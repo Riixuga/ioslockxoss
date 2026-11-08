@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">iOS Lock XOS</string>
+    <string name="xposed_desc">Lockscreen XOS ala iOS 26: jam tidak mengecil, stack notifikasi muncul saat swipe</string>
+</resources>
