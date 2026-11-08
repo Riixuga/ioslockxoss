@@ -7,7 +7,9 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
+import java.lang.reflect.Modifier
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 object Config {
     private val cache = ConcurrentHashMap<String, Pair<Long, String>>()
@@ -36,6 +38,10 @@ class MainHook : IXposedHookLoadPackage {
     private val lastLog = ConcurrentHashMap<String, Long>()
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
+    private val traceCount = AtomicInteger(0)
+    private val traceRegex = Regex(
+        "(?i)(expan|collaps|progress|fraction|drag|slide|swipe|translat|alpha|scroll|lockshade|transition|scale|level|factor|clock|height|position|touch|intercept)"
+    )
 
     @Volatile private var panelProgress = 0f
     @Volatile private var clockRef: WeakReference<View>? = null
@@ -43,7 +49,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.2 loaded into SystemUI")
+        log("v0.3 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val helper = "com.transsion.keyguard.clock.KeyguardClockHelper"
@@ -52,7 +58,8 @@ class MainHook : IXposedHookLoadPackage {
         val header = "com.transsion.notification.header.view.TrNotificationCenterHeader"
         val stack = "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayoutController"
 
-        listOf(clockView, helper, panel, anim, header, stack).forEach { dumpMethods(cl, it) }
+        // Tracer: pasang hook otomatis ke method yang namanya relevan
+        listOf(panel, anim, stack, clockView, header, helper).forEach { trace(cl, it) }
 
         hook(cl, clockView, "onAttachedToWindow", after = { p ->
             val v = p.thisObject as? View ?: return@hook
@@ -65,47 +72,73 @@ class MainHook : IXposedHookLoadPackage {
                 try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
             }
         }, after = { p -> clockState("after setClockLevel", p.thisObject) })
-        hook(cl, clockView, "getClockLevel", after = { p -> logT("getClockLevel", "ret=${p.result}", discrete = true) })
-        hook(cl, clockView, "setFactor", before = { p -> logT("setFactor", "arg=${p.args.getOrNull(0)}") })
         hook(cl, clockView, "updateClockViewParams", before = { p ->
             logT("updateClockViewParams", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
         }, after = { p -> clockState("after updateClockViewParams", p.thisObject) })
-        hook(cl, clockView, "getLevelHeight", after = { p -> logT("getLevelHeight", "ret=${p.result}", discrete = true) })
-
-        hook(cl, helper, "handleClockPosition", before = { p ->
-            dumpFields("KeyguardClockHelper#1", p.thisObject)
-            logT("handleClockPosition", "caller=${caller()}", discrete = true)
-        })
-        hook(cl, "com.android.systemui.keyguard.ui.viewmodel.KeyguardClockViewModel", "getSmallClockTopMargin",
-            after = { p -> logT("getSmallClockTopMargin", "ret=${p.result}", discrete = true) })
-        hook(cl, "com.android.systemui.keyguard.ui.sections.TrClockSection", "applyConstraints",
-            before = { logT("TrClockSection.applyConstraints", "caller=${caller()}", discrete = true) })
 
         hook(cl, panel, "positionClockAndNotifications",
             before = { p ->
                 dumpFields("TrNotificationPanelViewController#1", p.thisObject)
-                if (panelProgress > 0.5f) dumpFields("TrNotificationPanelViewController#2(progress>0.5)", p.thisObject)
                 logT("positionClockAndNotifications", "progress=$panelProgress caller=${caller()}")
             },
             after = { if (Config.enableClockPush) applyClockPush() })
-        hook(cl, panel, "updateExpandedHeight", before = { p -> logT("updateExpandedHeight", "h=${p.args.getOrNull(0)}") })
-        hook(cl, panel, "expandToNotifications", before = { logT("expandToNotifications", "caller=${caller()}", discrete = true) })
-        hook(cl, panel, "flingToLockShade", before = { p -> logT("flingToLockShade", "args=${p.args.toList()}", discrete = true) })
-
+        hook(cl, panel, "flingToLockShade", before = { p ->
+            logT("flingToLockShade", "args=${p.args.toList()} caller=${caller()}", discrete = true)
+        })
         hook(cl, anim, "changePanelCollapseAnim", before = { p ->
             val f = (p.args.getOrNull(0) as? Float) ?: 0f
             panelProgress = f
             logT("changePanelCollapseAnim", "f=$f (semua arg=${p.args.toList()})")
             if (Config.enableClockPush) applyClockPush()
         })
-        hook(cl, anim, "startPanelAnim", before = { p -> logT("startPanelAnim", "args=${p.args.toList()}", discrete = true) })
-        hook(cl, anim, "isPanelExpanded", after = { p -> logT("isPanelExpanded", "ret=${p.result}", discrete = true) })
-
-        hook(cl, header, "updateClockTranslationY", before = { p -> logT("header.updateClockTranslationY", "y=${p.args.getOrNull(0)}") })
-
         hook(cl, stack, "updateVisibility", before = { p ->
             logT("stack.updateVisibility", "visible=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
         })
+    }
+
+    private fun trace(cl: ClassLoader, cls: String) {
+        try {
+            val c = XposedHelpers.findClassIfExists(cls, cl) ?: return
+            val short = c.simpleName
+            var n = 0
+            for (m in c.declaredMethods) {
+                if (n >= 80) break
+                val name = m.name
+                if (Modifier.isAbstract(m.modifiers) || Modifier.isNative(m.modifiers)) continue
+                if (name.startsWith("get") || name.startsWith("is") || name.startsWith("has") ||
+                    name.startsWith("can") || name.startsWith("access") || name.startsWith("lambda") ||
+                    name.contains('$')) continue
+                if (!traceRegex.containsMatchIn(name)) continue
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        try {
+                            val key = "T:$short.$name"
+                            if (!allow(key)) return
+                            log("$key(" + p.args.joinToString { brief(it) } + ")")
+                        } catch (t: Throwable) { }
+                    }
+                })
+                n++
+            }
+            log("trace $short: $n method(s) hooked")
+        } catch (t: Throwable) { log("trace fail $cls: $t") }
+    }
+
+    private fun allow(key: String): Boolean {
+        if (traceCount.get() > 2500) return false
+        val now = System.currentTimeMillis()
+        val last = lastLog[key] ?: 0L
+        if (now - last < 250) return false
+        lastLog[key] = now
+        traceCount.incrementAndGet()
+        return true
+    }
+
+    private fun brief(a: Any?): String = when (a) {
+        null -> "null"
+        is View -> a.javaClass.simpleName
+        is Number, is Boolean, is CharSequence -> a.toString().take(40)
+        else -> a.javaClass.simpleName
     }
 
     private fun applyClockPush() {
@@ -165,17 +198,6 @@ class MainHook : IXposedHookLoadPackage {
         } catch (t: Throwable) {
             log("hook fail $cls.$method: $t")
         }
-    }
-
-    private fun dumpMethods(cl: ClassLoader, cls: String) {
-        try {
-            val c = XposedHelpers.findClassIfExists(cls, cl) ?: return
-            val sb = StringBuilder("methods of ${c.simpleName}:")
-            c.declaredMethods.sortedBy { it.name }.forEach { m ->
-                sb.append("\n  ${m.name}(${m.parameterTypes.joinToString { it.simpleName }}): ${m.returnType.simpleName}")
-            }
-            log(sb.toString())
-        } catch (t: Throwable) { log("dumpMethods fail $cls: $t") }
     }
 
     private fun dumpFields(key: String, obj: Any) {
