@@ -1,15 +1,17 @@
 package com.miko.ioslock
 
+import android.animation.ValueAnimator
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
-import java.lang.reflect.Modifier
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 
 object Config {
     private val cache = ConcurrentHashMap<String, Pair<Long, String>>()
@@ -26,10 +28,12 @@ object Config {
         return v
     }
 
+    val gesture: Boolean get() = prop("debug.ioslock.gesture") == "1"
     val forceClockLevel: Int? get() = prop("debug.ioslock.level").toIntOrNull()
-    val enableClockPush: Boolean get() = prop("debug.ioslock.push") == "1"
-    val maxPushDp: Float get() = prop("debug.ioslock.pushdp").toFloatOrNull() ?: 120f
-    val minClockScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
+    val pushDp: Float get() = prop("debug.ioslock.pushdp").toFloatOrNull() ?: 120f
+    val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
+    val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
+    val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -38,141 +42,162 @@ class MainHook : IXposedHookLoadPackage {
     private val lastLog = ConcurrentHashMap<String, Long>()
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
-    private val traceCount = AtomicInteger(0)
-    private val traceRegex = Regex(
-        "(?i)(expan|collaps|progress|fraction|drag|slide|swipe|translat|alpha|scroll|lockshade|transition|scale|level|factor|clock|height|position|touch|intercept)"
-    )
 
-    @Volatile private var panelProgress = 0f
     @Volatile private var clockRef: WeakReference<View>? = null
+    @Volatile private var stackRef: WeakReference<View>? = null
+
+    // state gestur
+    private var progress = 0f
+    private var downX = 0f
+    private var downY = 0f
+    private var startY = 0f
+    private var baseProgress = 0f
+    private var tracking = false
+    private var taken = false
+    private var applied = false
+    private var animator: ValueAnimator? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.3 loaded into SystemUI")
+        log("v0.4 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
-        val helper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
-        val anim = "com.android.systemui.shade.NotificationCenterAnimHelper"
-        val header = "com.transsion.notification.header.view.TrNotificationCenterHeader"
         val stack = "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayoutController"
-
-        // Tracer: pasang hook otomatis ke method yang namanya relevan
-        listOf(panel, anim, stack, clockView, header, helper).forEach { trace(cl, it) }
+        val shadeWindow = "com.android.systemui.shade.NotificationShadeWindowView"
 
         hook(cl, clockView, "onAttachedToWindow", after = { p ->
             val v = p.thisObject as? View ?: return@hook
             clockRef = WeakReference(v)
-            once("clockHierarchy") { log("clock attached: " + describeView(v) + "\n" + parentChain(v)) }
+            once("clockHierarchy") { log("clock attached: " + describeView(v)) }
         })
         hook(cl, clockView, "setClockLevel", before = { p ->
             logT("setClockLevel", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
             Config.forceClockLevel?.let { lv ->
                 try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
             }
-        }, after = { p -> clockState("after setClockLevel", p.thisObject) })
+        }, after = { applyState() })
         hook(cl, clockView, "updateClockViewParams", before = { p ->
-            logT("updateClockViewParams", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
-        }, after = { p -> clockState("after updateClockViewParams", p.thisObject) })
+            logT("updateClockViewParams", "arg=${p.args.getOrNull(0)}", discrete = true)
+        }, after = { applyState() })
 
-        hook(cl, panel, "positionClockAndNotifications",
-            before = { p ->
-                dumpFields("TrNotificationPanelViewController#1", p.thisObject)
-                logT("positionClockAndNotifications", "progress=$panelProgress caller=${caller()}")
-            },
-            after = { if (Config.enableClockPush) applyClockPush() })
-        hook(cl, panel, "flingToLockShade", before = { p ->
-            logT("flingToLockShade", "args=${p.args.toList()} caller=${caller()}", discrete = true)
+        hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
+
+        // Ambil View stack notifikasi dari controller-nya
+        hook(cl, stack, "updateVisibility", after = { p ->
+            try {
+                val v = XposedHelpers.callMethod(p.thisObject, "getView") as? View
+                if (v != null) {
+                    stackRef = WeakReference(v)
+                    once("stackView") { log("stack view: " + describeView(v)) }
+                }
+            } catch (t: Throwable) { once("stackViewFail") { log("getView gagal: $t") } }
         })
-        hook(cl, anim, "changePanelCollapseAnim", before = { p ->
-            val f = (p.args.getOrNull(0) as? Float) ?: 0f
-            panelProgress = f
-            logT("changePanelCollapseAnim", "f=$f (semua arg=${p.args.toList()})")
-            if (Config.enableClockPush) applyClockPush()
-        })
-        hook(cl, stack, "updateVisibility", before = { p ->
-            logT("stack.updateVisibility", "visible=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
-        })
+
+        // Tangkap sentuhan di window shade
+        hook(cl, shadeWindow, "dispatchTouchEvent", before = { p -> handleTouch(p) })
     }
 
-    private fun trace(cl: ClassLoader, cls: String) {
-        try {
-            val c = XposedHelpers.findClassIfExists(cls, cl) ?: return
-            val short = c.simpleName
-            var n = 0
-            for (m in c.declaredMethods) {
-                if (n >= 80) break
-                val name = m.name
-                if (Modifier.isAbstract(m.modifiers) || Modifier.isNative(m.modifiers)) continue
-                if (name.startsWith("get") || name.startsWith("is") || name.startsWith("has") ||
-                    name.startsWith("can") || name.startsWith("access") || name.startsWith("lambda") ||
-                    name.contains('$')) continue
-                if (!traceRegex.containsMatchIn(name)) continue
-                XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(p: MethodHookParam) {
-                        try {
-                            val key = "T:$short.$name"
-                            if (!allow(key)) return
-                            log("$key(" + p.args.joinToString { brief(it) } + ")")
-                        } catch (t: Throwable) { }
-                    }
-                })
-                n++
-            }
-            log("trace $short: $n method(s) hooked")
-        } catch (t: Throwable) { log("trace fail $cls: $t") }
-    }
-
-    private fun allow(key: String): Boolean {
-        if (traceCount.get() > 2500) return false
-        val now = System.currentTimeMillis()
-        val last = lastLog[key] ?: 0L
-        if (now - last < 250) return false
-        lastLog[key] = now
-        traceCount.incrementAndGet()
-        return true
-    }
-
-    private fun brief(a: Any?): String = when (a) {
-        null -> "null"
-        is View -> a.javaClass.simpleName
-        is Number, is Boolean, is CharSequence -> a.toString().take(40)
-        else -> a.javaClass.simpleName
-    }
-
-    private fun applyClockPush() {
+    private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
+        if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
+        val ev = p.args[0] as? MotionEvent ?: return
         val clock = clockRef?.get() ?: return
-        val p = panelProgress.coerceIn(0f, 1f)
-        val d = clock.resources.displayMetrics.density
-        val s = 1f - (1f - Config.minClockScale) * p
-        clock.post {
-            clock.pivotX = clock.width / 2f
-            clock.pivotY = 0f
-            clock.scaleX = s
-            clock.scaleY = s
-            clock.translationY = -Config.maxPushDp * d * p
+        if (!clock.isShown) { if (progress != 0f) { progress = 0f; applyState() }; return }
+        val dm = clock.resources.displayMetrics
+        val a = ev.actionMasked
+
+        if (a == MotionEvent.ACTION_DOWN) {
+            animator?.cancel()
+            downX = ev.rawX; downY = ev.rawY; taken = false
+            tracking = ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
+            return
+        }
+        if (!tracking) return
+
+        if (!taken && a == MotionEvent.ACTION_MOVE) {
+            val dy = downY - ev.rawY
+            val dx = ev.rawX - downX
+            val slop = ViewConfiguration.get(clock.context).scaledTouchSlop
+            val up = dy > slop
+            val down = progress > 0f && -dy > slop
+            if ((up || down) && abs(dy) > abs(dx) * 1.2f) {
+                // batalkan sentuhan di handler asli supaya tidak membuka kunci
+                try {
+                    val c = MotionEvent.obtain(ev)
+                    c.action = MotionEvent.ACTION_CANCEL
+                    XposedBridge.invokeOriginalMethod(p.method, p.thisObject, arrayOf<Any?>(c))
+                    c.recycle()
+                } catch (t: Throwable) { log("cancel gagal: $t") }
+                taken = true
+                startY = ev.rawY
+                baseProgress = progress
+                log("takeover swipe, base=$baseProgress")
+            }
+        }
+
+        if (taken) {
+            when (a) {
+                MotionEvent.ACTION_MOVE -> {
+                    progress = (baseProgress + (startY - ev.rawY) / (Config.rangeDp * dm.density)).coerceIn(0f, 1f)
+                    applyState()
+                    logT("progress", "p=$progress")
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    taken = false
+                    snap(if (progress > 0.35f) 1f else 0f)
+                }
+            }
+            p.result = true
         }
     }
 
-    private fun clockState(label: String, obj: Any?) {
-        val v = (obj as? View) ?: clockRef?.get() ?: return
-        logT("clockState", "$label -> ${describeView(v)}", discrete = true)
+    private fun snap(target: Float) {
+        animator?.cancel()
+        val an = ValueAnimator.ofFloat(progress, target)
+        an.duration = 220
+        an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
+        animator = an
+        an.start()
+    }
+
+    private fun applyState() {
+        try {
+            val clock = clockRef?.get()
+            val sv = stackRef?.get()
+            if (!Config.gesture) {
+                if (applied) { reset(clock, sv); applied = false }
+                return
+            }
+            val onKeyguard = clock?.isShown == true
+            if (!onKeyguard) { if (applied) { reset(clock, sv); applied = false }; return }
+            applied = true
+            val p = progress
+            if (clock != null) {
+                val d = clock.resources.displayMetrics.density
+                val s = 1f - (1f - Config.minScale) * p
+                clock.pivotX = clock.width / 2f
+                clock.pivotY = 0f
+                clock.scaleX = s
+                clock.scaleY = s
+                clock.translationY = -Config.pushDp * d * p
+            }
+            if (sv != null) {
+                val d = sv.resources.displayMetrics.density
+                sv.alpha = p
+                sv.translationY = (1f - p) * 48f * d
+            }
+        } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
+    }
+
+    private fun reset(clock: View?, sv: View?) {
+        clock?.let { it.scaleX = 1f; it.scaleY = 1f; it.translationY = 0f }
+        sv?.let { it.alpha = 1f; it.translationY = 0f }
     }
 
     private fun describeView(v: View): String =
         "${v.javaClass.name} id=${idName(v)} size=${v.width}x${v.height} y=${v.y} " +
             "scale=${v.scaleX}/${v.scaleY} transY=${v.translationY} alpha=${v.alpha} vis=${v.visibility}"
-
-    private fun parentChain(v: View): String {
-        val sb = StringBuilder()
-        var c: Any? = v.parent
-        var i = 0
-        while (c is View && i < 8) {
-            sb.append("  ^ ").append(describeView(c)).append('\n'); c = c.parent; i++
-        }
-        return sb.toString()
-    }
 
     private fun idName(v: View): String = try {
         if (v.id == View.NO_ID) "none" else v.resources.getResourceEntryName(v.id)
@@ -197,30 +222,6 @@ class MainHook : IXposedHookLoadPackage {
             log("hook ${cls.substringAfterLast('.')}.$method -> ${set.size} method(s)")
         } catch (t: Throwable) {
             log("hook fail $cls.$method: $t")
-        }
-    }
-
-    private fun dumpFields(key: String, obj: Any) {
-        once("dump:$key") {
-            val sb = StringBuilder("fields of $key:")
-            var c: Class<*>? = obj.javaClass
-            while (c != null && c != Any::class.java) {
-                for (f in c.declaredFields) {
-                    val value = try {
-                        f.isAccessible = true
-                        val x = f.get(obj)
-                        when {
-                            x == null -> "null"
-                            x is View -> describeView(x)
-                            f.type.isPrimitive || x is String || x is Number -> x.toString()
-                            else -> x.javaClass.name
-                        }
-                    } catch (t: Throwable) { "?" }
-                    sb.append("\n  ${c.simpleName}.${f.name}: ${f.type.name} = $value")
-                }
-                c = c.superclass
-            }
-            log(sb.toString())
         }
     }
 
