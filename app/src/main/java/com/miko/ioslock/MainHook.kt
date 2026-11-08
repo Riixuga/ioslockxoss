@@ -67,7 +67,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.4.2 loaded into SystemUI")
+        log("v0.4.3 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
@@ -76,6 +76,7 @@ class MainHook : IXposedHookLoadPackage {
 
         hook(cl, clockView, "onAttachedToWindow", after = { p ->
             val v = p.thisObject as? View ?: return@hook
+            if (!isRealClock(v)) { logT("clockIgnored", describeView(v), discrete = true); return@hook }
             attachedClocks.add(WeakReference(v))
             logT("clockAttached", "total=${attachedClocks.size} ${describeView(v)}", discrete = true)
         })
@@ -122,18 +123,26 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
+    // Jam asli = id lockscreen_clock_view. "lockscreen_measure_clock_view" hanya untuk mengukur (selalu tersembunyi).
+    private fun isRealClock(v: View): Boolean {
+        val id = idName(v)
+        if (id == "lockscreen_measure_clock_view") return false
+        return id == "lockscreen_clock_view" || v.javaClass.name.endsWith("KeyguardClockView")
+    }
+
     private fun refreshTargets(root: View) {
         val top = root.rootView
-        val shown = attachedClocks.mapNotNull { it.get() }.filter { it.isShown && it.width > 0 }
-        activeClocks = if (shown.isNotEmpty()) shown else {
+        // Tidak memakai isShown: saat transisi layar menyala, jam bisa sedang tersembunyi sesaat.
+        val known = attachedClocks.mapNotNull { it.get() }.filter { it.isAttachedToWindow && it.width > 0 }
+        activeClocks = if (known.isNotEmpty()) known else {
             val out = ArrayList<View>()
-            findViews(top, 0, out) { it.javaClass.name.endsWith("KeyguardClockView") && it.isShown && it.width > 0 }
+            findViews(top, 0, out) { isRealClock(it) && it.width > 0 }
             out
         }
         val sv = stackRef?.get()
-        if (sv == null || !sv.isShown) {
+        if (sv == null || !sv.isAttachedToWindow) {
             val out = ArrayList<View>()
-            findViews(top, 0, out) { it.javaClass.name.contains("NotificationStackScrollLayout") && it.isShown }
+            findViews(top, 0, out) { idName(it) == "notification_stack_scroller" }
             out.firstOrNull()?.let { stackRef = WeakReference(it) }
         }
     }
@@ -181,6 +190,7 @@ class MainHook : IXposedHookLoadPackage {
                 "locked=$locked clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
                 discrete = true
             )
+            activeClocks.firstOrNull()?.let { logT("clockAtTouch", describeView(it), discrete = true) }
             tracking = locked && activeClocks.isNotEmpty() &&
                 ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
             return
