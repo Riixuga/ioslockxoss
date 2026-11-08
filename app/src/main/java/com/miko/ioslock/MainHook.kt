@@ -28,7 +28,8 @@ object Config {
         return v
     }
 
-    val gesture: Boolean get() = prop("debug.ioslock.gesture") == "1"
+    // Menyala otomatis; matikan dengan: setprop debug.ioslock.gesture 0
+    val gesture: Boolean get() = prop("debug.ioslock.gesture") != "0"
     val forceClockLevel: Int? get() = prop("debug.ioslock.level").toIntOrNull()
     val pushDp: Float get() = prop("debug.ioslock.pushdp").toFloatOrNull() ?: 120f
     val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
@@ -60,7 +61,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.4 loaded into SystemUI")
+        log("v0.4.1 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
@@ -100,6 +101,11 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
+        logT(
+            "touchSeen",
+            "gesture=${Config.gesture} clock=${clockRef?.get() != null} shown=${clockRef?.get()?.isShown}",
+            discrete = true
+        )
         if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
         val ev = p.args[0] as? MotionEvent ?: return
         val clock = clockRef?.get() ?: return
