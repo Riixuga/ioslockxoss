@@ -1,9 +1,12 @@
 package com.miko.ioslock
 
 import android.animation.ValueAnimator
+import android.app.KeyguardManager
+import android.content.Context
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -11,6 +14,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 
 object Config {
@@ -43,8 +47,10 @@ class MainHook : IXposedHookLoadPackage {
     private val lastLog = ConcurrentHashMap<String, Long>()
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
+    private val treeRegex = Regex("(?i)clock|stack|notif|keyguard|lock|media")
 
-    @Volatile private var clockRef: WeakReference<View>? = null
+    private val attachedClocks = CopyOnWriteArrayList<WeakReference<View>>()
+    @Volatile private var activeClocks: List<View> = emptyList()
     @Volatile private var stackRef: WeakReference<View>? = null
 
     // state gestur
@@ -61,7 +67,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.4.1 loaded into SystemUI")
+        log("v0.4.2 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
@@ -70,8 +76,12 @@ class MainHook : IXposedHookLoadPackage {
 
         hook(cl, clockView, "onAttachedToWindow", after = { p ->
             val v = p.thisObject as? View ?: return@hook
-            clockRef = WeakReference(v)
-            once("clockHierarchy") { log("clock attached: " + describeView(v)) }
+            attachedClocks.add(WeakReference(v))
+            logT("clockAttached", "total=${attachedClocks.size} ${describeView(v)}", discrete = true)
+        })
+        hook(cl, clockView, "onDetachedFromWindow", after = { p ->
+            val v = p.thisObject as? View ?: return@hook
+            attachedClocks.removeAll { it.get() == null || it.get() === v }
         })
         hook(cl, clockView, "setClockLevel", before = { p ->
             logT("setClockLevel", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
@@ -100,23 +110,79 @@ class MainHook : IXposedHookLoadPackage {
         hook(cl, shadeWindow, "dispatchTouchEvent", before = { p -> handleTouch(p) })
     }
 
+    private fun isLocked(ctx: Context): Boolean = try {
+        (ctx.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+    } catch (t: Throwable) { false }
+
+    private fun findViews(v: View, depth: Int, out: MutableList<View>, pred: (View) -> Boolean) {
+        if (depth > 14 || out.size > 8) return
+        if (pred(v)) out.add(v)
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) findViews(v.getChildAt(i), depth + 1, out, pred)
+        }
+    }
+
+    private fun refreshTargets(root: View) {
+        val top = root.rootView
+        val shown = attachedClocks.mapNotNull { it.get() }.filter { it.isShown && it.width > 0 }
+        activeClocks = if (shown.isNotEmpty()) shown else {
+            val out = ArrayList<View>()
+            findViews(top, 0, out) { it.javaClass.name.endsWith("KeyguardClockView") && it.isShown && it.width > 0 }
+            out
+        }
+        val sv = stackRef?.get()
+        if (sv == null || !sv.isShown) {
+            val out = ArrayList<View>()
+            findViews(top, 0, out) { it.javaClass.name.contains("NotificationStackScrollLayout") && it.isShown }
+            out.firstOrNull()?.let { stackRef = WeakReference(it) }
+        }
+    }
+
+    private fun dumpTree(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
+        if (depth > 12 || count[0] > 120) return
+        val n = v.javaClass.name
+        val id = idName(v)
+        if (treeRegex.containsMatchIn(n + id)) {
+            sb.append("\n").append("  ".repeat(depth)).append(n.substringAfterLast('.'))
+                .append(" id=").append(id).append(" shown=").append(v.isShown)
+                .append(" ").append(v.width).append("x").append(v.height)
+            count[0]++
+        }
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) dumpTree(v.getChildAt(i), depth + 1, sb, count)
+        }
+    }
+
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
-        logT(
-            "touchSeen",
-            "gesture=${Config.gesture} clock=${clockRef?.get() != null} shown=${clockRef?.get()?.isShown}",
-            discrete = true
-        )
         if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
+        val root = p.thisObject as? View ?: return
         val ev = p.args[0] as? MotionEvent ?: return
-        val clock = clockRef?.get() ?: return
-        if (!clock.isShown) { if (progress != 0f) { progress = 0f; applyState() }; return }
-        val dm = clock.resources.displayMetrics
+        val dm = root.resources.displayMetrics
         val a = ev.actionMasked
 
         if (a == MotionEvent.ACTION_DOWN) {
             animator?.cancel()
-            downX = ev.rawX; downY = ev.rawY; taken = false
-            tracking = ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
+            taken = false
+            downX = ev.rawX; downY = ev.rawY
+            val locked = isLocked(root.context)
+            if (locked) {
+                refreshTargets(root)
+                once("tree") {
+                    val sb = StringBuilder("tree:")
+                    dumpTree(root.rootView, 0, sb, intArrayOf(0))
+                    log(sb.toString())
+                }
+            } else if (applied) {
+                progress = 0f
+                applyState()
+            }
+            logT(
+                "touchSeen",
+                "locked=$locked clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
+                discrete = true
+            )
+            tracking = locked && activeClocks.isNotEmpty() &&
+                ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
             return
         }
         if (!tracking) return
@@ -124,7 +190,7 @@ class MainHook : IXposedHookLoadPackage {
         if (!taken && a == MotionEvent.ACTION_MOVE) {
             val dy = downY - ev.rawY
             val dx = ev.rawX - downX
-            val slop = ViewConfiguration.get(clock.context).scaledTouchSlop
+            val slop = ViewConfiguration.get(root.context).scaledTouchSlop
             val up = dy > slop
             val down = progress > 0f && -dy > slop
             if ((up || down) && abs(dy) > abs(dx) * 1.2f) {
@@ -169,17 +235,18 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun applyState() {
         try {
-            val clock = clockRef?.get()
+            val clocks = activeClocks
             val sv = stackRef?.get()
-            if (!Config.gesture) {
-                if (applied) { reset(clock, sv); applied = false }
+            val ctx = clocks.firstOrNull()?.context ?: sv?.context
+            val locked = ctx != null && isLocked(ctx)
+            if (!Config.gesture || !locked) {
+                if (applied) { reset(clocks, sv); applied = false }
+                if (!locked) progress = 0f
                 return
             }
-            val onKeyguard = clock?.isShown == true
-            if (!onKeyguard) { if (applied) { reset(clock, sv); applied = false }; return }
             applied = true
             val p = progress
-            if (clock != null) {
+            for (clock in clocks) {
                 val d = clock.resources.displayMetrics.density
                 val s = 1f - (1f - Config.minScale) * p
                 clock.pivotX = clock.width / 2f
@@ -196,14 +263,14 @@ class MainHook : IXposedHookLoadPackage {
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
-    private fun reset(clock: View?, sv: View?) {
-        clock?.let { it.scaleX = 1f; it.scaleY = 1f; it.translationY = 0f }
+    private fun reset(clocks: List<View>, sv: View?) {
+        for (c in clocks) { c.scaleX = 1f; c.scaleY = 1f; c.translationY = 0f }
         sv?.let { it.alpha = 1f; it.translationY = 0f }
     }
 
     private fun describeView(v: View): String =
         "${v.javaClass.name} id=${idName(v)} size=${v.width}x${v.height} y=${v.y} " +
-            "scale=${v.scaleX}/${v.scaleY} transY=${v.translationY} alpha=${v.alpha} vis=${v.visibility}"
+            "scale=${v.scaleX}/${v.scaleY} transY=${v.translationY} alpha=${v.alpha} vis=${v.visibility} shown=${v.isShown}"
 
     private fun idName(v: View): String = try {
         if (v.id == View.NO_ID) "none" else v.resources.getResourceEntryName(v.id)
