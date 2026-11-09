@@ -7,6 +7,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.ViewParent
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -79,7 +80,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.5 loaded into SystemUI")
+        log("v0.5.1 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
@@ -112,7 +113,11 @@ class MainHook : IXposedHookLoadPackage {
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
         hook(cl, panel, "onHeightUpdated", after = { p ->
-            (p.args.getOrNull(0) as? Float)?.let { shadeH = it; logT("shadeH", "h=$it") }
+            val h = p.args.getOrNull(0) as? Float
+            if (h != null) {
+                shadeH = h
+                logT("shadeH", "h=$h")
+            }
         })
 
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
@@ -163,23 +168,25 @@ class MainHook : IXposedHookLoadPackage {
         val top = root.rootView
         val known = attachedClocks.mapNotNull { it.get() }.filter { it.isAttachedToWindow && it.width > 0 }
         var list: List<View> = if (known.isNotEmpty()) known else {
-            val out = ArrayList<View>()
-            findViews(top, 0, out) { isRealClock(it) && it.width > 0 }
-            out
+            val found = ArrayList<View>()
+            findViews(top, 0, found) { isRealClock(it) && it.width > 0 }
+            found
         }
         val extra = Config.clockId
         if (extra.isNotEmpty()) {
-            val out = ArrayList<View>()
-            findViews(top, 0, out) { idName(it) == extra }
-            list = list + out.filter { it !in list }
+            val found = ArrayList<View>()
+            findViews(top, 0, found) { idName(it) == extra }
+            val current = list
+            list = current + found.filter { it !in current }
         }
         activeClocks = list
 
         val sv = stackRef?.get()
         if (sv == null || !sv.isAttachedToWindow) {
-            val out = ArrayList<View>()
-            findViews(top, 0, out) { idName(it) == "notification_stack_scroller" }
-            out.firstOrNull()?.let { stackRef = WeakReference(it) }
+            val found = ArrayList<View>()
+            findViews(top, 0, found) { idName(it) == "notification_stack_scroller" }
+            val first = found.firstOrNull()
+            if (first != null) stackRef = WeakReference(first)
         }
     }
 
@@ -198,20 +205,35 @@ class MainHook : IXposedHookLoadPackage {
     // View besar yang sedang terlihat (untuk mencari jam yang sebenarnya)
     private fun scanBig(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
         if (depth > 18 || count[0] > 30) return
-        if (v.isShown && v.width >= 300 && v.height >= 120 && !(v.width >= 1000 && v.height >= 2000)) {
+        val isBig = v.isShown && v.width >= 300 && v.height >= 120 &&
+            !(v.width >= 1000 && v.height >= 2000)
+        if (isBig) {
             sb.append("\n  ").append(v.javaClass.name.substringAfterLast('.'))
-                .append(" id=").append(idName(v))
-                .append(" ").append(v.width).append("x").append(v.height)
-            if (v is TextView) sb.append(" text='").append(v.text?.toString()?.take(12)).append("'")
-                        var par: android.view.ViewParent? = v.parent
-            var n = 0
-            sb.append(" <")
-            while (par is View && n < 3) {
-                val pv: View = par
-                sb.append(" ").append(pv.javaClass.simpleName).append("#").append(idName(pv))
-                par = pv.parent
-                n++
+            sb.append(" id=").append(idName(v))
+            sb.append(" ").append(v.width).append("x").append(v.height)
+            if (v is TextView) {
+                sb.append(" text='").append(v.text?.toString()?.take(12)).append("'")
             }
+            sb.append(" <").append(parentNames(v))
+            count[0]++
+        }
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) scanBig(v.getChildAt(i), depth + 1, sb, count)
+        }
+    }
+
+    private fun parentNames(v: View): String {
+        val out = StringBuilder()
+        var par: ViewParent? = v.parent
+        var n = 0
+        while (par != null && n < 3) {
+            val pv = par as? View ?: break
+            out.append(" ").append(pv.javaClass.simpleName).append("#").append(idName(pv))
+            par = pv.parent
+            n++
+        }
+        return out.toString()
+    }
 
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
         if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
@@ -223,7 +245,8 @@ class MainHook : IXposedHookLoadPackage {
         if (a == MotionEvent.ACTION_DOWN) {
             animator?.cancel()
             taken = false
-            downX = ev.rawX; downY = ev.rawY
+            downX = ev.rawX
+            downY = ev.rawY
             val locked = isLocked(root.context)
             if (locked) {
                 refreshTargets(root)
@@ -232,9 +255,8 @@ class MainHook : IXposedHookLoadPackage {
                     dumpAll(root.rootView, 0, 5, sb, intArrayOf(0))
                     log(sb.toString())
                 }
-                activeClocks.firstOrNull { idName(it) == "lockscreen_clock_view" }?.let {
-                    dumpFields("clock", it)
-                }
+                val realClock = activeClocks.firstOrNull { idName(it) == "lockscreen_clock_view" }
+                if (realClock != null) dumpFields("clock", realClock)
                 val big = StringBuilder("visibleBig:")
                 scanBig(root.rootView, 0, big, intArrayOf(0))
                 logT("visibleBig", big.toString(), discrete = true)
@@ -342,12 +364,15 @@ class MainHook : IXposedHookLoadPackage {
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
             if (c.visibility == View.VISIBLE && c.javaClass.name.contains("ExpandableNotificationRow")) {
-                rows.add(c to baseOf(c))
+                rows.add(Pair(c, baseOf(c)))
             }
         }
         rows.sortBy { it.second }
-        val base0 = rows.firstOrNull()?.second ?: return
-        rows.forEachIndexed { i, (row, base) ->
+        if (rows.isEmpty()) return
+        val base0 = rows[0].second
+        for (i in 0 until rows.size) {
+            val row = rows[i].first
+            val base = rows[i].second
             val off = (1f - p) * ((base0 - base) + i * 10f * d)
             val w = base + off
             row.translationY = w
@@ -360,19 +385,23 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun reset(clocks: List<View>, sv: View?) {
-        for (c in clocks) { c.scaleX = 1f; c.scaleY = 1f; c.translationY = 0f }
-        if (sv != null) {
-            sv.alpha = 1f
-            sv.translationY = 0f
-            (sv as? ViewGroup)?.let { g ->
-                for (i in 0 until g.childCount) {
-                    val c = g.getChildAt(i)
-                    val st = rowState[c] ?: continue
-                    if (abs(c.translationY - st[1]) < 0.01f) c.translationY = st[0]
-                    c.scaleX = 1f
-                    c.scaleY = 1f
-                    rowState.remove(c)
-                }
+        for (c in clocks) {
+            c.scaleX = 1f
+            c.scaleY = 1f
+            c.translationY = 0f
+        }
+        if (sv == null) return
+        sv.alpha = 1f
+        sv.translationY = 0f
+        val g = sv as? ViewGroup ?: return
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            val st = rowState[c]
+            if (st != null) {
+                if (abs(c.translationY - st[1]) < 0.01f) c.translationY = st[0]
+                c.scaleX = 1f
+                c.scaleY = 1f
+                rowState.remove(c)
             }
         }
     }
@@ -443,7 +472,8 @@ class MainHook : IXposedHookLoadPackage {
         val last = lastLog[key] ?: 0L
         val changed = lastMsg[key] != msg
         if ((discrete && changed) || now - last >= 250) {
-            lastLog[key] = now; lastMsg[key] = msg
+            lastLog[key] = now
+            lastMsg[key] = msg
             log("$key: $msg")
         }
     }
