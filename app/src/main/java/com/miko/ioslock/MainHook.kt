@@ -17,9 +17,11 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
+import java.lang.reflect.Modifier
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 object Config {
@@ -44,16 +46,16 @@ object Config {
     val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
-    // posisi tengah tumpukan saat awal (0 = atas layar, 1 = bawah layar)
     val pileFrac: Float get() = prop("debug.ioslock.pilefrac").toFloatOrNull() ?: 0.84f
-    // skala kartu teratas saat masih menumpuk
     val pileScale: Float get() = prop("debug.ioslock.pilescale").toFloatOrNull() ?: 0.80f
-    // seberapa kartu di belakang mengintip di bawah kartu depan
     val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 14f
-    // id view jam tambahan yang ingin digeser/dikecilkan
     val clockId: String get() = prop("debug.ioslock.clockid")
-    // ubah nilainya untuk memaksa dump ulang struktur view
     val dumpToken: String get() = prop("debug.ioslock.dump")
+
+    // eksperimen: kirim perintah systemui.wallpaper.touch ke wallpaper mengikuti progres swipe
+    val wpExp: Boolean get() = prop("debug.ioslock.wpexp") == "1"
+    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.6f
+    val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 0f
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -63,6 +65,8 @@ class MainHook : IXposedHookLoadPackage {
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
     private val chanRegex = Regex("(?i)pictorial|wallpaper|clock|keyguardtheme|keyguard_theme|lockscreen|lock_screen")
+    private val discoverRegex = Regex("(?i)(ClockControllerImpl|WallpaperTouch|KeyguardClockInteractor|ClockViewBinder|WallpaperClock|DepthOfField|DepthWallpaper)")
+    private val traceCount = AtomicInteger(0)
 
     private val attachedClocks = CopyOnWriteArrayList<WeakReference<View>>()
     @Volatile private var activeClocks: List<View> = emptyList()
@@ -73,6 +77,12 @@ class MainHook : IXposedHookLoadPackage {
 
     // posisi asli tiap kartu: [dasarY, tulisY, dasarZ, tulisZ]
     private val rowState = WeakHashMap<View, FloatArray>()
+
+    // untuk eksperimen perintah wallpaper
+    @Volatile private var wpManager: Any? = null
+    @Volatile private var wpToken: Any? = null
+    @Volatile private var ownCall = false
+    private var lastWpSend = 0L
 
     // state gestur
     private var progress = 0f
@@ -89,7 +99,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.6 loaded into SystemUI")
+        log("v0.7 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
@@ -109,13 +119,13 @@ class MainHook : IXposedHookLoadPackage {
             attachedClocks.removeAll { it.get() == null || it.get() === v }
         })
         hook(cl, clockView, "setClockLevel", before = { p ->
-            logT("setClockLevel", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
+            logT("setClockLevel", "arg=${p.args.getOrNull(0)} stack=${callerFull()}", discrete = true)
             Config.forceClockLevel?.let { lv ->
                 try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
             }
         }, after = { applyState() })
-        hook(cl, clockView, "getClockLevel", after = { p ->
-            logT("getClockLevel", "ret=${p.result}", discrete = true)
+        hook(cl, clockView, "setFactor", before = { p ->
+            logT("setFactor", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
         })
         hook(cl, clockView, "updateClockViewParams", before = { p ->
             logT("updateClockViewParams", "arg=${p.args.getOrNull(0)}", discrete = true)
@@ -156,6 +166,9 @@ class MainHook : IXposedHookLoadPackage {
 
         // Sadap saluran komunikasi System UI -> wallpaper / tema
         hookChannels(cl)
+
+        // Cari class jam / wallpaper secara otomatis lalu catat semua pemanggilannya
+        startDiscovery(cl)
     }
 
     private fun resetDumps() {
@@ -163,6 +176,86 @@ class MainHook : IXposedHookLoadPackage {
         dumped.remove("custom")
         dumped.remove("dump:clock")
     }
+
+    // ---- penemuan class otomatis ----
+
+    private fun startDiscovery(cl: ClassLoader) {
+        Thread {
+            try {
+                val names = ArrayList<String>()
+                val pathList = XposedHelpers.getObjectField(cl, "pathList")
+                val elements = XposedHelpers.getObjectField(pathList, "dexElements") as Array<*>
+                for (e in elements) {
+                    if (e == null) continue
+                    val df = XposedHelpers.getObjectField(e, "dexFile") ?: continue
+                    val en = XposedHelpers.callMethod(df, "entries") as java.util.Enumeration<*>
+                    while (en.hasMoreElements()) {
+                        val name = en.nextElement() as String
+                        if (names.size >= 14) break
+                        val simple = name.substringAfterLast('.')
+                        if (simple.contains('$')) continue
+                        if (discoverRegex.containsMatchIn(simple)) names.add(name)
+                    }
+                }
+                log("discovered: " + names.joinToString(" | "))
+                for (n in names) trace(cl, n)
+            } catch (t: Throwable) {
+                log("discovery gagal: $t")
+            }
+        }.start()
+    }
+
+    private fun trace(cl: ClassLoader, cls: String) {
+        try {
+            val c = XposedHelpers.findClassIfExists(cls, cl) ?: return
+            val short = c.simpleName
+            val sb = StringBuilder("methods of $cls:")
+            var n = 0
+            for (m in c.declaredMethods) {
+                val name = m.name
+                sb.append("\n  ").append(name).append("(")
+                    .append(m.parameterTypes.joinToString { it.simpleName }).append(")")
+                if (n >= 70) continue
+                if (Modifier.isAbstract(m.modifiers) || Modifier.isNative(m.modifiers)) continue
+                if (name.startsWith("access$") || name.contains('$')) continue
+                if (name.startsWith("get") || name.startsWith("is") || name.startsWith("has")) continue
+                if (name == "toString" || name == "hashCode" || name == "equals") continue
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(p: MethodHookParam) {
+                        try {
+                            val key = "TR:$short.$name"
+                            if (!allow(key)) return
+                            log("$key(" + p.args.joinToString { brief(it) } + ")")
+                        } catch (t: Throwable) { }
+                    }
+                })
+                n++
+            }
+            log(sb.toString())
+            log("trace $short: $n method(s) hooked")
+        } catch (t: Throwable) {
+            log("trace gagal $cls: $t")
+        }
+    }
+
+    private fun allow(key: String): Boolean {
+        if (traceCount.get() > 2500) return false
+        val now = System.currentTimeMillis()
+        val last = lastLog[key] ?: 0L
+        if (now - last < 250) return false
+        lastLog[key] = now
+        traceCount.incrementAndGet()
+        return true
+    }
+
+    private fun brief(a: Any?): String = try {
+        when (a) {
+            null -> "null"
+            is View -> a.javaClass.simpleName
+            is Bundle -> briefArg(a)
+            else -> a.toString().take(160)
+        }
+    } catch (t: Throwable) { "?" }
 
     // ---- penyadapan saluran ke wallpaper ----
 
@@ -185,9 +278,12 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun hookChannels(cl: ClassLoader) {
         hook(cl, "android.app.WallpaperManager", "sendWallpaperCommand", before = { p ->
+            if (ownCall) return@hook
+            wpManager = p.thisObject
+            wpToken = p.args.getOrNull(0)
             val action = p.args.getOrNull(1)?.toString() ?: "?"
             val rest = p.args.drop(1).joinToString(" ") { briefArg(it) }
-            logT("WPCMD:$action", "$rest caller=${caller()}", discrete = true)
+            logT("WPCMD:$action", "$rest stack=${callerFull()}", discrete = true)
         })
         hook(cl, "android.app.ContextImpl", "sendBroadcast", before = { p -> chanIntent("BCAST", p.args.getOrNull(0)) })
         hook(cl, "android.app.ContextImpl", "sendBroadcastAsUser", before = { p -> chanIntent("BCAST", p.args.getOrNull(0)) })
@@ -207,6 +303,26 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
+    // Eksperimen: kirim perintah touch ke wallpaper (alpha, scale)
+    private fun sendWp(alpha: Float, scale: Float, force: Boolean) {
+        val wm = wpManager ?: return
+        val tk = wpToken ?: return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastWpSend < 16) return
+        lastWpSend = now
+        try {
+            val b = Bundle()
+            b.putFloat("alpha", alpha)
+            b.putFloat("scale", scale)
+            ownCall = true
+            XposedHelpers.callMethod(wm, "sendWallpaperCommand", tk, "systemui.wallpaper.touch", 0, 0, 0, b)
+        } catch (t: Throwable) {
+            once("wpSendFail") { log("sendWp gagal: $t") }
+        } finally {
+            ownCall = false
+        }
+    }
+
     // ---- utilitas view ----
 
     private fun isLocked(ctx: Context): Boolean = try {
@@ -223,7 +339,6 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // Jam bawaan = id lockscreen_clock_view ("lockscreen_measure_clock_view" hanya pengukur)
     private fun isRealClock(v: View): Boolean {
         val id = idName(v)
         if (id == "lockscreen_measure_clock_view") return false
@@ -256,7 +371,6 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // Struktur view (semua, sampai kedalaman tertentu)
     private fun dumpAll(v: View, depth: Int, maxDepth: Int, sb: StringBuilder, count: IntArray) {
         if (depth > maxDepth || count[0] > 90) return
         sb.append("\n").append("  ".repeat(depth)).append(v.javaClass.simpleName)
@@ -268,7 +382,6 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // Semua view non-standar yang terlihat
     private val skipIds = setOf("keyguard_header", "notification_stack_scroller", "notification_container_parent")
 
     private fun scanCustom(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
@@ -287,7 +400,6 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // View besar yang sedang terlihat
     private fun scanBig(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
         if (depth > 18 || count[0] > 30) return
         val isBig = v.isShown && v.width >= 300 && v.height >= 120 &&
@@ -379,7 +491,6 @@ class MainHook : IXposedHookLoadPackage {
             val up = dy > slop
             val down = progress > 0f && -dy > slop
             if ((up || down) && abs(dy) > abs(dx) * 1.2f) {
-                // batalkan sentuhan di handler asli supaya tidak membuka kunci
                 try {
                     val c = MotionEvent.obtain(ev)
                     c.action = MotionEvent.ACTION_CANCEL
@@ -444,6 +555,7 @@ class MainHook : IXposedHookLoadPackage {
                 clock.translationY = -Config.pushDp * d * p
             }
             if (sv != null) applyStack(sv, p)
+            if (Config.wpExp) sendWp(Config.wpAlpha, 1f - (1f - Config.wpMin) * p, false)
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
@@ -457,7 +569,6 @@ class MainHook : IXposedHookLoadPackage {
         return if (st != null && abs(v.translationZ - st[3]) < 0.01f) st[2] else v.translationZ
     }
 
-    // Stack: tumpukan mulai di area bawah, kartu teratas paling depan, lalu naik dan menyebar ke posisi akhir
     private fun applyStack(sv: View, p: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -490,8 +601,6 @@ class MainHook : IXposedHookLoadPackage {
 
             val collapsed = (Config.pileScale - 0.05f * i).coerceAtLeast(0.55f)
             val s = 1f - (1f - p) * (1f - collapsed)
-
-            // kartu teratas harus paling depan
             val wz = baseZ + (1f - p) * (n - i) * 3f * d
 
             card.pivotX = card.width / 2f
@@ -510,6 +619,7 @@ class MainHook : IXposedHookLoadPackage {
             c.scaleY = 1f
             c.translationY = 0f
         }
+        if (Config.wpExp) sendWp(0f, 1f, true)
         if (sv == null) return
         sv.alpha = 1f
         sv.translationY = 0f
@@ -539,7 +649,8 @@ class MainHook : IXposedHookLoadPackage {
         once("dump:$key") {
             val sb = StringBuilder("fields of $key:")
             var c: Class<*>? = obj.javaClass
-            while (c != null && c != Any::class.java) {
+            // hanya field class aplikasi (bukan View / ViewGroup bawaan Android) supaya log ringkas
+            while (c != null && c != Any::class.java && !c.name.startsWith("android.")) {
                 for (f in c.declaredFields) {
                     val value = try {
                         f.isAccessible = true
@@ -585,6 +696,12 @@ class MainHook : IXposedHookLoadPackage {
         Throwable().stackTrace.drop(3)
             .filter { it.className.contains("systemui") || it.className.contains("transsion") }
             .take(4).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+
+    // jejak dengan nama class lengkap (untuk mengetahui paket class)
+    private fun callerFull(): String =
+        Throwable().stackTrace.drop(3)
+            .filter { it.className.contains("systemui") || it.className.contains("transsion") }
+            .take(8).joinToString(" < ") { "${it.className}.${it.methodName}" }
 
     private fun once(key: String, block: () -> Unit) { if (dumped.add(key)) block() }
 
