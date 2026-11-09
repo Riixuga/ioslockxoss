@@ -4,11 +4,18 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
+import android.app.WallpaperManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Bundle
 import android.util.TypedValue
@@ -75,6 +82,10 @@ object Config {
     // teks "Notification Center" dan "N Notification(s)"
     val labels: Boolean get() = prop("debug.ioslock.labels") != "0"
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.846f
+    // bubble frosted (blur wallpaper) di belakang "N Notifications" saja, bukan "Notification Center"
+    val bubble: Boolean get() = prop("debug.ioslock.bubble") != "0"
+    // penjaga: selama di lockscreen SystemUI tidak boleh menurunkan alpha/scale jam depth
+    val holdDepth: Boolean get() = prop("debug.ioslock.holddepth") != "0"
 
     // gear jam sistem: tahap 2 memaksa SMALL (default MATI; jam depth mengecil lewat wallpaper, tidak hilang)
     val gearSwipe: Boolean get() = prop("debug.ioslock.gearswipe") == "1"
@@ -139,6 +150,25 @@ class MainHook : IXposedHookLoadPackage {
     private var centerLabel: TextView? = null
     private var countLabel: TextView? = null
 
+    // bubble frosted di belakang "N Notifications"
+    private var bubbleView: CountBubble? = null
+    private var wallBmp: Bitmap? = null
+    private var wallTried = false
+    private var bubbleBackdrop: Bitmap? = null
+    private var bubbleKey = ""
+
+    // swipe ke-3 (bouncer kunci): notifikasi & label memudar ke tengah, jam tidak diintervensi
+    @Volatile private var bouncerRef: WeakReference<View>? = null
+    @Volatile private var bouncerFade = 0f
+    private var lastBouncerScan = 0L
+
+    // nilai terakhir yang dikirim ke wallpaper: hindari spam perintah yang membuat jam berkedip
+    private var lastWpSentA = -1f
+    private var lastWpSentS = -1f
+
+    // konteks terakhir: dipakai penjaga wallpaper untuk memastikan keyguard masih terkunci
+    @Volatile private var appCtx: Context? = null
+
     // penegakan tiap frame + reset saat layar mati
     private var preDrawHost: WeakReference<View>? = null
     private var receiverRegistered = false
@@ -147,7 +177,10 @@ class MainHook : IXposedHookLoadPackage {
         if (applied) {
             val sv = stackRef?.get()
             if (sv != null) {
-                try { applyStack(sv, lastP1, lastQ) } catch (t: Throwable) { once("preDrawFail") { log("preDraw gagal: $t") } }
+                try {
+                    val fade = updateBouncer(sv.rootView ?: sv)
+                    applyStack(sv, lastP1, lastQ, fade)
+                } catch (t: Throwable) { once("preDrawFail") { log("preDraw gagal: $t") } }
             }
         }
         true
@@ -156,7 +189,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.12 loaded into SystemUI")
+        log("v0.13 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -190,7 +223,8 @@ class MainHook : IXposedHookLoadPackage {
             var want = Config.gear
             // Selama di lockscreen (termasuk saat gestur tweak aktif) jam dipaksa LARGE:
             // notifikasi masuk tidak boleh mengubah jam depth jadi kecil (foto 2N).
-            val onLock = Config.gesture && (barState == 1 || barState == -1 || applied)
+            // saat bouncer (swipe ke-3) tampil jangan ikut campur gear: penyebab jam berkedip
+            val onLock = Config.gesture && bouncerFade < 0.01f && (barState == 1 || barState == -1 || applied)
             if (want.isEmpty() && onLock) {
                 want = when {
                     Config.gearSwipe && gearSmall -> "SMALL"
@@ -234,9 +268,16 @@ class MainHook : IXposedHookLoadPackage {
             wpManager = p.thisObject
             wpToken = p.args.getOrNull(0)
             val action = p.args.getOrNull(1)?.toString() ?: "?"
+            // Penjaga: selama di lockscreen, alpha/scale jam depth tidak boleh diturunkan SystemUI
+            val held = holdDepth(p)
             if (Config.spy || action != "systemui.wallpaper.touch") {
                 val rest = p.args.drop(1).joinToString(" ") { brief(it) }
-                logT("WPCMD:$action", rest, discrete = true)
+                logT("WPCMD:$action", if (held) "$rest (depth ditahan)" else rest, discrete = true)
+            }
+            if (Config.spy) {
+                once("wpKeys:$action") {
+                    log("wpKeys $action -> ${(p.args.getOrNull(5) as? Bundle)?.keySet()}")
+                }
             }
         })
 
@@ -355,12 +396,38 @@ class MainHook : IXposedHookLoadPackage {
 
     // ---- perintah ke wallpaper ----
 
+    // alpha/scale jam depth yang seharusnya dipakai sesuai progres gestur
+    private fun wpTargetAlpha(): Float = 1f - (1f - Config.wpAlpha) * (progress - 1f).coerceIn(0f, 1f)
+
+    private fun wpTargetScale(): Float = 1f - (1f - Config.wpMin) * (progress - 1f).coerceIn(0f, 1f)
+
+    // Penjaga perintah System UI -> wallpaper: kalau SystemUI meminta alpha/scale lebih kecil
+    // (menghilangkan jam depth) sementara kita masih di lockscreen, tulis ulang dengan nilai kita.
+    private fun holdDepth(p: XC_MethodHook.MethodHookParam): Boolean {
+        if (!Config.gesture || !Config.holdDepth) return false
+        if (!applied || bouncerFade > 0.01f || !onKeyguardState()) return false
+        appCtx?.let { if (!isLocked(it)) return false }
+        val b = p.args.getOrNull(5) as? Bundle ?: return false
+        val hasA = b.containsKey("alpha")
+        val hasS = b.containsKey("scale")
+        if (!hasA && !hasS) return false
+        val a = wpTargetAlpha()
+        val s = wpTargetScale()
+        if (hasA && abs(b.getFloat("alpha", 1f) - a) > 0.004f) b.putFloat("alpha", a)
+        if (hasS && abs(b.getFloat("scale", 1f) - s) > 0.004f) b.putFloat("scale", s)
+        return true
+    }
+
     private fun sendWp(alpha: Float, scale: Float, force: Boolean) {
         val wm = wpManager ?: return
         val tk = wpToken ?: return
+        // kirim hanya saat nilainya berubah: perintah per frame membuat jam berkedip
+        if (!force && abs(alpha - lastWpSentA) < 0.004f && abs(scale - lastWpSentS) < 0.004f) return
         val now = System.currentTimeMillis()
-        if (!force && now - lastWpSend < 16) return
+        if (!force && now - lastWpSend < 33) return
         lastWpSend = now
+        lastWpSentA = alpha
+        lastWpSentS = scale
         try {
             val b = Bundle()
             b.putFloat("alpha", alpha)
@@ -496,7 +563,10 @@ class MainHook : IXposedHookLoadPackage {
                 "locked=$locked state=$barState stack=${stackRef?.get() != null} wp=${wpManager != null}",
                 discrete = true
             )
-            tracking = locked && onKeyguardState() &&
+            // kalau bouncer kunci (swipe ke-3) sedang tampil, jangan ambil alih sentuhan
+            val bouncerUp = locked && bouncerShowing(root)
+            if (bouncerUp) bouncerRef = null
+            tracking = locked && !bouncerUp && onKeyguardState() &&
                 ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
             return
         }
@@ -574,7 +644,7 @@ class MainHook : IXposedHookLoadPackage {
             val clocks = activeClocks
             val sv = stackRef?.get()
             val ctx = clocks.firstOrNull()?.context ?: sv?.context
-            if (ctx != null) ensureReceiver(ctx)
+            if (ctx != null) { appCtx = ctx; ensureReceiver(ctx) }
             val locked = ctx != null && isLocked(ctx)
             val onKeyguard = locked && onKeyguardState()
             if (!Config.gesture || !onKeyguard) {
@@ -583,6 +653,8 @@ class MainHook : IXposedHookLoadPackage {
                 return
             }
             applied = true
+            // swipe ke-3 / bouncer kunci: notifikasi dan label ikut memudar ke tengah
+            val fade = if (sv != null) updateBouncer(sv.rootView ?: sv) else 0f
             val n = sv?.let { countCards(it) } ?: 0
             cardCount = n
             if (n == 0) {
@@ -596,7 +668,7 @@ class MainHook : IXposedHookLoadPackage {
                 lastP1 = 0f
                 lastQ = 0f
                 if (sentWp) { sentWp = false; sendWp(1f, 1f, true) }
-                if (sv != null) applyStack(sv, 0f, 0f) else hideLabels()
+                if (sv != null) applyStack(sv, 0f, 0f, fade) else hideLabels()
                 return
             }
             val p = progress
@@ -606,18 +678,18 @@ class MainHook : IXposedHookLoadPackage {
             lastQ = q
 
             // gear jam sistem: tahap 2 -> SMALL; selain itu ikut sistem (atau LARGE jika keepbig)
-            if (Config.gearSwipe && Config.gear.isEmpty()) {
+            if (Config.gearSwipe && Config.gear.isEmpty() && fade < 0.01f) {
                 if (q > 0.55f) gearSmall = true else if (q < 0.45f) gearSmall = false
                 val want = if (gearSmall) "SMALL" else if (Config.keepBig) "LARGE" else sysGear
                 if (want != null && want != (lastGearSet ?: sysGear)) setGear(want)
             }
 
             // jam depth wallpaper: di tahap 2 jam MENGECIL (foto 4) tapi tetap terlihat,
-            // tidak boleh di-fade sampai hilang
-            if (Config.wpExp) {
+            // tidak boleh di-fade sampai hilang. Saat bouncer tampil berhenti mengirim (jam berkedip).
+            if (Config.wpExp && fade < 0.01f) {
                 if (q > 0.001f) {
                     sentWp = true
-                    sendWp(1f - (1f - Config.wpAlpha) * q, 1f - (1f - Config.wpMin) * q, q >= 0.999f)
+                    sendWp(wpTargetAlpha(), wpTargetScale(), q >= 0.999f)
                 } else if (sentWp) {
                     sentWp = false
                     sendWp(1f, 1f, true)
@@ -626,7 +698,7 @@ class MainHook : IXposedHookLoadPackage {
 
             if (sv != null) {
                 ensurePreDraw(sv)
-                applyStack(sv, p1, q)
+                applyStack(sv, p1, q, fade)
             }
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
@@ -642,10 +714,11 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     // p1: 0..1 (tumpukan di bawah -> posisi diam), q: 0..1 (posisi diam -> posisi akhir tahap 2)
-    private fun applyStack(sv: View, p1: Float, q: Float) {
+    // fade: 0..1 = bouncer kunci (swipe ke-3): kartu memudar dan tertarik ke tengah layar
+    private fun applyStack(sv: View, p1: Float, q: Float, fade: Float = 0f) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
-        sv.alpha = (p1 * 2.5f).coerceAtMost(1f)
+        sv.alpha = (p1 * 2.5f).coerceAtMost(1f) * (1f - fade)
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         val loc = IntArray(2)
@@ -685,11 +758,21 @@ class MainHook : IXposedHookLoadPackage {
             val base2 = baseY + shift
             val naturalCenter = loc[1] + base2 + h / 2f
             val targetCenter = pileCenter + i * Config.peekDp * d
-            val wy = base2 + (1f - p1) * (targetCenter - naturalCenter)
+            var wy = base2 + (1f - p1) * (targetCenter - naturalCenter)
 
             val collapsed = (Config.pileScale - 0.05f * i).coerceAtLeast(0.55f)
-            val s = 1f - (1f - p1) * (1f - collapsed)
+            var s = 1f - (1f - p1) * (1f - collapsed)
             val wz = baseZ + (1f - p1) * (n - i) * 3f * d
+
+            // "fade ketengah": kartu ditarik ke tengah layar, mengecil sedikit, lalu memudar
+            if (fade > 0f) {
+                val cy = loc[1] + wy + h / 2f
+                wy += (dm.heightPixels * 0.5f - cy) * fade
+                s *= 1f - 0.12f * fade
+                card.alpha = 1f - fade
+            } else if (card.alpha != 1f) {
+                card.alpha = 1f
+            }
 
             card.pivotX = card.width / 2f
             card.pivotY = h / 2f
@@ -704,7 +787,7 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
 
-        updateLabels(sv, n, p1, topVisual, leftVisual, d, dm.heightPixels)
+        updateLabels(sv, n, p1, topVisual, leftVisual, d, dm.heightPixels, fade)
     }
 
     private fun countCards(sv: View): Int {
@@ -743,6 +826,17 @@ class MainHook : IXposedHookLoadPackage {
             host.addView(v)
             centerLabel = v
         }
+        // bubble frosted di belakang "N Notifications" (ditambahkan sebelum label agar di belakang teks)
+        if (bubbleView?.parent !== host) {
+            (bubbleView?.parent as? ViewGroup)?.removeView(bubbleView)
+            val d = host.resources.displayMetrics.density
+            val v = CountBubble(host.context)
+            v.layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, (72f * d).toInt()
+            )
+            host.addView(v)
+            bubbleView = v
+        }
         if (countLabel?.parent !== host) {
             (countLabel?.parent as? ViewGroup)?.removeView(countLabel)
             val v = makeLabel(host.context, 13f)
@@ -754,9 +848,13 @@ class MainHook : IXposedHookLoadPackage {
     private fun hideLabels() {
         centerLabel?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
         countLabel?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
+        bubbleView?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
     }
 
-    private fun updateLabels(sv: View, n: Int, p1: Float, topVisual: Float, leftVisual: Float, d: Float, screenH: Int) {
+    private fun updateLabels(
+        sv: View, n: Int, p1: Float, topVisual: Float, leftVisual: Float,
+        d: Float, screenH: Int, fade: Float,
+    ) {
         if (!Config.labels) { hideLabels(); return }
         val host = sv.rootView as? FrameLayout ?: return
         ensureLabels(host)
@@ -766,26 +864,49 @@ class MainHook : IXposedHookLoadPackage {
         host.getLocationOnScreen(hl)
 
         // "Notification Center": menempel di atas kartu paling atas, rata kiri dengan tepi kiri kartu
-        // (garis merah "y" foto 3), bukan di tengah.
-        val ca = ((p1 - 0.7f) / 0.3f).coerceIn(0f, 1f)
+        // (garis merah "y" foto 3), bukan di tengah. Saat bouncer (swipe ke-3) ikut memudar ke tengah.
+        val ca = (((p1 - 0.7f) / 0.3f).coerceIn(0f, 1f)) * (1f - fade)
         c.alpha = ca
         c.visibility = if (ca > 0f) View.VISIBLE else View.INVISIBLE
         val ch = if (c.height > 0) c.height.toFloat() else 28f * d
         c.translationY = topVisual - hl[1] - ch - 6f * d
-        c.translationX = (leftVisual - hl[0]).coerceAtLeast(8f * d)
+        val leftX = (leftVisual - hl[0]).coerceAtLeast(8f * d)
+        val ctw = c.paint.measureText(c.text.toString())
+        val midX = ((sv.width - ctw) / 2f).coerceAtLeast(0f)
+        c.translationX = leftX + (midX - leftX) * fade
 
         // "N Notification(s)": tampil saat stack tertutup, memudar saat stack ditarik
-        val ka = (1f - p1 * 3f).coerceIn(0f, 1f)
+        val ka = ((1f - p1 * 3f).coerceIn(0f, 1f)) * (1f - fade)
         val t = "\u2022 $n Notification" + if (n != 1) "s" else ""
         if (k.text.toString() != t) k.text = t
         k.alpha = ka
         k.visibility = if (ka > 0f) View.VISIBLE else View.INVISIBLE
         val kh = if (k.height > 0) k.height.toFloat() else 20f * d
         k.translationY = screenH * Config.countFrac - hl[1] - kh / 2f
+
+        // bubble: pill frosted (blur wallpaper) di belakang teks, bukan untuk "Notification Center"
+        val bub = bubbleView ?: return
+        val show = Config.bubble && ka > 0.02f
+        bub.alpha = ka
+        bub.visibility = if (show) View.VISIBLE else View.INVISIBLE
+        if (!show) return
+        val bubH = if (bub.height > 0) bub.height.toFloat() else 72f * d
+        bub.translationY = (k.translationY + kh / 2f) - bubH / 2f
+        val pillW = k.paint.measureText(t) + 26f * d
+        val pillH = kh + 10f * d
+        bub.pillW = pillW
+        bub.pillH = pillH
+        bub.backdrop = backdropFor(
+            bub.context, pillW, pillH,
+            hl[0] + sv.width / 2f, hl[1] + k.translationY + kh / 2f,
+            sv.width, screenH
+        )
     }
 
     private fun reset(sv: View?) {
         hideLabels()
+        bouncerFade = 0f
+        bouncerRef = null
         // kembalikan wallpaper ke keadaan normal
         if (sentWp) {
             sentWp = false
@@ -811,6 +932,143 @@ class MainHook : IXposedHookLoadPackage {
                 c.scaleX = 1f
                 c.scaleY = 1f
                 rowState.remove(c)
+            }
+        }
+    }
+
+    // ---- bouncer kunci (swipe ke-3): notifikasi & label memudar ke tengah ----
+
+    private fun bouncerShowing(root: View): Boolean {
+        val cached = bouncerRef?.get()
+        if (cached != null) {
+            if (cached.isShown && cached.alpha > 0.01f) return true
+            bouncerRef = null
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastBouncerScan < 300L) return false
+        lastBouncerScan = now
+        val found = ArrayList<View>()
+        findViews(root, 0, found) { v ->
+            val cn = v.javaClass.simpleName
+            val id = idName(v)
+            (cn.contains("Bouncer") || cn.contains("KeyguardSecurity") ||
+                id.contains("bouncer") || id.contains("keyguard_security")) &&
+                v.isShown && v.alpha > 0.01f && v.width > 0 && v.height > 0
+        }
+        val v = found.firstOrNull() ?: return false
+        bouncerRef = WeakReference(v)
+        log("bouncer terdeteksi: ${v.javaClass.simpleName} ${idName(v)}")
+        return true
+    }
+
+    // naik/turun bertahap tiap frame supaya fade-nya halus, bukan lompat
+    private fun updateBouncer(root: View): Float {
+        val target = if (bouncerShowing(root)) 1f else 0f
+        val f = bouncerFade
+        if (f == target) return f
+        val step = 0.18f
+        bouncerFade = if (target > f) (f + step).coerceAtMost(1f) else (f - step).coerceAtLeast(0f)
+        return bouncerFade
+    }
+
+    // ---- bubble frosted: potongan wallpaper lockscreen yang diburamkan ----
+
+    private fun lockWallpaper(ctx: Context): Bitmap? {
+        if (wallTried) return wallBmp
+        wallTried = true
+        wallBmp = try {
+            val wm = WallpaperManager.getInstance(ctx)
+            // getBitmap() tidak ada di stub SDK ini, jadi drawable lockscreen digambar sendiri
+            val dr = try { wm.getDrawable(WallpaperManager.FLAG_LOCK) } catch (e: Throwable) { null }
+                ?: wm.getDrawable()
+            if (dr == null) null else {
+                val iw = if (dr.intrinsicWidth > 0) dr.intrinsicWidth else 1080
+                val ih = if (dr.intrinsicHeight > 0) dr.intrinsicHeight else 2160
+                val s = 540f / iw
+                val bw = 540
+                val bh = (ih * s).toInt().coerceAtLeast(1)
+                val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+                val c = Canvas(bmp)
+                dr.setBounds(0, 0, bw, bh)
+                dr.draw(c)
+                bmp
+            }
+        } catch (t: Throwable) {
+            once("wallFail") { log("wallpaper gagal dibaca: $t") }
+            null
+        }
+        return wallBmp
+    }
+
+    private fun backdropFor(
+        ctx: Context, pw: Float, ph: Float,
+        cx: Float, cy: Float, screenW: Int, screenH: Int,
+    ): Bitmap? {
+        if (!Config.bubble) return null
+        val wall = lockWallpaper(ctx) ?: return null
+        if (wall.isRecycled || screenW <= 0 || screenH <= 0) return null
+        val key = "${pw.toInt()}x${ph.toInt()}@${cx.toInt()},${cy.toInt()}/${wall.width}x${wall.height}"
+        if (key == bubbleKey && bubbleBackdrop?.isRecycled == false) return bubbleBackdrop
+        return try {
+            val bw = wall.width.toFloat()
+            val bh = wall.height.toFloat()
+            val sw = (pw / screenW * bw).coerceAtLeast(6f)
+            val sh = (ph / screenH * bh).coerceAtLeast(4f)
+            val l = (cx / screenW * bw - sw / 2f).coerceIn(0f, (bw - sw).coerceAtLeast(0f))
+            val t = (cy / screenH * bh - sh / 2f).coerceIn(0f, (bh - sh).coerceAtLeast(0f))
+            val smallW = 40
+            val smallH = (smallW * sh / sw).toInt().coerceIn(8, 40)
+            val small = Bitmap.createBitmap(smallW, smallH, Bitmap.Config.ARGB_8888)
+            val c = Canvas(small)
+            c.drawBitmap(
+                wall,
+                Rect(l.toInt(), t.toInt(), (l + sw).toInt(), (t + sh).toInt()),
+                RectF(0f, 0f, smallW.toFloat(), smallH.toFloat()),
+                Paint(Paint.FILTER_BITMAP_FLAG)
+            )
+            upscaleBlur(small)
+            bubbleBackdrop?.recycle()
+            bubbleBackdrop = small
+            bubbleKey = key
+            small
+        } catch (e: Throwable) {
+            once("bubbleFail") { log("bubble gagal: $e") }
+            null
+        }
+    }
+
+    private fun upscaleBlur(bmp: Bitmap) {
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        repeat(2) {
+            boxBlurPass(px, w, h, 3, true)
+            boxBlurPass(px, w, h, 3, false)
+        }
+        bmp.setPixels(px, 0, w, 0, 0, w, h)
+    }
+
+    private fun boxBlurPass(px: IntArray, w: Int, h: Int, r: Int, horizontal: Boolean) {
+        val src = px.copyOf()
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                var sa = 0
+                var sr = 0
+                var sg = 0
+                var sb = 0
+                var n = 0
+                for (k in -r..r) {
+                    val xx = if (horizontal) (x + k).coerceIn(0, w - 1) else x
+                    val yy = if (horizontal) y else (y + k).coerceIn(0, h - 1)
+                    val p = src[yy * w + xx]
+                    sa += (p ushr 24) and 0xFF
+                    sr += (p ushr 16) and 0xFF
+                    sg += (p ushr 8) and 0xFF
+                    sb += p and 0xFF
+                    n++
+                }
+                px[y * w + x] = ((sa / n) shl 24) or ((sr / n) shl 16) or ((sg / n) shl 8) or (sb / n)
             }
         }
     }
@@ -862,5 +1120,49 @@ class MainHook : IXposedHookLoadPackage {
     private fun log(msg: String) {
         XposedBridge.log("$tag $msg")
         android.util.Log.i("IOSLock", msg)
+    }
+}
+
+// Pill frosted di belakang "N Notifications": potongan wallpaper lockscreen yang diburamkan,
+// bentuk kapsul seperti tombol flash/kamera, dengan lapisan gelap transparan + tepi tipis.
+private class CountBubble(ctx: Context) : View(ctx) {
+    var pillW: Float = 0f
+    var pillH: Float = 0f
+    var backdrop: Bitmap? = null
+
+    private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+    private val scrim = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x59000000 }
+    private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = 0x33FFFFFF
+        strokeWidth = 1f * ctx.resources.displayMetrics.density
+    }
+    private val rect = RectF()
+    private val path = Path()
+
+    init {
+        isClickable = false
+        isFocusable = false
+        alpha = 0f
+        visibility = INVISIBLE
+    }
+
+    override fun onDraw(c: Canvas) {
+        if (pillW <= 0f || pillH <= 0f) return
+        val cx = width / 2f
+        val cy = height / 2f
+        rect.set(cx - pillW / 2f, cy - pillH / 2f, cx + pillW / 2f, cy + pillH / 2f)
+        val r = pillH / 2f
+        val b = backdrop
+        if (b != null && !b.isRecycled) {
+            path.reset()
+            path.addRoundRect(rect, r, r, Path.Direction.CW)
+            val save = c.save()
+            c.clipPath(path)
+            c.drawBitmap(b, null, rect, bmpPaint)
+            c.restoreToCount(save)
+        }
+        c.drawRoundRect(rect, r, r, scrim)
+        c.drawRoundRect(rect, r, r, edge)
     }
 }

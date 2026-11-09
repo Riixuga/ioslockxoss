@@ -12,6 +12,17 @@ adb logcat -s IOSLock > ioslock.txt   (atau LSPosed > Logs > filter IOSLock > si
 Urutan: nyalakan layar -> kunci -> biarkan notifikasi masuk -> swipe ke atas pelan-pelan sampai batas F -> turun lagi.
 Kirim file log utuh (blok "methods of", "fields of", "clock attached", "clockState", setClockLevel, changePanelCollapseAnim).
 
+## Tuning gesture tanpa rebuild (root)
+su -c setprop debug.ioslock.restfrac 0.55   # posisi diam stack tahap 1 (0..1 tinggi layar)
+su -c setprop debug.ioslock.endfrac 0.33    # posisi stack di akhir tahap 2
+su -c setprop debug.ioslock.wpmin 0.5       # skala jam depth akhir tahap 2 (1 = tidak mengecil)
+su -c setprop debug.ioslock.wpalpha 1       # alpha jam depth akhir tahap 2 (0 = hilang)
+su -c setprop debug.ioslock.keepbig 0       # 0 = jangan paksa gear LARGE di lockscreen
+su -c setprop debug.ioslock.gearswipe 1     # 1 = paksa gear SMALL di tahap 2
+su -c setprop debug.ioslock.labels 0        # sembunyikan "Notification Center" / "N Notifications"
+su -c setprop debug.ioslock.bubble 0        # matikan bubble frosted di belakang "N Notifications"
+su -c setprop debug.ioslock.holddepth 0     # matikan penjaga alpha/scale jam depth
+
 ## Eksperimen tanpa rebuild (root)
 su -c setprop debug.ioslock.level N      # paksa arg setClockLevel
 su -c setprop debug.ioslock.push 1       # jam terdorong mengikuti swipe
