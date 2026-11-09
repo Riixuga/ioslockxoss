@@ -42,6 +42,8 @@ object Config {
     // Menyala otomatis; matikan dengan: setprop debug.ioslock.gesture 0
     val gesture: Boolean get() = prop("debug.ioslock.gesture") != "0"
     val forceClockLevel: Int? get() = prop("debug.ioslock.level").toIntOrNull()
+    // paksa gear jam: LARGE atau SMALL (kosongkan = bawaan)
+    val gear: String get() = prop("debug.ioslock.gear").trim().uppercase()
     val pushDp: Float get() = prop("debug.ioslock.pushdp").toFloatOrNull() ?: 120f
     val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
@@ -54,12 +56,8 @@ object Config {
 
     // eksperimen: kirim perintah systemui.wallpaper.touch ke wallpaper mengikuti progres swipe
     val wpExp: Boolean get() = prop("debug.ioslock.wpexp") == "1"
-    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.8f
-    // kosong = ikuti alpha dari sistem (JANGAN 0: alpha 0 menyembunyikan jam yang digambar wallpaper)
-    val wpAlpha: Float? get() = prop("debug.ioslock.wpalpha").toFloatOrNull()
-
-    // jam tetap LARGE walau ada notifikasi (matikan: setprop debug.ioslock.keeplarge 0)
-    val keepLarge: Boolean get() = prop("debug.ioslock.keeplarge") != "0"
+    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.6f
+    val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 1f
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -87,10 +85,6 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var wpToken: Any? = null
     @Volatile private var ownCall = false
     private var lastWpSend = 0L
-    // alpha terakhir yang dikirim SISTEM ke wallpaper (1 = jam terlihat, 0 = layar mati / transisi)
-    @Volatile private var sysAlpha = 1f
-    // true jika kita sudah mengirim scale != 1, jadi perlu dikembalikan
-    private var wpDirty = false
 
     // state gestur
     private var progress = 0f
@@ -107,10 +101,11 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.9 loaded into SystemUI")
+        log("v0.8 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
+        val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
         val stack = "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayoutController"
         val shadeWindow = "com.android.systemui.shade.NotificationShadeWindowView"
@@ -132,15 +127,6 @@ class MainHook : IXposedHookLoadPackage {
                 try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
             }
         }, after = { applyState() })
-        // Jam bawaan mengecil (gear SMALL) saat ada notifikasi -> paksa tetap LARGE
-        hook(cl, "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor", "switchClockGear", before = { p ->
-            val g = p.args.getOrNull(0) ?: return@hook
-            logT("clockGear", "arg=$g keepLarge=${Config.keepLarge}", discrete = true)
-            if (Config.keepLarge && g.toString() == "SMALL") {
-                @Suppress("UNCHECKED_CAST")
-                p.args[0] = java.lang.Enum.valueOf(g.javaClass as Class<out Enum<*>>, "LARGE")
-            }
-        })
         hook(cl, clockView, "setFactor", before = { p ->
             logT("setFactor", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
         })
@@ -148,29 +134,34 @@ class MainHook : IXposedHookLoadPackage {
             logT("updateClockViewParams", "arg=${p.args.getOrNull(0)}", discrete = true)
         }, after = { applyState() })
 
+        // Gear jam: LARGE / SMALL. SMALL kemungkinan penyebab jam mengecil saat ada notifikasi.
+        hook(cl, clockInteractor, "switchClockGear", before = { p ->
+            logT("switchClockGear", "args=${p.args.toList()} caller=${caller()}", discrete = true)
+            val want = Config.gear
+            val cur = p.args.getOrNull(0)
+            if (want.isNotEmpty() && cur is Enum<*>) {
+                try {
+                    val ec = if (cur.javaClass.isEnum) cur.javaClass else cur.javaClass.superclass
+                    val consts = ec?.enumConstants
+                    var target: Any? = null
+                    if (consts != null) {
+                        for (c in consts) {
+                            if ((c as Enum<*>).name == want) target = c
+                        }
+                    }
+                    if (target != null) p.args[0] = target
+                } catch (t: Throwable) { log("force gear gagal: $t") }
+            }
+        })
+
         // Kapan jam bawaan disembunyikan karena tema / wallpaper
         hook(cl, clockHelper, "updateKeyguardClockVisibility", before = { p ->
             logT("clockVisibility", "args=${p.args.toList()} caller=${caller()}", discrete = true)
-        }, after = { p -> logT("helperState", compactFields(p.thisObject), discrete = true) })
+            val inst = p.thisObject
+            if (inst != null) dumpFields("helper", inst)
+        })
         hook(cl, clockHelper, "updateClockVisibilityInternal", before = { p ->
             logT("clockVisibilityInternal", "args=${p.args.toList()} caller=${caller()}", discrete = true)
-        }, after = { p -> logT("helperState", compactFields(p.thisObject), discrete = true) })
-        hook(cl, clockHelper, "handleClockPosition", after = { p ->
-            logT("helperState", compactFields(p.thisObject), discrete = true)
-        })
-        // Mode tampilan jam (ClockDisplayMode) yang dipilih binder: catat nilai + semua konstanta enum-nya
-        hook(cl, "com.android.systemui.keyguard.ui.binder.TrKeyguardClockViewBinder", "access\$getClockView", before = { p ->
-            val mode = p.args.getOrNull(2)
-            logT("binderMode", "mode=$mode flag=${p.args.getOrNull(3)} caller=${caller()}", discrete = true)
-            if (mode != null) once("modeEnum") {
-                try {
-                    val vals = mode.javaClass.enumConstants?.joinToString(",")
-                    log("ClockDisplayMode values: $vals")
-                } catch (t: Throwable) { }
-            }
-        })
-        hook(cl, "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor", "switchClockGear", after = { p ->
-            logT("interactorState", compactFields(p.thisObject), discrete = true)
         })
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
@@ -184,15 +175,15 @@ class MainHook : IXposedHookLoadPackage {
             applyState()
         })
 
-        // Ambil View stack notifikasi dari controller-nya
+        // Ambil View stack notifikasi dari controller-nya (field mView)
         hook(cl, stack, "updateVisibility", after = { p ->
-            try {
-                val v = XposedHelpers.callMethod(p.thisObject, "getView") as? View
-                if (v != null) {
-                    stackRef = WeakReference(v)
-                    once("stackView") { log("stack view: " + describeView(v)) }
-                }
-            } catch (t: Throwable) { once("stackViewFail") { log("getView gagal: $t") } }
+            val v = try {
+                XposedHelpers.getObjectField(p.thisObject, "mView") as? View
+            } catch (t: Throwable) { null }
+            if (v != null) {
+                stackRef = WeakReference(v)
+                once("stackView") { log("stack view: " + describeView(v)) }
+            }
         })
 
         // Tangkap sentuhan di window shade
@@ -316,11 +307,6 @@ class MainHook : IXposedHookLoadPackage {
             wpManager = p.thisObject
             wpToken = p.args.getOrNull(0)
             val action = p.args.getOrNull(1)?.toString() ?: "?"
-            if (action == "systemui.wallpaper.touch") {
-                val b = p.args.getOrNull(5) as? Bundle
-                if (b != null && b.containsKey("alpha")) sysAlpha = b.getFloat("alpha", sysAlpha)
-                return@hook // sudah ratusan baris per swipe, tidak perlu dilog lagi
-            }
             val rest = p.args.drop(1).joinToString(" ") { briefArg(it) }
             logT("WPCMD:$action", "$rest stack=${callerFull()}", discrete = true)
         })
@@ -343,7 +329,7 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     // Eksperimen: kirim perintah touch ke wallpaper (alpha, scale)
-    private fun sendWp(scale: Float, force: Boolean) {
+    private fun sendWp(alpha: Float, scale: Float, force: Boolean) {
         val wm = wpManager ?: return
         val tk = wpToken ?: return
         val now = System.currentTimeMillis()
@@ -351,7 +337,7 @@ class MainHook : IXposedHookLoadPackage {
         lastWpSend = now
         try {
             val b = Bundle()
-            b.putFloat("alpha", Config.wpAlpha ?: sysAlpha)
+            b.putFloat("alpha", alpha)
             b.putFloat("scale", scale)
             ownCall = true
             XposedHelpers.callMethod(wm, "sendWallpaperCommand", tk, "systemui.wallpaper.touch", 0, 0, 0, b)
@@ -504,7 +490,10 @@ class MainHook : IXposedHookLoadPackage {
                     log(sb.toString())
                 }
                 val realClock = activeClocks.firstOrNull { idName(it) == "lockscreen_clock_view" }
-                if (realClock != null) dumpFields("clock", realClock)
+                if (realClock != null) {
+                    dumpFields("clock", realClock)
+                    logT("clockAtTouch", describeView(realClock), discrete = true)
+                }
                 val big = StringBuilder("visibleBig:")
                 scanBig(root.rootView, 0, big, intArrayOf(0))
                 logT("visibleBig", big.toString(), discrete = true)
@@ -514,8 +503,7 @@ class MainHook : IXposedHookLoadPackage {
             }
             logT(
                 "touchSeen",
-                "locked=$locked state=$barState clocks=${activeClocks.size} stack=${stackRef?.get() != null} " +
-                    "sysAlpha=$sysAlpha clock=${activeClocks.firstOrNull()?.let { describeView(it) }}",
+                "locked=$locked state=$barState clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
                 discrete = true
             )
             tracking = locked && onKeyguardState() &&
@@ -595,15 +583,7 @@ class MainHook : IXposedHookLoadPackage {
                 clock.translationY = -Config.pushDp * d * p
             }
             if (sv != null) applyStack(sv, p)
-            if (Config.wpExp) {
-                if (p > 0f) {
-                    wpDirty = true
-                    sendWp(1f - (1f - Config.wpMin) * p, false)
-                } else if (wpDirty) {
-                    wpDirty = false
-                    sendWp(1f, true)
-                }
-            }
+            if (Config.wpExp) sendWp(Config.wpAlpha, 1f - (1f - Config.wpMin) * p, false)
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
@@ -667,10 +647,8 @@ class MainHook : IXposedHookLoadPackage {
             c.scaleY = 1f
             c.translationY = 0f
         }
-        if (wpDirty) {
-            wpDirty = false
-            sendWp(1f, true)
-        }
+        // kembalikan wallpaper ke keadaan normal (alpha 1, scale 1)
+        if (Config.wpExp) sendWp(1f, 1f, true)
         if (sv == null) return
         sv.alpha = 1f
         sv.translationY = 0f
@@ -700,7 +678,7 @@ class MainHook : IXposedHookLoadPackage {
         once("dump:$key") {
             val sb = StringBuilder("fields of $key:")
             var c: Class<*>? = obj.javaClass
-            // hanya field class aplikasi (bukan View / ViewGroup bawaan Android) supaya log ringkas
+            // hanya field class aplikasi (bukan View / ViewGroup bawaan Android)
             while (c != null && c != Any::class.java && !c.name.startsWith("android.")) {
                 for (f in c.declaredFields) {
                     val value = try {
@@ -748,38 +726,12 @@ class MainHook : IXposedHookLoadPackage {
             .filter { it.className.contains("systemui") || it.className.contains("transsion") }
             .take(4).joinToString(" < ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
 
-    // jejak dengan nama class lengkap (untuk mengetahui paket class)
     private fun callerFull(): String =
         Throwable().stackTrace.drop(3)
             .filter { it.className.contains("systemui") || it.className.contains("transsion") }
             .take(8).joinToString(" < ") { "${it.className}.${it.methodName}" }
 
     private fun once(key: String, block: () -> Unit) { if (dumped.add(key)) block() }
-
-    // satu baris berisi field primitif / String / enum / ukuran koleksi milik class aplikasi
-    private fun compactFields(obj: Any?): String {
-        if (obj == null) return "null"
-        val sb = StringBuilder(obj.javaClass.simpleName).append("{")
-        var c: Class<*>? = obj.javaClass
-        while (c != null && c != Any::class.java && !c.name.startsWith("android.")) {
-            for (f in c.declaredFields) {
-                if (Modifier.isStatic(f.modifiers) || f.name.contains('$')) continue
-                try {
-                    f.isAccessible = true
-                    val x = f.get(obj)
-                    val s = when {
-                        x == null -> continue
-                        f.type.isPrimitive || x is String || x is Number || x is Boolean || x is Enum<*> -> x.toString()
-                        x is Collection<*> -> "size=${x.size}"
-                        else -> continue
-                    }
-                    sb.append(f.name).append('=').append(s).append(' ')
-                } catch (t: Throwable) { }
-            }
-            c = c.superclass
-        }
-        return sb.append("}").toString()
-    }
 
     private fun logT(key: String, msg: String, discrete: Boolean = false) {
         val now = System.currentTimeMillis()
