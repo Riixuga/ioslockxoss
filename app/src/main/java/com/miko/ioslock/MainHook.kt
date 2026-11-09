@@ -42,10 +42,10 @@ object Config {
     val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
-    // id view jam tambahan yang ingin digeser/dikecilkan (lihat log visibleBig)
+    // jarak meluncur kartu dari bawah saat stack muncul
+    val slideDp: Float get() = prop("debug.ioslock.slidedp").toFloatOrNull() ?: 80f
+    // id view jam tambahan yang ingin digeser/dikecilkan
     val clockId: String get() = prop("debug.ioslock.clockid")
-    // guard tambahan: hanya ambil alih jika tinggi shade <= 1
-    val guardH: Boolean get() = prop("debug.ioslock.guardh") == "1"
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -61,9 +61,8 @@ class MainHook : IXposedHookLoadPackage {
 
     // 0 = SHADE, 1 = KEYGUARD, 2 = SHADE_LOCKED, -1 = belum diketahui
     @Volatile private var barState = -1
-    @Volatile private var shadeH = 0f
 
-    // posisi asli tiap kartu notifikasi: [dasar, nilai yang kita tulis]
+    // posisi asli tiap kartu: [dasar, nilai yang kita tulis]
     private val rowState = WeakHashMap<View, FloatArray>()
 
     // state gestur
@@ -80,7 +79,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.5.1 loaded into SystemUI")
+        log("v0.5.2 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
@@ -112,13 +111,6 @@ class MainHook : IXposedHookLoadPackage {
         }, after = { applyState() })
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
-        hook(cl, panel, "onHeightUpdated", after = { p ->
-            val h = p.args.getOrNull(0) as? Float
-            if (h != null) {
-                shadeH = h
-                logT("shadeH", "h=$h")
-            }
-        })
 
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
         hook(cl, stateCtl, "setState", after = { p ->
@@ -202,7 +194,26 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // View besar yang sedang terlihat (untuk mencari jam yang sebenarnya)
+    // Semua view non-standar yang terlihat (untuk mencari penggambar jam)
+    private val skipIds = setOf("keyguard_header", "notification_stack_scroller", "notification_container_parent")
+
+    private fun scanCustom(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
+        if (depth > 10 || count[0] > 60) return
+        val n = v.javaClass.name
+        val id = idName(v)
+        if (v.isShown && !n.startsWith("android.") && !n.startsWith("androidx.")) {
+            sb.append("\n").append("  ".repeat(depth.coerceAtMost(6))).append(n.substringAfterLast('.'))
+            sb.append(" id=").append(id)
+            sb.append(" ").append(v.width).append("x").append(v.height)
+            count[0]++
+        }
+        if (id in skipIds) return
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) scanCustom(v.getChildAt(i), depth + 1, sb, count)
+        }
+    }
+
+    // View besar yang sedang terlihat
     private fun scanBig(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
         if (depth > 18 || count[0] > 30) return
         val isBig = v.isShown && v.width >= 300 && v.height >= 120 &&
@@ -255,6 +266,11 @@ class MainHook : IXposedHookLoadPackage {
                     dumpAll(root.rootView, 0, 5, sb, intArrayOf(0))
                     log(sb.toString())
                 }
+                once("custom") {
+                    val sb = StringBuilder("visibleCustom:")
+                    scanCustom(root.rootView, 0, sb, intArrayOf(0))
+                    log(sb.toString())
+                }
                 val realClock = activeClocks.firstOrNull { idName(it) == "lockscreen_clock_view" }
                 if (realClock != null) dumpFields("clock", realClock)
                 val big = StringBuilder("visibleBig:")
@@ -266,11 +282,10 @@ class MainHook : IXposedHookLoadPackage {
             }
             logT(
                 "touchSeen",
-                "locked=$locked state=$barState shadeH=$shadeH clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
+                "locked=$locked state=$barState clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
                 discrete = true
             )
             tracking = locked && onKeyguardState() &&
-                (!Config.guardH || shadeH <= 1f) &&
                 ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
             return
         }
@@ -316,7 +331,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun snap(target: Float) {
         animator?.cancel()
         val an = ValueAnimator.ofFloat(progress, target)
-        an.duration = 260
+        an.duration = 280
         an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
         animator = an
         an.start()
@@ -354,33 +369,34 @@ class MainHook : IXposedHookLoadPackage {
         return if (st != null && abs(row.translationY - st[1]) < 0.01f) st[0] else row.translationY
     }
 
-    // Animasi stack: kartu menumpuk di kartu teratas, lalu menyebar saat p naik ke 1
+    // Stack: semua kartu meluncur dari bawah, menumpuk di kartu teratas, lalu menyebar saat p naik ke 1
     private fun applyStack(sv: View, p: Float) {
         val d = sv.resources.displayMetrics.density
-        sv.alpha = (p * 3f).coerceAtMost(1f)
+        sv.alpha = (p * 2.5f).coerceAtMost(1f)
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
-        val rows = ArrayList<Pair<View, Float>>()
+        val cards = ArrayList<Pair<View, Float>>()
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
-            if (c.visibility == View.VISIBLE && c.javaClass.name.contains("ExpandableNotificationRow")) {
-                rows.add(Pair(c, baseOf(c)))
+            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0) {
+                cards.add(Pair(c, baseOf(c)))
             }
         }
-        rows.sortBy { it.second }
-        if (rows.isEmpty()) return
-        val base0 = rows[0].second
-        for (i in 0 until rows.size) {
-            val row = rows[i].first
-            val base = rows[i].second
-            val off = (1f - p) * ((base0 - base) + i * 10f * d)
+        cards.sortBy { it.second }
+        if (cards.isEmpty()) return
+        val base0 = cards[0].second
+        val slide = Config.slideDp * d
+        for (i in 0 until cards.size) {
+            val card = cards[i].first
+            val base = cards[i].second
+            val off = (1f - p) * ((base0 - base) + i * 10f * d + slide)
             val w = base + off
-            row.translationY = w
-            val s = 1f - (1f - p) * 0.05f * i
-            row.pivotX = row.width / 2f
-            row.scaleX = s
-            row.scaleY = s
-            rowState[row] = floatArrayOf(base, w)
+            card.translationY = w
+            val s = (1f - (1f - p) * (0.06f + 0.03f * i)).coerceAtLeast(0.7f)
+            card.pivotX = card.width / 2f
+            card.scaleX = s
+            card.scaleY = s
+            rowState[card] = floatArrayOf(base, w)
         }
     }
 
