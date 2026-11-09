@@ -28,6 +28,7 @@ su -c setprop debug.ioslock.wpexp 0         # 0 = jangan kecilkan jam depth di t
 su -c setprop debug.ioslock.pilescale 1     # skala kartu notifikasi terbaru saat tertutup
 su -c setprop debug.ioslock.pilestep 0.06   # selisih skala tiap kartu lebih lama (tumpukan gaya iOS)
 su -c setprop debug.ioslock.peekdp 14       # jarak intip antar kartu di tumpukan
+su -c setprop debug.ioslock.pilefrac 1      # garis DASAR tumpukan (1 = dasar layar: kartu naik dari bawah)
 su -c setprop debug.ioslock.keepbig 1       # (opsional) paksa gear LARGE; bisa menghilangkan jam depth
 su -c setprop debug.ioslock.clockshrink 1   # kecilkan View jam System UI saat tahap 2 (bukan jam depth)
 su -c setprop debug.ioslock.countfrac 0.846 # garis acuan: dasar kartu notifikasi paling bawah
@@ -37,16 +38,21 @@ Di wallpaper lockscreen `com.transsion.livewallpaper.custompictorial` jam **diga
 (bukan View System UI): `CustomPictorial.setClockShape(alpha, scale)` dengan nilai diam 1.0/0.95,
 dan ukuran/gaya jam mengikuti gear yang dikirim System UI.
 
-### Aturan jam (v0.17)
+### Aturan jam (v0.18)
 - state 1 (tanpa notifikasi), state 2 (notifikasi masuk, belum di-swipe), state 3 (stack terbuka):
   jam tetap **besar**. Caranya: nilai diam alpha/scale direkam hanya saat tidak ada notifikasi,
 lalu perintah System UI yang mengecilkannya ditulis ulang (`holddepth`), gear state 1 dipakai lagi
   saat notifikasi masuk (`holdgear`), dan bentuk diam dikirim sekali saat notifikasi baru datang.
-- state 4 (swipe sekali lagi dari state 3): jam baru **mengecil** (`wpexp` + `wpmin`) dan stack naik
-  ke `endfrac`.
+- state 4 (swipe sekali lagi dari state 3): tahanan dilepas. Skala jam dikalikan `wpmin` (`wpexp`),
+  perintah System UI juga diskalakan turun supaya tidak menimpa lagi, dan gear yang tadi diminta
+  system (diblokir di state 1-3) dimintakan ulang.
+- Kalau jam masih belum kecil di state 4, coba `setprop debug.ioslock.clockshrink 1` (mengecilkan
+  View jam System UI) lalu kirim log baris `WPCMD` dan `wpsend`.
 
-### Aturan tumpukan (v0.17)
-- Kartu TERBARU selalu menempel di garis `countfrac` (bawah), kartu lama menumpuk di atasnya sambil
+### Aturan tumpukan (v0.18)
+- Posisi asli kartu dihitung dari `top` tata letak + translasi, jadi tumpukan selalu mendarat
+  di tempat yang sama (dulu kartu "muncul dari tengah" karena `top` tidak dihitung).
+- Kartu TERBARU menempel di garis `pilefrac` (dasar layar), kartu lama mengintip di atasnya sambil
   mengecil; saat di-swipe, kartu lama bergerak naik lebih dulu (gaya iOS).
 - Saat terbuka (state 3) puncak stack berhenti di `restfrac` lalu kartu mengalir ke bawah, jadi
   3 kartu atau lebih **tidak** lagi mendorong stack turun dari garis acuan.
