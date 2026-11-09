@@ -22,8 +22,12 @@ su -c setprop debug.ioslock.gearswipe 1     # 1 = paksa gear SMALL di tahap 2
 su -c setprop debug.ioslock.labels 0        # sembunyikan "Notification Center" / "N Notifications"
 su -c setprop debug.ioslock.bubble 0        # matikan bubble frosted di belakang "N Notifications"
 su -c setprop debug.ioslock.liveblur 0      # bubble pakai potongan wallpaper statis, bukan blur live
-su -c setprop debug.ioslock.holddepth 1     # (opsional) tahan alpha/scale jam depth milik sistem
-su -c setprop debug.ioslock.wpexp 1         # (opsional) kecilkan jam depth sendiri saat tahap 2
+su -c setprop debug.ioslock.holddepth 0     # 0 = jangan tahan jam depth (default 1: jam tetap besar di state 1-3)
+su -c setprop debug.ioslock.holdgear 0      # 0 = jangan tahan gear jam saat notifikasi masuk (default 1)
+su -c setprop debug.ioslock.wpexp 0         # 0 = jangan kecilkan jam depth di tahap 2 (default 1)
+su -c setprop debug.ioslock.pilescale 1     # skala kartu notifikasi terbaru saat tertutup
+su -c setprop debug.ioslock.pilestep 0.06   # selisih skala tiap kartu lebih lama (tumpukan gaya iOS)
+su -c setprop debug.ioslock.peekdp 14       # jarak intip antar kartu di tumpukan
 su -c setprop debug.ioslock.keepbig 1       # (opsional) paksa gear LARGE; bisa menghilangkan jam depth
 su -c setprop debug.ioslock.clockshrink 1   # kecilkan View jam System UI saat tahap 2 (bukan jam depth)
 su -c setprop debug.ioslock.countfrac 0.846 # garis acuan: dasar kartu notifikasi paling bawah
@@ -31,8 +35,21 @@ su -c setprop debug.ioslock.powerreset 0     # sembunyikan tombol "Restart UI" d
 
 Di wallpaper lockscreen `com.transsion.livewallpaper.custompictorial` jam **digambar oleh wallpaper**
 (bukan View System UI): `CustomPictorial.setClockShape(alpha, scale)` dengan nilai diam 1.0/0.95,
-dan ukuran/gaya jam mengikuti gear yang dikirim System UI. Karena itu v0.15 berhenti memaksa gear
-(default `keepbig`/`holddepth`/`wpexp` MATI) supaya jam depth kembali seperti bawaan sistem.
+dan ukuran/gaya jam mengikuti gear yang dikirim System UI.
+
+### Aturan jam (v0.17)
+- state 1 (tanpa notifikasi), state 2 (notifikasi masuk, belum di-swipe), state 3 (stack terbuka):
+  jam tetap **besar**. Caranya: nilai diam alpha/scale direkam hanya saat tidak ada notifikasi,
+lalu perintah System UI yang mengecilkannya ditulis ulang (`holddepth`), gear state 1 dipakai lagi
+  saat notifikasi masuk (`holdgear`), dan bentuk diam dikirim sekali saat notifikasi baru datang.
+- state 4 (swipe sekali lagi dari state 3): jam baru **mengecil** (`wpexp` + `wpmin`) dan stack naik
+  ke `endfrac`.
+
+### Aturan tumpukan (v0.17)
+- Kartu TERBARU selalu menempel di garis `countfrac` (bawah), kartu lama menumpuk di atasnya sambil
+  mengecil; saat di-swipe, kartu lama bergerak naik lebih dulu (gaya iOS).
+- Saat terbuka (state 3) puncak stack berhenti di `restfrac` lalu kartu mengalir ke bawah, jadi
+  3 kartu atau lebih **tidak** lagi mendorong stack turun dari garis acuan.
 
 ## Eksperimen tanpa rebuild (root)
 su -c setprop debug.ioslock.level N      # paksa arg setClockLevel

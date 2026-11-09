@@ -66,8 +66,9 @@ object Config {
     // PENTING: nilainya RELATIF terhadap alpha/scale diam yang dipakai System UI sendiri.
     // DEFAULT MATI: jam depth digambar wallpaper (CustomPictorial.setClockShape alpha/scale); perintah
     // tambahan dari modul hanya membuat Jam berkedip/goyah, jadi biarkan sistem yang urus.
-    val wpExp: Boolean get() = prop("debug.ioslock.wpexp") == "1"
-    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.5f
+    // Menyala otomatis: hanya tahap 2 (state 4) yang mengecilkan jam. setprop debug.ioslock.wpexp 0 untuk mematikan.
+    val wpExp: Boolean get() = prop("debug.ioslock.wpexp") != "0"
+    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.6f
     val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 1f
     // alternatif: kecilkan View jam milik System UI (dipakai kalau jam tidak digambar wallpaper)
     val clockShrink: Boolean get() = prop("debug.ioslock.clockshrink") == "1"
@@ -87,7 +88,10 @@ object Config {
 
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
     val pileFrac: Float get() = prop("debug.ioslock.pilefrac").toFloatOrNull() ?: 0.84f
-    val pileScale: Float get() = prop("debug.ioslock.pilescale").toFloatOrNull() ?: 0.80f
+    // tumpukan tertutup: kartu terbaru (paling bawah) diskala pileScale, kartu di atasnya makin kecil
+    // selisih pileStep per kartu (gaya iOS: kartu lama mengintip dari atas, yang baru di depan).
+    val pileScale: Float get() = prop("debug.ioslock.pilescale").toFloatOrNull() ?: 1f
+    val pileStep: Float get() = prop("debug.ioslock.pilestep").toFloatOrNull() ?: 0.06f
     val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 14f
 
     // teks "Notification Center" dan "N Notification(s)"
@@ -95,9 +99,13 @@ object Config {
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.846f
     // bubble frosted (blur wallpaper) di belakang "N Notifications" saja, bukan "Notification Center"
     val bubble: Boolean get() = prop("debug.ioslock.bubble") != "0"
-    // penjaga: selama di lockscreen SystemUI tidak boleh menurunkan alpha/scale jam depth.
-    // DEFAULT MATI: di wallpaper depth nilainya 1.0/0.95 dan dimiliki sistem; menahannya bikin jam melompat.
-    val holdDepth: Boolean get() = prop("debug.ioslock.holddepth") == "1"
+    // Tahan jam depth tetap BESAR selama tahap 1 (state 1-3): perintah System UI ke wallpaper yang
+    // mengecilkan alpha/scale jam ditulis ulang ke nilai diam. Menyala otomatis;
+    // setprop debug.ioslock.holddepth 0 untuk mematikan.
+    val holdDepth: Boolean get() = prop("debug.ioslock.holddepth") != "0"
+    // Tahan gear jam di gear yang dipakai saat TIDAK ada notifikasi (gear jam depth) selama tahap 1,
+    // supaya jam tidak berubah jadi jam kecil begitu notifikasi masuk. setprop debug.ioslock.holdgear 0.
+    val holdGear: Boolean get() = prop("debug.ioslock.holdgear") != "0"
 
     // gear jam sistem: tahap 2 memaksa SMALL (default MATI; jam depth mengecil lewat wallpaper, tidak hilang)
     val gearSwipe: Boolean get() = prop("debug.ioslock.gearswipe") == "1"
@@ -188,6 +196,10 @@ class MainHook : IXposedHookLoadPackage {
     // Jam depth digambar oleh wallpaper; skalanya bisa > 1. Semua target kita relatif ke angka ini.
     @Volatile private var restAlpha = 0f
     @Volatile private var restScale = 0f
+    // gear jam yang dipakai sistem saat TIDAK ada notifikasi (state 1); dipertahankan selama tahap 1
+    @Volatile private var restGear: String? = null
+    // jumlah kartu pada penerapan sebelumnya, untuk mendeteksi "notifikasi baru masuk"
+    @Volatile private var lastCardN = 0
 
     // view jam yang skala/alpha-nya kita ubah (hanya kalau clockshrink=1)
     private var clockTouched = false
@@ -224,7 +236,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.16 loaded into SystemUI")
+        log("v0.17 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -257,13 +269,20 @@ class MainHook : IXposedHookLoadPackage {
             val kids = (stackRef?.get() as? ViewGroup)?.childCount ?: -1
             logT("switchClockGear", "args=${p.args.toList()} state=$barState kids=$kids stack=${callerFull()}", discrete = true)
             var want = Config.gear
-            // Selama di lockscreen (termasuk saat gestur tweak aktif) jam dipaksa LARGE:
-            // notifikasi masuk tidak boleh mengubah jam depth jadi kecil (foto 2N).
             // saat bouncer (swipe ke-3) tampil jangan ikut campur gear: penyebab jam berkedip
             val onLock = Config.gesture && bouncerFade < 0.01f && (barState == 1 || barState == -1 || applied)
+            // state 1 (tanpa notifikasi): catat gear yang dipakai sistem. Gear inilah yang menggambar
+            // jam depth besar, jadi gear ini yang kita pertahankan saat notifikasi masuk.
+            if (onLock && cur is Enum<*> && cardCount == 0 && progress < 0.01f && restGear == null) {
+                restGear = cur.name
+                log("gear state 1 dicatat: ${cur.name} (dipakai lagi saat notifikasi masuk)")
+            }
             if (want.isEmpty() && onLock) {
                 want = when {
                     Config.gearSwipe && gearSmall -> "SMALL"
+                    // notifikasi masuk tidak boleh mengecilkan jam: kembali ke gear state 1.
+                    // State 4 (progress 2) sengaja dilepas supaya jam boleh mengecil.
+                    Config.holdGear && restGear != null && progress <= 1.001f -> restGear!!
                     Config.keepBig -> "LARGE"
                     else -> ""
                 }
@@ -585,6 +604,10 @@ class MainHook : IXposedHookLoadPackage {
     // membuat jam besar berubah jadi jam biasa (bug "depth clock hilang").
     private fun learnRest(p: XC_MethodHook.MethodHookParam) {
         if (!onKeyguardState()) return
+        // rekam HANYA saat tidak ada notifikasi (state 1): itu bentuk jam depth yang paling besar.
+        // Kalau direkam saat notifikasi sudah ada, nilai "diam" kita ikut mengecil dan jam tidak
+        // pernah bisa dikembalikan ke ukuran penuh.
+        if (cardCount > 0) return
         appCtx?.let { if (!isLocked(it)) { restAlpha = 0f; restScale = 0f; return } }
         val b = p.args.getOrNull(5) as? Bundle ?: return
         for (k in b.keySet()) {
@@ -603,22 +626,25 @@ class MainHook : IXposedHookLoadPackage {
     private fun holdDepth(p: XC_MethodHook.MethodHookParam): Boolean {
         if (!Config.gesture || !Config.holdDepth) return false
         if (!applied || bouncerFade > 0.01f || !onKeyguardState()) return false
+        // state 4 (tahap 2): jam memang boleh mengecil, jangan ditahan
+        if (progress > 1.001f) return false
         appCtx?.let { if (!isLocked(it)) return false }
         val ra = restAlpha
         val rs = restScale
         if (ra <= 0f && rs <= 0f) return false
         val b = p.args.getOrNull(5) as? Bundle ?: return false
-        val a = if (ra > 0f) ra * wpTargetAlpha() else -1f
-        val s = if (rs > 0f) rs * wpTargetScale() else -1f
         var touched = false
         for (k in b.keySet()) {
             val lk = k.lowercase()
             val cur = bundleFloat(b, k) ?: continue
-            if (lk.contains("alpha") && a >= 0f) {
-                if (abs(cur - a) > 0.004f) { b.putFloat(k, a); touched = true }
-            } else if (lk.contains("scale") && s >= 0f) {
-                if (abs(cur - s) > 0.004f) { b.putFloat(k, s); touched = true }
+            val target = when {
+                ra > 0f && lk.contains("alpha") -> ra
+                rs > 0f && lk.contains("scale") -> rs
+                else -> continue
             }
+            // hanya MENAIKKAN: nilai yang lebih besar dari sistem dibiarkan apa adanya, supaya
+            // transisi bawaan (animasi masuk) tidak dilawan dan jam tidak melompat.
+            if (cur < target - 0.004f) { b.putFloat(k, target); touched = true }
         }
         return touched
     }
@@ -880,6 +906,13 @@ class MainHook : IXposedHookLoadPackage {
             // swipe ke-3 / bouncer kunci: notifikasi dan label ikut memudar ke tengah
             val fade = if (sv != null) updateBouncer(sv.rootView ?: sv) else 0f
             val n = sv?.let { countCards(it) } ?: 0
+            // state 1 -> 2: notifikasi baru masuk. System UI mengecilkan jam depth tepat saat itu,
+            // jadi kita kirim sekali bentuk diam (jam besar) supaya state 2 & 3 tetap sebesar state 1.
+            if (Config.holdDepth && restScale > 0f && n > 0 && lastCardN == 0 && progress < 0.01f) {
+                sendWp(restAlpha, restScale, true)
+                log("notifikasi masuk: jam depth dikembalikan ke bentuk state 1 (alpha=$restAlpha scale=$restScale)")
+            }
+            lastCardN = n
             cardCount = n
             if (n == 0) {
                 // Tidak ada notifikasi (foto 1 & foto 2): tidak ada yang boleh berubah.
@@ -972,18 +1005,15 @@ class MainHook : IXposedHookLoadPackage {
         }
         if (n == 0) { hideLabels(); return }
 
-        // ACUAN: dasar kartu PALING BAWAH tepat di garis teks "N Notifications" (tengah bawah).
-        // Stack tumbuh ke atas dari garis itu; kalau kepanjangan, puncaknya berhenti di restFrac.
+        // TERBUKA (state 3): puncak stack berhenti di restFrac lalu kartu mengalir ke bawah, persis
+        // foto 3. Dulu dasar kartu DIRATAKAN ke garis "N Notifications"; dengan 3 kartu atau lebih
+        // cara itu mendorong seluruh stack ke bawah dari garis acuan (bug "offset kebawah").
         val anchorBottom = dm.heightPixels * Config.countFrac
         val naturalTop = loc[1] + cards[0].second
-        val lowest = cards[n - 1]
-        val naturalBottom = loc[1] + lowest.second + lowest.first.height
-        var shift1 = anchorBottom - naturalBottom
-        val minTop = if (Config.restFrac > 0f) dm.heightPixels * Config.restFrac else Float.NEGATIVE_INFINITY
-        if (naturalTop + shift1 < minTop) shift1 = minTop - naturalTop
-        // tahap 2: puncak stack naik ke endFrac (foto 4)
-        val shift2 = if (Config.endFrac > 0f) dm.heightPixels * Config.endFrac - naturalTop else shift1
-        val shift = shift1 + (shift2 - shift1) * q
+        val shiftOpen = if (Config.restFrac > 0f) dm.heightPixels * Config.restFrac - naturalTop else 0f
+        // tahap 2 (foto 4): puncak stack naik ke endFrac
+        val shift2 = if (Config.endFrac > 0f) dm.heightPixels * Config.endFrac - naturalTop else shiftOpen
+        val shift = shiftOpen + (shift2 - shiftOpen) * q
 
         var topVisual = naturalTop + shift
         var leftVisual = loc[0].toFloat()
@@ -992,16 +1022,20 @@ class MainHook : IXposedHookLoadPackage {
             val baseY = cards[i].second
             val baseZ = baseOfZ(card)
             val h = card.height.toFloat()
+            val fromBottom = n - 1 - i          // 0 = kartu terbaru (paling bawah)
 
-            val base2 = baseY + shift
-            val naturalCenter = loc[1] + base2 + h / 2f
-            // tertutup: kartu menumpuk ke atas dari garis teks yang sama (kartu bawah tetap di acuan)
-            val targetCenter = anchorBottom - h / 2f - (n - 1 - i) * Config.peekDp * d
-            var wy = base2 + (1f - p1) * (targetCenter - naturalCenter)
+            // posisi TERBUKA: posisi asli kartu + pergeseran puncak di atas
+            val yOpenCenter = loc[1] + baseY + shift + h / 2f
+            // posisi TERTUTUP (gaya iOS): semua kartu menumpuk di garis "N Notifications".
+            // Kartu terbaru paling bawah & paling besar, kartu lama mengintip di atasnya sambil
+            // mengecil. Saat di-swipe, kartu lama itulah yang lebih dulu bergerak naik.
+            val sClosed = (Config.pileScale - Config.pileStep * fromBottom).coerceAtLeast(0.7f)
+            val yClosedCenter = anchorBottom - h * sClosed / 2f - fromBottom * Config.peekDp * d
 
-            val collapsed = (Config.pileScale - 0.05f * i).coerceAtLeast(0.55f)
-            var s = 1f - (1f - p1) * (1f - collapsed)
-            val wz = baseZ + (1f - p1) * (n - i) * 3f * d
+            var wy = baseY + (1f - p1) * (yClosedCenter - yOpenCenter)
+            var s = sClosed + (1f - sClosed) * p1
+            // kartu terbaru di depan, kartu lama di belakangnya (seperti keluar dari tumpukan)
+            val wz = baseZ + (1f - p1) * (i + 1) * 3f * d
 
             // "fade ketengah": kartu ditarik ke tengah layar, mengecil sedikit, lalu memudar
             if (fade > 0f) {
@@ -1193,6 +1227,8 @@ class MainHook : IXposedHookLoadPackage {
         // nilai diam jam depth dipelajari ulang tiap kali masuk lockscreen
         restAlpha = 0f
         restScale = 0f
+        restGear = null
+        lastCardN = 0
         // kembalikan gear jam ke permintaan sistem
         gearSmall = false
         val sg = sysGear
