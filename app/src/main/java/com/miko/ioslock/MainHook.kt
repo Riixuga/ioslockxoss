@@ -55,7 +55,11 @@ object Config {
     // eksperimen: kirim perintah systemui.wallpaper.touch ke wallpaper mengikuti progres swipe
     val wpExp: Boolean get() = prop("debug.ioslock.wpexp") == "1"
     val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.6f
-    val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 0f
+    // kosong = ikuti alpha dari sistem (JANGAN 0: alpha 0 menyembunyikan jam yang digambar wallpaper)
+    val wpAlpha: Float? get() = prop("debug.ioslock.wpalpha").toFloatOrNull()
+
+    // jam tetap LARGE walau ada notifikasi (matikan: setprop debug.ioslock.keeplarge 0)
+    val keepLarge: Boolean get() = prop("debug.ioslock.keeplarge") != "0"
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -83,6 +87,10 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var wpToken: Any? = null
     @Volatile private var ownCall = false
     private var lastWpSend = 0L
+    // alpha terakhir yang dikirim SISTEM ke wallpaper (1 = jam terlihat, 0 = layar mati / transisi)
+    @Volatile private var sysAlpha = 1f
+    // true jika kita sudah mengirim scale != 1, jadi perlu dikembalikan
+    private var wpDirty = false
 
     // state gestur
     private var progress = 0f
@@ -99,7 +107,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.7 loaded into SystemUI")
+        log("v0.8 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
@@ -124,6 +132,15 @@ class MainHook : IXposedHookLoadPackage {
                 try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
             }
         }, after = { applyState() })
+        // Jam bawaan mengecil (gear SMALL) saat ada notifikasi -> paksa tetap LARGE
+        hook(cl, "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor", "switchClockGear", before = { p ->
+            val g = p.args.getOrNull(0) ?: return@hook
+            logT("clockGear", "arg=$g keepLarge=${Config.keepLarge}", discrete = true)
+            if (Config.keepLarge && g.toString() == "SMALL") {
+                @Suppress("UNCHECKED_CAST")
+                p.args[0] = java.lang.Enum.valueOf(g.javaClass as Class<out Enum<*>>, "LARGE")
+            }
+        })
         hook(cl, clockView, "setFactor", before = { p ->
             logT("setFactor", "arg=${p.args.getOrNull(0)} caller=${caller()}", discrete = true)
         })
@@ -282,6 +299,11 @@ class MainHook : IXposedHookLoadPackage {
             wpManager = p.thisObject
             wpToken = p.args.getOrNull(0)
             val action = p.args.getOrNull(1)?.toString() ?: "?"
+            if (action == "systemui.wallpaper.touch") {
+                val b = p.args.getOrNull(5) as? Bundle
+                if (b != null && b.containsKey("alpha")) sysAlpha = b.getFloat("alpha", sysAlpha)
+                return@hook // sudah ratusan baris per swipe, tidak perlu dilog lagi
+            }
             val rest = p.args.drop(1).joinToString(" ") { briefArg(it) }
             logT("WPCMD:$action", "$rest stack=${callerFull()}", discrete = true)
         })
@@ -304,7 +326,7 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     // Eksperimen: kirim perintah touch ke wallpaper (alpha, scale)
-    private fun sendWp(alpha: Float, scale: Float, force: Boolean) {
+    private fun sendWp(scale: Float, force: Boolean) {
         val wm = wpManager ?: return
         val tk = wpToken ?: return
         val now = System.currentTimeMillis()
@@ -312,7 +334,7 @@ class MainHook : IXposedHookLoadPackage {
         lastWpSend = now
         try {
             val b = Bundle()
-            b.putFloat("alpha", alpha)
+            b.putFloat("alpha", Config.wpAlpha ?: sysAlpha)
             b.putFloat("scale", scale)
             ownCall = true
             XposedHelpers.callMethod(wm, "sendWallpaperCommand", tk, "systemui.wallpaper.touch", 0, 0, 0, b)
@@ -555,7 +577,15 @@ class MainHook : IXposedHookLoadPackage {
                 clock.translationY = -Config.pushDp * d * p
             }
             if (sv != null) applyStack(sv, p)
-            if (Config.wpExp) sendWp(Config.wpAlpha, 1f - (1f - Config.wpMin) * p, false)
+            if (Config.wpExp) {
+                if (p > 0f) {
+                    wpDirty = true
+                    sendWp(1f - (1f - Config.wpMin) * p, false)
+                } else if (wpDirty) {
+                    wpDirty = false
+                    sendWp(1f, true)
+                }
+            }
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
@@ -619,7 +649,10 @@ class MainHook : IXposedHookLoadPackage {
             c.scaleY = 1f
             c.translationY = 0f
         }
-        if (Config.wpExp) sendWp(0f, 1f, true)
+        if (wpDirty) {
+            wpDirty = false
+            sendWp(1f, true)
+        }
         if (sv == null) return
         sv.alpha = 1f
         sv.translationY = 0f
