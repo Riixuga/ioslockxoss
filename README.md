@@ -27,6 +27,7 @@ su -c setprop debug.ioslock.wpexp 1         # (opsional) kecilkan jam depth send
 su -c setprop debug.ioslock.keepbig 1       # (opsional) paksa gear LARGE; bisa menghilangkan jam depth
 su -c setprop debug.ioslock.clockshrink 1   # kecilkan View jam System UI saat tahap 2 (bukan jam depth)
 su -c setprop debug.ioslock.countfrac 0.846 # garis acuan: dasar kartu notifikasi paling bawah
+su -c setprop debug.ioslock.powerreset 0     # sembunyikan tombol "Restart UI" di power menu
 
 Di wallpaper lockscreen `com.transsion.livewallpaper.custompictorial` jam **digambar oleh wallpaper**
 (bukan View System UI): `CustomPictorial.setClockShape(alpha, scale)` dengan nilai diam 1.0/0.95,

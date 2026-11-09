@@ -28,6 +28,8 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -105,6 +107,9 @@ object Config {
     //   setprop debug.ioslock.keepbig 1
     val keepBig: Boolean get() = prop("debug.ioslock.keepbig") == "1"
     val gear: String get() = prop("debug.ioslock.gear").trim().uppercase()
+
+    // tombol "Restart UI" di power menu (bentuk sama dengan Power Off / Restart). Default menyala.
+    val powerReset: Boolean get() = prop("debug.ioslock.powerreset") != "0"
 
     // alat penemuan
     val spy: Boolean get() = prop("debug.ioslock.spy") == "1"
@@ -219,7 +224,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.15 loaded into SystemUI")
+        log("v0.16 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -320,7 +325,132 @@ class MainHook : IXposedHookLoadPackage {
             }
         })
 
+        // Tombol tambahan "Restart UI" di power menu. Dialog power menu HiOS adalah
+        // com.transsion.systemui.globalactions.TrGlobalActionsDialogLite (turunan
+        // GlobalActionsDialogLite\$ActionsDialogLite). Kita tunggu dialognya tampil lalu menempelkan
+        // tombol yang meniru tombol Restart (lingkaran + label), tanpa mengubah adapter/action-nya.
+        hook(cl, "android.app.Dialog", "show", after = { p ->
+            val dlg = p.thisObject as? android.app.Dialog ?: return@hook
+            val nm = try { dlg.javaClass.name } catch (t: Throwable) { return@hook }
+            if (nm.contains("ActionsDialogLite")) {
+                val host = try { dlg.window?.decorView } catch (t: Throwable) { null }
+                // tunggu animasi masuk dialog selesai supaya posisi tombol asli sudah final
+                if (host != null) host.postDelayed({ injectResetButton(dlg, host, 0) }, 380)
+            }
+        })
+
         hookSpy(cl)
+    }
+
+    // ---- tombol "Restart UI" di power menu ----
+
+    @Volatile private var resetBtnId = 0
+
+    private fun injectResetButton(dlg: android.app.Dialog, host: View, attempt: Int) {
+        if (!Config.powerReset) return
+        if (resetBtnId == 0) resetBtnId = View.generateViewId()
+        if (host.findViewById<View>(resetBtnId) != null) return
+        // pohon decor dialog bisa dalam, jadi pakai pencarian sendiri dengan batas lebih longgar
+        val items = ArrayList<View>()
+        fun scan(v: View, depth: Int) {
+            if (depth > 26 || items.size > 3) return
+            if (v.javaClass.name.endsWith("TranGlobalActionView")) {
+                items.add(v)
+                return
+            }
+            if (v is ViewGroup) for (i in 0 until v.childCount) scan(v.getChildAt(i), depth + 1)
+        }
+        scan(host, 0)
+        val ref = items.getOrNull(1) ?: items.getOrNull(0)
+        if (ref == null) {
+            if (attempt < 3) host.postDelayed({ injectResetButton(dlg, host, attempt + 1) }, 200)
+            else once("noPowerItems") { log("tombol power menu tidak ditemukan, Restart UI dilewati") }
+            return
+        }
+        try {
+            buildResetButton(dlg, host, ref)
+        } catch (t: Throwable) {
+            once("resetBtnFail") { log("Restart UI gagal dibuat: $t") }
+        }
+    }
+
+    // Meniru tombol Restart: latar lingkaran + ikon yang sama, label dengan font/warna yang sama.
+    private fun buildResetButton(dlg: android.app.Dialog, host: View, ref: View) {
+        val ctx = host.context
+        val d = ctx.resources.displayMetrics.density
+        val icon = XposedHelpers.getObjectField(ref, "mActionImageView") as? View
+            ?: throw IllegalStateException("mActionImageView kosong")
+        val label = XposedHelpers.getObjectField(ref, "mActionTextView") as? TextView
+            ?: throw IllegalStateException("mActionTextView kosong")
+        if (icon.width <= 0 || icon.height <= 0) throw IllegalStateException("ukuran tombol 0")
+        val iconLoc = IntArray(2).also { icon.getLocationInWindow(it) }
+        val labelLoc = IntArray(2).also { label.getLocationInWindow(it) }
+        val refLoc = IntArray(2).also { ref.getLocationInWindow(it) }
+        val hostLoc = IntArray(2).also { host.getLocationInWindow(it) }
+        // jarak lingkaran -> label, diambil dari tombol aslinya supaya spasi identik
+        val gap = (labelLoc[1] - (iconLoc[1] + icon.height)).coerceIn(0, (40 * d).toInt())
+        val circle = ImageView(ctx).apply {
+            background = icon.background?.constantState?.newDrawable()?.mutate()
+            setImageDrawable((icon as? ImageView)?.drawable)
+            scaleType = (icon as? ImageView)?.scaleType ?: ImageView.ScaleType.CENTER
+            contentDescription = "Restart UI"
+            layoutParams = LinearLayout.LayoutParams(icon.width, icon.height)
+        }
+        val text = TextView(ctx).apply {
+            text = "Restart UI"
+            setTextColor(label.currentTextColor)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, label.textSize)
+            typeface = label.typeface
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = gap }
+        }
+        val block = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            id = resetBtnId
+            isClickable = true
+            isFocusable = true
+            addView(circle)
+            addView(text)
+            setOnClickListener {
+                log("Restart UI ditekan: System UI direstart")
+                try { dlg.dismiss() } catch (t: Throwable) { }
+                resetSystemUi()
+            }
+        }
+        block.measure(
+            View.MeasureSpec.makeMeasureSpec(host.width, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(host.height, View.MeasureSpec.AT_MOST)
+        )
+        val w = block.measuredWidth
+        val h = block.measuredHeight
+        val left = (host.width - w) / 2
+        val below = (h / 2).coerceAtLeast((18 * d).toInt())
+        val top = (refLoc[1] - hostLoc[1]) + ref.height + below
+        (host as? ViewGroup)?.addView(
+            block,
+            FrameLayout.LayoutParams(w, h).apply { leftMargin = left; topMargin = top }
+        ) ?: throw IllegalStateException("host bukan ViewGroup")
+        once("resetBtn") { log("Restart UI ditambahkan ke power menu ($w x $h di $left,$top)") }
+    }
+
+    // Restart System UI lewat root; kalau satu perintah tidak tersedia, coba berikutnya.
+    private fun resetSystemUi() {
+        val cmds = listOf(
+            "killall com.android.systemui",
+            "pkill -f com.android.systemui",
+            "kill -9 \$(pidof com.android.systemui)"
+        )
+        Thread {
+            for (c in cmds) {
+                try {
+                    if (Runtime.getRuntime().exec(arrayOf("su", "-c", c)).waitFor() == 0) return@Thread
+                } catch (t: Throwable) { }
+            }
+            log("Restart UI: perintah kill gagal (root tersedia?)")
+        }.start()
     }
 
     // ---- mode spy: catat semua saluran keluar System UI ----
