@@ -3,6 +3,8 @@ package com.miko.ioslock
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
 import android.content.Context
+import android.content.Intent
+import android.os.Bundle
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -42,10 +44,16 @@ object Config {
     val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
-    // jarak meluncur kartu dari bawah saat stack muncul
-    val slideDp: Float get() = prop("debug.ioslock.slidedp").toFloatOrNull() ?: 80f
+    // posisi tengah tumpukan saat awal (0 = atas layar, 1 = bawah layar)
+    val pileFrac: Float get() = prop("debug.ioslock.pilefrac").toFloatOrNull() ?: 0.84f
+    // skala kartu teratas saat masih menumpuk
+    val pileScale: Float get() = prop("debug.ioslock.pilescale").toFloatOrNull() ?: 0.80f
+    // seberapa kartu di belakang mengintip di bawah kartu depan
+    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 14f
     // id view jam tambahan yang ingin digeser/dikecilkan
     val clockId: String get() = prop("debug.ioslock.clockid")
+    // ubah nilainya untuk memaksa dump ulang struktur view
+    val dumpToken: String get() = prop("debug.ioslock.dump")
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -54,6 +62,7 @@ class MainHook : IXposedHookLoadPackage {
     private val lastLog = ConcurrentHashMap<String, Long>()
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
+    private val chanRegex = Regex("(?i)pictorial|wallpaper|clock|keyguardtheme|keyguard_theme|lockscreen|lock_screen")
 
     private val attachedClocks = CopyOnWriteArrayList<WeakReference<View>>()
     @Volatile private var activeClocks: List<View> = emptyList()
@@ -62,7 +71,7 @@ class MainHook : IXposedHookLoadPackage {
     // 0 = SHADE, 1 = KEYGUARD, 2 = SHADE_LOCKED, -1 = belum diketahui
     @Volatile private var barState = -1
 
-    // posisi asli tiap kartu: [dasar, nilai yang kita tulis]
+    // posisi asli tiap kartu: [dasarY, tulisY, dasarZ, tulisZ]
     private val rowState = WeakHashMap<View, FloatArray>()
 
     // state gestur
@@ -75,13 +84,15 @@ class MainHook : IXposedHookLoadPackage {
     private var taken = false
     private var applied = false
     private var animator: ValueAnimator? = null
+    private var lastDumpToken = ""
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.5.2 loaded into SystemUI")
+        log("v0.6 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
+        val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
         val stack = "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayoutController"
         val shadeWindow = "com.android.systemui.shade.NotificationShadeWindowView"
@@ -110,6 +121,14 @@ class MainHook : IXposedHookLoadPackage {
             logT("updateClockViewParams", "arg=${p.args.getOrNull(0)}", discrete = true)
         }, after = { applyState() })
 
+        // Kapan jam bawaan disembunyikan karena tema / wallpaper
+        hook(cl, clockHelper, "updateKeyguardClockVisibility", before = { p ->
+            logT("clockVisibility", "args=${p.args.toList()} caller=${caller()}", discrete = true)
+        })
+        hook(cl, clockHelper, "updateClockVisibilityInternal", before = { p ->
+            logT("clockVisibilityInternal", "args=${p.args.toList()} caller=${caller()}", discrete = true)
+        })
+
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
 
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
@@ -117,6 +136,7 @@ class MainHook : IXposedHookLoadPackage {
             val s = p.args.getOrNull(0) as? Int ?: return@hook
             barState = s
             logT("barState", "state=$s", discrete = true)
+            if (s == 1) resetDumps()
             applyState()
         })
 
@@ -133,7 +153,61 @@ class MainHook : IXposedHookLoadPackage {
 
         // Tangkap sentuhan di window shade
         hook(cl, shadeWindow, "dispatchTouchEvent", before = { p -> handleTouch(p) })
+
+        // Sadap saluran komunikasi System UI -> wallpaper / tema
+        hookChannels(cl)
     }
+
+    private fun resetDumps() {
+        dumped.remove("tree2")
+        dumped.remove("custom")
+        dumped.remove("dump:clock")
+    }
+
+    // ---- penyadapan saluran ke wallpaper ----
+
+    private fun briefArg(a: Any?): String = try {
+        when (a) {
+            null -> "null"
+            is Bundle -> "Bundle{" + a.keySet().joinToString(",") { k -> k + "=" + a.get(k) } + "}"
+            is Intent -> "Intent{act=${a.action} cmp=${a.component} pkg=${a.getPackage()} extras=${a.extras?.keySet()}}"
+            else -> a.toString().take(120)
+        }
+    } catch (t: Throwable) { "?" }
+
+    private fun chanIntent(kind: String, a: Any?) {
+        val intent = a as? Intent ?: return
+        val hay = "${intent.action} ${intent.component} ${intent.getPackage()}"
+        if (chanRegex.containsMatchIn(hay)) {
+            logT("$kind:${intent.action}", briefArg(intent) + " caller=" + caller(), discrete = true)
+        }
+    }
+
+    private fun hookChannels(cl: ClassLoader) {
+        hook(cl, "android.app.WallpaperManager", "sendWallpaperCommand", before = { p ->
+            val action = p.args.getOrNull(1)?.toString() ?: "?"
+            val rest = p.args.drop(1).joinToString(" ") { briefArg(it) }
+            logT("WPCMD:$action", "$rest caller=${caller()}", discrete = true)
+        })
+        hook(cl, "android.app.ContextImpl", "sendBroadcast", before = { p -> chanIntent("BCAST", p.args.getOrNull(0)) })
+        hook(cl, "android.app.ContextImpl", "sendBroadcastAsUser", before = { p -> chanIntent("BCAST", p.args.getOrNull(0)) })
+        hook(cl, "android.content.ContentResolver", "call", before = { p ->
+            val hay = (p.args.getOrNull(0)?.toString() ?: "") + " " + (p.args.getOrNull(1)?.toString() ?: "")
+            if (chanRegex.containsMatchIn(hay)) {
+                logT("PROVIDER:$hay", p.args.joinToString(" | ") { briefArg(it) } + " caller=" + caller(), discrete = true)
+            }
+        })
+        for (cls in listOf("android.provider.Settings\$System", "android.provider.Settings\$Secure")) {
+            hook(cl, cls, "putStringForUser", before = { p ->
+                val name = p.args.getOrNull(1)?.toString() ?: ""
+                if (chanRegex.containsMatchIn(name)) {
+                    logT("SETTING:$name", "${cls.substringAfterLast('$')} $name=${p.args.getOrNull(2)}", discrete = true)
+                }
+            })
+        }
+    }
+
+    // ---- utilitas view ----
 
     private fun isLocked(ctx: Context): Boolean = try {
         (ctx.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
@@ -194,7 +268,7 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // Semua view non-standar yang terlihat (untuk mencari penggambar jam)
+    // Semua view non-standar yang terlihat
     private val skipIds = setOf("keyguard_header", "notification_stack_scroller", "notification_container_parent")
 
     private fun scanCustom(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
@@ -246,6 +320,8 @@ class MainHook : IXposedHookLoadPackage {
         return out.toString()
     }
 
+    // ---- sentuhan ----
+
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
         if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
         val root = p.thisObject as? View ?: return
@@ -258,6 +334,11 @@ class MainHook : IXposedHookLoadPackage {
             taken = false
             downX = ev.rawX
             downY = ev.rawY
+            val token = Config.dumpToken
+            if (token != lastDumpToken) {
+                lastDumpToken = token
+                resetDumps()
+            }
             val locked = isLocked(root.context)
             if (locked) {
                 refreshTargets(root)
@@ -337,6 +418,8 @@ class MainHook : IXposedHookLoadPackage {
         an.start()
     }
 
+    // ---- penerapan efek ----
+
     private fun applyState() {
         try {
             val clocks = activeClocks
@@ -364,39 +447,60 @@ class MainHook : IXposedHookLoadPackage {
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
-    private fun baseOf(row: View): Float {
-        val st = rowState[row]
-        return if (st != null && abs(row.translationY - st[1]) < 0.01f) st[0] else row.translationY
+    private fun baseOfY(v: View): Float {
+        val st = rowState[v]
+        return if (st != null && abs(v.translationY - st[1]) < 0.01f) st[0] else v.translationY
     }
 
-    // Stack: semua kartu meluncur dari bawah, menumpuk di kartu teratas, lalu menyebar saat p naik ke 1
+    private fun baseOfZ(v: View): Float {
+        val st = rowState[v]
+        return if (st != null && abs(v.translationZ - st[3]) < 0.01f) st[2] else v.translationZ
+    }
+
+    // Stack: tumpukan mulai di area bawah, kartu teratas paling depan, lalu naik dan menyebar ke posisi akhir
     private fun applyStack(sv: View, p: Float) {
-        val d = sv.resources.displayMetrics.density
+        val dm = sv.resources.displayMetrics
+        val d = dm.density
         sv.alpha = (p * 2.5f).coerceAtMost(1f)
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
+        val loc = IntArray(2)
+        sv.getLocationOnScreen(loc)
+
         val cards = ArrayList<Pair<View, Float>>()
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
             if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0) {
-                cards.add(Pair(c, baseOf(c)))
+                cards.add(Pair(c, baseOfY(c)))
             }
         }
         cards.sortBy { it.second }
-        if (cards.isEmpty()) return
-        val base0 = cards[0].second
-        val slide = Config.slideDp * d
-        for (i in 0 until cards.size) {
+        val n = cards.size
+        if (n == 0) return
+
+        val pileCenter = dm.heightPixels * Config.pileFrac
+        for (i in 0 until n) {
             val card = cards[i].first
-            val base = cards[i].second
-            val off = (1f - p) * ((base0 - base) + i * 10f * d + slide)
-            val w = base + off
-            card.translationY = w
-            val s = (1f - (1f - p) * (0.06f + 0.03f * i)).coerceAtLeast(0.7f)
+            val baseY = cards[i].second
+            val baseZ = baseOfZ(card)
+            val h = card.height.toFloat()
+            val naturalCenter = loc[1] + baseY + h / 2f
+            val targetCenter = pileCenter + i * Config.peekDp * d
+            val wy = baseY + (1f - p) * (targetCenter - naturalCenter)
+
+            val collapsed = (Config.pileScale - 0.05f * i).coerceAtLeast(0.55f)
+            val s = 1f - (1f - p) * (1f - collapsed)
+
+            // kartu teratas harus paling depan
+            val wz = baseZ + (1f - p) * (n - i) * 3f * d
+
             card.pivotX = card.width / 2f
+            card.pivotY = h / 2f
+            card.translationY = wy
+            card.translationZ = wz
             card.scaleX = s
             card.scaleY = s
-            rowState[card] = floatArrayOf(base, w)
+            rowState[card] = floatArrayOf(baseY, wy, baseZ, wz)
         }
     }
 
@@ -415,6 +519,7 @@ class MainHook : IXposedHookLoadPackage {
             val st = rowState[c]
             if (st != null) {
                 if (abs(c.translationY - st[1]) < 0.01f) c.translationY = st[0]
+                if (abs(c.translationZ - st[3]) < 0.01f) c.translationZ = st[2]
                 c.scaleX = 1f
                 c.scaleY = 1f
                 rowState.remove(c)
