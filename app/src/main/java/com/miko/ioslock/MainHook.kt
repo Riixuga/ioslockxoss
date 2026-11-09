@@ -203,19 +203,15 @@ class MainHook : IXposedHookLoadPackage {
                 .append(" id=").append(idName(v))
                 .append(" ").append(v.width).append("x").append(v.height)
             if (v is TextView) sb.append(" text='").append(v.text?.toString()?.take(12)).append("'")
-            var par = v.parent
+                        var par: android.view.ViewParent? = v.parent
             var n = 0
             sb.append(" <")
             while (par is View && n < 3) {
-                sb.append(" ").append(par.javaClass.simpleName).append("#").append(idName(par))
-                par = par.parent; n++
+                val pv: View = par
+                sb.append(" ").append(pv.javaClass.simpleName).append("#").append(idName(pv))
+                par = pv.parent
+                n++
             }
-            count[0]++
-        }
-        if (v is ViewGroup) {
-            for (i in 0 until v.childCount) scanBig(v.getChildAt(i), depth + 1, sb, count)
-        }
-    }
 
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
         if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
