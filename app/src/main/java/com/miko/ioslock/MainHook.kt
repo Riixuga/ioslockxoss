@@ -50,21 +50,22 @@ object Config {
     // Menyala otomatis; matikan dengan: setprop debug.ioslock.gesture 0
     val gesture: Boolean get() = prop("debug.ioslock.gesture") != "0"
 
-    // tahap 2: jam wallpaper (depth) di-fade keluar, jam kecil sistem muncul
-    // wpalpha = alpha jam wallpaper di akhir tahap 2 (0 = hilang). wpmin = skala akhir (1 = tidak mengecil)
+    // tahap 2: jam wallpaper (depth) MENGECIL tapi tetap terlihat (foto 4), bukan di-fade sampai hilang
+    // wpalpha = alpha jam wallpaper di akhir tahap 2 (1 = tetap terlihat, 0 = hilang). wpmin = skala akhir (1 = tidak mengecil)
     val wpExp: Boolean get() = prop("debug.ioslock.wpexp") != "0"
-    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 1f
-    val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 0f
+    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.5f
+    val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 1f
 
     // tahap 2: swipe lanjutan setelah stack muncul
     val stage2: Boolean get() = prop("debug.ioslock.stage2") != "0"
     val stage2Dp: Float get() = prop("debug.ioslock.stage2dp").toFloatOrNull() ?: 120f
     // jarak swipe tahap 1 (dp)
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
-    // posisi atas stack saat diam tahap 1 (0..1 tinggi layar); 0 = ikut posisi sistem
-    val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0f
-    // posisi atas stack di akhir tahap 2 (foto 3), 0..1 tinggi layar; 0 = ikut posisi sistem
-    val endFrac: Float get() = prop("debug.ioslock.endfrac").toFloatOrNull() ?: 0.355f
+    // posisi atas stack saat diam tahap 1 (0..1 tinggi layar); 0 = ikut posisi sistem.
+    // 0.55 = garis merah "x" (foto 1): puncak notifikasi berhenti di bawah jam besar (foto 3)
+    val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0.55f
+    // posisi atas stack di akhir tahap 2 (foto 4), 0..1 tinggi layar; 0 = ikut posisi sistem
+    val endFrac: Float get() = prop("debug.ioslock.endfrac").toFloatOrNull() ?: 0.33f
 
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
     val pileFrac: Float get() = prop("debug.ioslock.pilefrac").toFloatOrNull() ?: 0.84f
@@ -75,10 +76,10 @@ object Config {
     val labels: Boolean get() = prop("debug.ioslock.labels") != "0"
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.846f
 
-    // gear jam sistem: tahap 2 memaksa SMALL (default menyala)
-    val gearSwipe: Boolean get() = prop("debug.ioslock.gearswipe") != "0"
-    // eksperimen: paksa LARGE selama tahap 1 walau ada >1 notifikasi (default mati)
-    val keepBig: Boolean get() = prop("debug.ioslock.keepbig") == "1"
+    // gear jam sistem: tahap 2 memaksa SMALL (default MATI; jam depth mengecil lewat wallpaper, tidak hilang)
+    val gearSwipe: Boolean get() = prop("debug.ioslock.gearswipe") == "1"
+    // paksa LARGE di lockscreen walau ada >1 notifikasi supaya jam depth tetap besar (foto 2N)
+    val keepBig: Boolean get() = prop("debug.ioslock.keepbig") != "0"
     val gear: String get() = prop("debug.ioslock.gear").trim().uppercase()
 
     // alat penemuan
@@ -119,8 +120,10 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var gearSmall = false         // tahap 2 aktif -> paksa SMALL
     private var lastGearSet: String? = null
 
-    // state gestur. progress: 0..1 = tahap 1 (stack muncul), 1..2 = tahap 2 (jam kecil, stack naik)
+    // state gestur. progress: 0..1 = tahap 1 (stack muncul), 1..2 = tahap 2 (jam mengecil, stack naik)
     @Volatile private var progress = 0f
+    // jumlah kartu notifikasi yang terlihat; 0 -> swipe ke atas tidak boleh mengubah apa pun
+    @Volatile private var cardCount = 0
     private var lastP1 = 0f
     private var lastQ = 0f
     private var downX = 0f
@@ -153,7 +156,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.11 loaded into SystemUI")
+        log("v0.12 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -185,8 +188,15 @@ class MainHook : IXposedHookLoadPackage {
             val kids = (stackRef?.get() as? ViewGroup)?.childCount ?: -1
             logT("switchClockGear", "args=${p.args.toList()} state=$barState kids=$kids stack=${callerFull()}", discrete = true)
             var want = Config.gear
-            if (want.isEmpty() && Config.gearSwipe && Config.gesture && barState == 1) {
-                want = if (gearSmall) "SMALL" else if (Config.keepBig) "LARGE" else ""
+            // Selama di lockscreen (termasuk saat gestur tweak aktif) jam dipaksa LARGE:
+            // notifikasi masuk tidak boleh mengubah jam depth jadi kecil (foto 2N).
+            val onLock = Config.gesture && (barState == 1 || barState == -1 || applied)
+            if (want.isEmpty() && onLock) {
+                want = when {
+                    Config.gearSwipe && gearSmall -> "SMALL"
+                    Config.keepBig -> "LARGE"
+                    else -> ""
+                }
             }
             if (want.isNotEmpty() && cur is Enum<*>) {
                 val t = enumByName(want)
@@ -476,6 +486,7 @@ class MainHook : IXposedHookLoadPackage {
             val locked = isLocked(root.context)
             if (locked) {
                 refreshTargets(root)
+                cardCount = stackRef?.get()?.let { countCards(it) } ?: 0
             } else if (applied) {
                 progress = 0f
                 applyState()
@@ -514,11 +525,17 @@ class MainHook : IXposedHookLoadPackage {
         if (taken) {
             when (a) {
                 MotionEvent.ACTION_MOVE -> {
-                    val moved = (startY - ev.rawY) / dm.density
-                    val d = progressToDist(baseProgress) + moved
-                    progress = distToProgress(d.coerceAtLeast(0f)).coerceIn(0f, maxProgress())
-                    applyState()
-                    logT("progress", "p=$progress")
+                    if (cardCount == 0) {
+                        // tanpa notifikasi (foto 2): jam & layar harus tetap persis seperti foto 1
+                        progress = 0f
+                        applyState()
+                    } else {
+                        val moved = (startY - ev.rawY) / dm.density
+                        val d = progressToDist(baseProgress) + moved
+                        progress = distToProgress(d.coerceAtLeast(0f)).coerceIn(0f, maxProgress())
+                        applyState()
+                        logT("progress", "p=$progress")
+                    }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     taken = false
@@ -566,6 +583,22 @@ class MainHook : IXposedHookLoadPackage {
                 return
             }
             applied = true
+            val n = sv?.let { countCards(it) } ?: 0
+            cardCount = n
+            if (n == 0) {
+                // Tidak ada notifikasi (foto 1 & foto 2): tidak ada yang boleh berubah.
+                // Jam depth tetap besar; swipe ke atas tidak boleh memudarkannya.
+                if (progress != 0f) {
+                    animator?.cancel()
+                    progress = 0f
+                }
+                gearSmall = false
+                lastP1 = 0f
+                lastQ = 0f
+                if (sentWp) { sentWp = false; sendWp(1f, 1f, true) }
+                if (sv != null) applyStack(sv, 0f, 0f) else hideLabels()
+                return
+            }
             val p = progress
             val p1 = min(p, 1f)
             val q = (p - 1f).coerceIn(0f, 1f)
@@ -579,7 +612,8 @@ class MainHook : IXposedHookLoadPackage {
                 if (want != null && want != (lastGearSet ?: sysGear)) setGear(want)
             }
 
-            // jam depth wallpaper: di-fade keluar di tahap 2 (jam kecil sistem mengambil alih)
+            // jam depth wallpaper: di tahap 2 jam MENGECIL (foto 4) tapi tetap terlihat,
+            // tidak boleh di-fade sampai hilang
             if (Config.wpExp) {
                 if (q > 0.001f) {
                     sentWp = true
@@ -640,6 +674,7 @@ class MainHook : IXposedHookLoadPackage {
         val shift = top - naturalTop
 
         var topVisual = top
+        var leftVisual = loc[0].toFloat()
         val pileCenter = dm.heightPixels * Config.pileFrac
         for (i in 0 until n) {
             val card = cards[i].first
@@ -663,20 +698,33 @@ class MainHook : IXposedHookLoadPackage {
             card.scaleX = s
             card.scaleY = s
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz)
-            if (i == 0) topVisual = loc[1] + wy + h / 2f - h * s / 2f
+            if (i == 0) {
+                topVisual = loc[1] + wy + h / 2f - h * s / 2f
+                leftVisual = (loc[0] + card.left).toFloat()
+            }
         }
 
-        updateLabels(sv, n, p1, topVisual, d, dm.heightPixels)
+        updateLabels(sv, n, p1, topVisual, leftVisual, d, dm.heightPixels)
+    }
+
+    private fun countCards(sv: View): Int {
+        val g = sv as? ViewGroup ?: return 0
+        var n = 0
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0) n++
+        }
+        return n
     }
 
     // ---- label: "Notification Center" (di atas stack) dan "N Notification(s)" (saat stack tertutup) ----
 
-    private fun makeLabel(ctx: Context, sp: Float, d: Float): TextView = TextView(ctx).apply {
+    private fun makeLabel(ctx: Context, sp: Float): TextView = TextView(ctx).apply {
         setTextColor(Color.WHITE)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         gravity = Gravity.CENTER
-        setShadowLayer(3f * d, 0f, d, 0x80000000.toInt())
+        // tanpa bayangan hitam (diminta): teks polos
         isClickable = false
         isFocusable = false
         alpha = 0f
@@ -687,17 +735,17 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun ensureLabels(host: FrameLayout) {
-        val d = host.resources.displayMetrics.density
         if (centerLabel?.parent !== host) {
             (centerLabel?.parent as? ViewGroup)?.removeView(centerLabel)
-            val v = makeLabel(host.context, 17f, d)
+            val v = makeLabel(host.context, 17f)
             v.text = "Notification Center"
+            v.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             host.addView(v)
             centerLabel = v
         }
         if (countLabel?.parent !== host) {
             (countLabel?.parent as? ViewGroup)?.removeView(countLabel)
-            val v = makeLabel(host.context, 13f, d)
+            val v = makeLabel(host.context, 13f)
             host.addView(v)
             countLabel = v
         }
@@ -708,7 +756,7 @@ class MainHook : IXposedHookLoadPackage {
         countLabel?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
     }
 
-    private fun updateLabels(sv: View, n: Int, p1: Float, topVisual: Float, d: Float, screenH: Int) {
+    private fun updateLabels(sv: View, n: Int, p1: Float, topVisual: Float, leftVisual: Float, d: Float, screenH: Int) {
         if (!Config.labels) { hideLabels(); return }
         val host = sv.rootView as? FrameLayout ?: return
         ensureLabels(host)
@@ -717,12 +765,14 @@ class MainHook : IXposedHookLoadPackage {
         val hl = IntArray(2)
         host.getLocationOnScreen(hl)
 
-        // "Notification Center": menempel di atas kartu paling atas, muncul saat stack hampir penuh
+        // "Notification Center": menempel di atas kartu paling atas, rata kiri dengan tepi kiri kartu
+        // (garis merah "y" foto 3), bukan di tengah.
         val ca = ((p1 - 0.7f) / 0.3f).coerceIn(0f, 1f)
         c.alpha = ca
         c.visibility = if (ca > 0f) View.VISIBLE else View.INVISIBLE
         val ch = if (c.height > 0) c.height.toFloat() else 28f * d
         c.translationY = topVisual - hl[1] - ch - 6f * d
+        c.translationX = (leftVisual - hl[0]).coerceAtLeast(8f * d)
 
         // "N Notification(s)": tampil saat stack tertutup, memudar saat stack ditarik
         val ka = (1f - p1 * 3f).coerceIn(0f, 1f)
