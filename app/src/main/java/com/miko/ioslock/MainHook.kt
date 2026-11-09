@@ -7,12 +7,14 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
@@ -39,6 +41,10 @@ object Config {
     val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
+    // id view jam tambahan yang ingin digeser/dikecilkan (lihat log visibleBig)
+    val clockId: String get() = prop("debug.ioslock.clockid")
+    // guard tambahan: hanya ambil alih jika tinggi shade <= 1
+    val guardH: Boolean get() = prop("debug.ioslock.guardh") == "1"
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -47,11 +53,17 @@ class MainHook : IXposedHookLoadPackage {
     private val lastLog = ConcurrentHashMap<String, Long>()
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
-    private val treeRegex = Regex("(?i)clock|stack|notif|keyguard|lock|media")
 
     private val attachedClocks = CopyOnWriteArrayList<WeakReference<View>>()
     @Volatile private var activeClocks: List<View> = emptyList()
     @Volatile private var stackRef: WeakReference<View>? = null
+
+    // 0 = SHADE, 1 = KEYGUARD, 2 = SHADE_LOCKED, -1 = belum diketahui
+    @Volatile private var barState = -1
+    @Volatile private var shadeH = 0f
+
+    // posisi asli tiap kartu notifikasi: [dasar, nilai yang kita tulis]
+    private val rowState = WeakHashMap<View, FloatArray>()
 
     // state gestur
     private var progress = 0f
@@ -67,16 +79,17 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.4.3 loaded into SystemUI")
+        log("v0.5 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
         val stack = "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayoutController"
         val shadeWindow = "com.android.systemui.shade.NotificationShadeWindowView"
+        val stateCtl = "com.android.systemui.statusbar.StatusBarStateControllerImpl"
 
         hook(cl, clockView, "onAttachedToWindow", after = { p ->
             val v = p.thisObject as? View ?: return@hook
-            if (!isRealClock(v)) { logT("clockIgnored", describeView(v), discrete = true); return@hook }
+            if (!isRealClock(v)) return@hook
             attachedClocks.add(WeakReference(v))
             logT("clockAttached", "total=${attachedClocks.size} ${describeView(v)}", discrete = true)
         })
@@ -90,11 +103,25 @@ class MainHook : IXposedHookLoadPackage {
                 try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
             }
         }, after = { applyState() })
+        hook(cl, clockView, "getClockLevel", after = { p ->
+            logT("getClockLevel", "ret=${p.result}", discrete = true)
+        })
         hook(cl, clockView, "updateClockViewParams", before = { p ->
             logT("updateClockViewParams", "arg=${p.args.getOrNull(0)}", discrete = true)
         }, after = { applyState() })
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
+        hook(cl, panel, "onHeightUpdated", after = { p ->
+            (p.args.getOrNull(0) as? Float)?.let { shadeH = it; logT("shadeH", "h=$it") }
+        })
+
+        // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
+        hook(cl, stateCtl, "setState", after = { p ->
+            val s = p.args.getOrNull(0) as? Int ?: return@hook
+            barState = s
+            logT("barState", "state=$s", discrete = true)
+            applyState()
+        })
 
         // Ambil View stack notifikasi dari controller-nya
         hook(cl, stack, "updateVisibility", after = { p ->
@@ -115,6 +142,8 @@ class MainHook : IXposedHookLoadPackage {
         (ctx.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
     } catch (t: Throwable) { false }
 
+    private fun onKeyguardState(): Boolean = barState == 1 || barState == -1
+
     private fun findViews(v: View, depth: Int, out: MutableList<View>, pred: (View) -> Boolean) {
         if (depth > 14 || out.size > 8) return
         if (pred(v)) out.add(v)
@@ -123,7 +152,7 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // Jam asli = id lockscreen_clock_view. "lockscreen_measure_clock_view" hanya untuk mengukur (selalu tersembunyi).
+    // Jam bawaan = id lockscreen_clock_view ("lockscreen_measure_clock_view" hanya pengukur)
     private fun isRealClock(v: View): Boolean {
         val id = idName(v)
         if (id == "lockscreen_measure_clock_view") return false
@@ -132,13 +161,20 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun refreshTargets(root: View) {
         val top = root.rootView
-        // Tidak memakai isShown: saat transisi layar menyala, jam bisa sedang tersembunyi sesaat.
         val known = attachedClocks.mapNotNull { it.get() }.filter { it.isAttachedToWindow && it.width > 0 }
-        activeClocks = if (known.isNotEmpty()) known else {
+        var list: List<View> = if (known.isNotEmpty()) known else {
             val out = ArrayList<View>()
             findViews(top, 0, out) { isRealClock(it) && it.width > 0 }
             out
         }
+        val extra = Config.clockId
+        if (extra.isNotEmpty()) {
+            val out = ArrayList<View>()
+            findViews(top, 0, out) { idName(it) == extra }
+            list = list + out.filter { it !in list }
+        }
+        activeClocks = list
+
         val sv = stackRef?.get()
         if (sv == null || !sv.isAttachedToWindow) {
             val out = ArrayList<View>()
@@ -147,18 +183,37 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun dumpTree(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
-        if (depth > 12 || count[0] > 120) return
-        val n = v.javaClass.name
-        val id = idName(v)
-        if (treeRegex.containsMatchIn(n + id)) {
-            sb.append("\n").append("  ".repeat(depth)).append(n.substringAfterLast('.'))
-                .append(" id=").append(id).append(" shown=").append(v.isShown)
+    // Struktur view (semua, sampai kedalaman tertentu)
+    private fun dumpAll(v: View, depth: Int, maxDepth: Int, sb: StringBuilder, count: IntArray) {
+        if (depth > maxDepth || count[0] > 90) return
+        sb.append("\n").append("  ".repeat(depth)).append(v.javaClass.simpleName)
+            .append(" id=").append(idName(v)).append(" shown=").append(v.isShown)
+            .append(" ").append(v.width).append("x").append(v.height)
+        count[0]++
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) dumpAll(v.getChildAt(i), depth + 1, maxDepth, sb, count)
+        }
+    }
+
+    // View besar yang sedang terlihat (untuk mencari jam yang sebenarnya)
+    private fun scanBig(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
+        if (depth > 18 || count[0] > 30) return
+        if (v.isShown && v.width >= 300 && v.height >= 120 && !(v.width >= 1000 && v.height >= 2000)) {
+            sb.append("\n  ").append(v.javaClass.name.substringAfterLast('.'))
+                .append(" id=").append(idName(v))
                 .append(" ").append(v.width).append("x").append(v.height)
+            if (v is TextView) sb.append(" text='").append(v.text?.toString()?.take(12)).append("'")
+            var par = v.parent
+            var n = 0
+            sb.append(" <")
+            while (par is View && n < 3) {
+                sb.append(" ").append(par.javaClass.simpleName).append("#").append(idName(par))
+                par = par.parent; n++
+            }
             count[0]++
         }
         if (v is ViewGroup) {
-            for (i in 0 until v.childCount) dumpTree(v.getChildAt(i), depth + 1, sb, count)
+            for (i in 0 until v.childCount) scanBig(v.getChildAt(i), depth + 1, sb, count)
         }
     }
 
@@ -176,22 +231,28 @@ class MainHook : IXposedHookLoadPackage {
             val locked = isLocked(root.context)
             if (locked) {
                 refreshTargets(root)
-                once("tree") {
-                    val sb = StringBuilder("tree:")
-                    dumpTree(root.rootView, 0, sb, intArrayOf(0))
+                once("tree2") {
+                    val sb = StringBuilder("tree2:")
+                    dumpAll(root.rootView, 0, 5, sb, intArrayOf(0))
                     log(sb.toString())
                 }
+                activeClocks.firstOrNull { idName(it) == "lockscreen_clock_view" }?.let {
+                    dumpFields("clock", it)
+                }
+                val big = StringBuilder("visibleBig:")
+                scanBig(root.rootView, 0, big, intArrayOf(0))
+                logT("visibleBig", big.toString(), discrete = true)
             } else if (applied) {
                 progress = 0f
                 applyState()
             }
             logT(
                 "touchSeen",
-                "locked=$locked clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
+                "locked=$locked state=$barState shadeH=$shadeH clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
                 discrete = true
             )
-            activeClocks.firstOrNull()?.let { logT("clockAtTouch", describeView(it), discrete = true) }
-            tracking = locked && activeClocks.isNotEmpty() &&
+            tracking = locked && onKeyguardState() &&
+                (!Config.guardH || shadeH <= 1f) &&
                 ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
             return
         }
@@ -237,7 +298,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun snap(target: Float) {
         animator?.cancel()
         val an = ValueAnimator.ofFloat(progress, target)
-        an.duration = 220
+        an.duration = 260
         an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
         animator = an
         an.start()
@@ -249,7 +310,8 @@ class MainHook : IXposedHookLoadPackage {
             val sv = stackRef?.get()
             val ctx = clocks.firstOrNull()?.context ?: sv?.context
             val locked = ctx != null && isLocked(ctx)
-            if (!Config.gesture || !locked) {
+            val onKeyguard = locked && onKeyguardState()
+            if (!Config.gesture || !onKeyguard) {
                 if (applied) { reset(clocks, sv); applied = false }
                 if (!locked) progress = 0f
                 return
@@ -265,17 +327,58 @@ class MainHook : IXposedHookLoadPackage {
                 clock.scaleY = s
                 clock.translationY = -Config.pushDp * d * p
             }
-            if (sv != null) {
-                val d = sv.resources.displayMetrics.density
-                sv.alpha = p
-                sv.translationY = (1f - p) * 48f * d
-            }
+            if (sv != null) applyStack(sv, p)
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
+    }
+
+    private fun baseOf(row: View): Float {
+        val st = rowState[row]
+        return if (st != null && abs(row.translationY - st[1]) < 0.01f) st[0] else row.translationY
+    }
+
+    // Animasi stack: kartu menumpuk di kartu teratas, lalu menyebar saat p naik ke 1
+    private fun applyStack(sv: View, p: Float) {
+        val d = sv.resources.displayMetrics.density
+        sv.alpha = (p * 3f).coerceAtMost(1f)
+        sv.translationY = 0f
+        val g = sv as? ViewGroup ?: return
+        val rows = ArrayList<Pair<View, Float>>()
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            if (c.visibility == View.VISIBLE && c.javaClass.name.contains("ExpandableNotificationRow")) {
+                rows.add(c to baseOf(c))
+            }
+        }
+        rows.sortBy { it.second }
+        val base0 = rows.firstOrNull()?.second ?: return
+        rows.forEachIndexed { i, (row, base) ->
+            val off = (1f - p) * ((base0 - base) + i * 10f * d)
+            val w = base + off
+            row.translationY = w
+            val s = 1f - (1f - p) * 0.05f * i
+            row.pivotX = row.width / 2f
+            row.scaleX = s
+            row.scaleY = s
+            rowState[row] = floatArrayOf(base, w)
+        }
     }
 
     private fun reset(clocks: List<View>, sv: View?) {
         for (c in clocks) { c.scaleX = 1f; c.scaleY = 1f; c.translationY = 0f }
-        sv?.let { it.alpha = 1f; it.translationY = 0f }
+        if (sv != null) {
+            sv.alpha = 1f
+            sv.translationY = 0f
+            (sv as? ViewGroup)?.let { g ->
+                for (i in 0 until g.childCount) {
+                    val c = g.getChildAt(i)
+                    val st = rowState[c] ?: continue
+                    if (abs(c.translationY - st[1]) < 0.01f) c.translationY = st[0]
+                    c.scaleX = 1f
+                    c.scaleY = 1f
+                    rowState.remove(c)
+                }
+            }
+        }
     }
 
     private fun describeView(v: View): String =
@@ -285,6 +388,30 @@ class MainHook : IXposedHookLoadPackage {
     private fun idName(v: View): String = try {
         if (v.id == View.NO_ID) "none" else v.resources.getResourceEntryName(v.id)
     } catch (t: Throwable) { "0x" + Integer.toHexString(v.id) }
+
+    private fun dumpFields(key: String, obj: Any) {
+        once("dump:$key") {
+            val sb = StringBuilder("fields of $key:")
+            var c: Class<*>? = obj.javaClass
+            while (c != null && c != Any::class.java) {
+                for (f in c.declaredFields) {
+                    val value = try {
+                        f.isAccessible = true
+                        val x = f.get(obj)
+                        when {
+                            x == null -> "null"
+                            x is View -> x.javaClass.simpleName + "#" + idName(x)
+                            f.type.isPrimitive || x is String || x is Number -> x.toString()
+                            else -> x.javaClass.name
+                        }
+                    } catch (t: Throwable) { "?" }
+                    sb.append("\n  ${c.simpleName}.${f.name}: ${f.type.simpleName} = $value")
+                }
+                c = c.superclass
+            }
+            log(sb.toString())
+        }
+    }
 
     private fun hook(
         cl: ClassLoader, cls: String, method: String,
