@@ -54,7 +54,7 @@ object Config {
 
     // eksperimen: kirim perintah systemui.wallpaper.touch ke wallpaper mengikuti progres swipe
     val wpExp: Boolean get() = prop("debug.ioslock.wpexp") == "1"
-    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.6f
+    val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.8f
     // kosong = ikuti alpha dari sistem (JANGAN 0: alpha 0 menyembunyikan jam yang digambar wallpaper)
     val wpAlpha: Float? get() = prop("debug.ioslock.wpalpha").toFloatOrNull()
 
@@ -107,7 +107,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.8 loaded into SystemUI")
+        log("v0.9 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
@@ -151,9 +151,26 @@ class MainHook : IXposedHookLoadPackage {
         // Kapan jam bawaan disembunyikan karena tema / wallpaper
         hook(cl, clockHelper, "updateKeyguardClockVisibility", before = { p ->
             logT("clockVisibility", "args=${p.args.toList()} caller=${caller()}", discrete = true)
-        })
+        }, after = { p -> logT("helperState", compactFields(p.thisObject), discrete = true) })
         hook(cl, clockHelper, "updateClockVisibilityInternal", before = { p ->
             logT("clockVisibilityInternal", "args=${p.args.toList()} caller=${caller()}", discrete = true)
+        }, after = { p -> logT("helperState", compactFields(p.thisObject), discrete = true) })
+        hook(cl, clockHelper, "handleClockPosition", after = { p ->
+            logT("helperState", compactFields(p.thisObject), discrete = true)
+        })
+        // Mode tampilan jam (ClockDisplayMode) yang dipilih binder: catat nilai + semua konstanta enum-nya
+        hook(cl, "com.android.systemui.keyguard.ui.binder.TrKeyguardClockViewBinder", "access\$getClockView", before = { p ->
+            val mode = p.args.getOrNull(2)
+            logT("binderMode", "mode=$mode flag=${p.args.getOrNull(3)} caller=${caller()}", discrete = true)
+            if (mode != null) once("modeEnum") {
+                try {
+                    val vals = mode.javaClass.enumConstants?.joinToString(",")
+                    log("ClockDisplayMode values: $vals")
+                } catch (t: Throwable) { }
+            }
+        })
+        hook(cl, "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor", "switchClockGear", after = { p ->
+            logT("interactorState", compactFields(p.thisObject), discrete = true)
         })
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
@@ -497,7 +514,8 @@ class MainHook : IXposedHookLoadPackage {
             }
             logT(
                 "touchSeen",
-                "locked=$locked state=$barState clocks=${activeClocks.size} stack=${stackRef?.get() != null}",
+                "locked=$locked state=$barState clocks=${activeClocks.size} stack=${stackRef?.get() != null} " +
+                    "sysAlpha=$sysAlpha clock=${activeClocks.firstOrNull()?.let { describeView(it) }}",
                 discrete = true
             )
             tracking = locked && onKeyguardState() &&
@@ -737,6 +755,31 @@ class MainHook : IXposedHookLoadPackage {
             .take(8).joinToString(" < ") { "${it.className}.${it.methodName}" }
 
     private fun once(key: String, block: () -> Unit) { if (dumped.add(key)) block() }
+
+    // satu baris berisi field primitif / String / enum / ukuran koleksi milik class aplikasi
+    private fun compactFields(obj: Any?): String {
+        if (obj == null) return "null"
+        val sb = StringBuilder(obj.javaClass.simpleName).append("{")
+        var c: Class<*>? = obj.javaClass
+        while (c != null && c != Any::class.java && !c.name.startsWith("android.")) {
+            for (f in c.declaredFields) {
+                if (Modifier.isStatic(f.modifiers) || f.name.contains('$')) continue
+                try {
+                    f.isAccessible = true
+                    val x = f.get(obj)
+                    val s = when {
+                        x == null -> continue
+                        f.type.isPrimitive || x is String || x is Number || x is Boolean || x is Enum<*> -> x.toString()
+                        x is Collection<*> -> "size=${x.size}"
+                        else -> continue
+                    }
+                    sb.append(f.name).append('=').append(s).append(' ')
+                } catch (t: Throwable) { }
+            }
+            c = c.superclass
+        }
+        return sb.append("}").toString()
+    }
 
     private fun logT(key: String, msg: String, discrete: Boolean = false) {
         val now = System.currentTimeMillis()
