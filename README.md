@@ -21,7 +21,15 @@ su -c setprop debug.ioslock.keepbig 0       # 0 = jangan paksa gear LARGE di loc
 su -c setprop debug.ioslock.gearswipe 1     # 1 = paksa gear SMALL di tahap 2
 su -c setprop debug.ioslock.labels 0        # sembunyikan "Notification Center" / "N Notifications"
 su -c setprop debug.ioslock.bubble 0        # matikan bubble frosted di belakang "N Notifications"
+su -c setprop debug.ioslock.liveblur 0      # bubble pakai potongan wallpaper statis, bukan blur live
 su -c setprop debug.ioslock.holddepth 0     # matikan penjaga alpha/scale jam depth
+su -c setprop debug.ioslock.wpexp 0         # jam depth jangan dikirim perintah saat tahap 2 (jam tetap besar)
+su -c setprop debug.ioslock.clockshrink 1   # kecilkan View jam System UI saat tahap 2 (bukan jam depth)
+su -c setprop debug.ioslock.countfrac 0.846 # garis acuan: dasar kartu notifikasi paling bawah
+
+Semua target alpha/scale jam depth sekarang RELATIF terhadap nilai diam yang dipakai System UI
+(direkam otomatis, mis. skala 1.6 untuk jam depth). Versi lama memaksa 1.0 absolut sehingga jam
+depth berubah jadi jam biasa/hilang.
 
 ## Eksperimen tanpa rebuild (root)
 su -c setprop debug.ioslock.level N      # paksa arg setClockLevel

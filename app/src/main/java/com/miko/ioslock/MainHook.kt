@@ -14,10 +14,12 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -57,11 +59,17 @@ object Config {
     // Menyala otomatis; matikan dengan: setprop debug.ioslock.gesture 0
     val gesture: Boolean get() = prop("debug.ioslock.gesture") != "0"
 
-    // tahap 2: jam wallpaper (depth) MENGECIL tapi tetap terlihat (foto 4), bukan di-fade sampai hilang
-    // wpalpha = alpha jam wallpaper di akhir tahap 2 (1 = tetap terlihat, 0 = hilang). wpmin = skala akhir (1 = tidak mengecil)
+    // tahap 2: jam wallpaper (depth) MENGECIL tapi tetap terlihat (foto 4), bukan di-fade sampai hilang.
+    // wpalpha = alpha jam depth di akhir tahap 2 (1 = tetap terlihat, 0 = hilang). wpmin = skala akhir (1 = tidak mengecil).
+    // PENTING: nilainya RELATIF terhadap alpha/scale diam yang dipakai System UI sendiri. Jam depth digambar
+    // oleh wallpaper dengan skala diam besar (mis. 1.6), jadi memaksa 1.0 absolut akan mengubahnya jadi jam kecil.
     val wpExp: Boolean get() = prop("debug.ioslock.wpexp") != "0"
     val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.5f
     val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 1f
+    // alternatif: kecilkan View jam milik System UI (dipakai kalau jam tidak digambar wallpaper)
+    val clockShrink: Boolean get() = prop("debug.ioslock.clockshrink") == "1"
+    // bubble "N Notifications": blur live dari lapisan wallpaper yang sedang tampil (bukan potongan statis)
+    val liveBlur: Boolean get() = prop("debug.ioslock.liveblur") != "0"
 
     // tahap 2: swipe lanjutan setelah stack muncul
     val stage2: Boolean get() = prop("debug.ioslock.stage2") != "0"
@@ -166,6 +174,18 @@ class MainHook : IXposedHookLoadPackage {
     private var lastWpSentA = -1f
     private var lastWpSentS = -1f
 
+    // alpha/scale DIAM yang dipakai System UI sendiri untuk jam depth (direkam, bukan ditebak).
+    // Jam depth digambar oleh wallpaper; skalanya bisa > 1. Semua target kita relatif ke angka ini.
+    @Volatile private var restAlpha = 0f
+    @Volatile private var restScale = 0f
+
+    // view jam yang skala/alpha-nya kita ubah (hanya kalau clockshrink=1)
+    private var clockTouched = false
+
+    // sumber blur live: lapisan wallpaper yang tampil di keyguard (untuk bubble "N Notifications")
+    @Volatile private var liveRef: WeakReference<View>? = null
+    private var liveScanAt = 0L
+
     // konteks terakhir: dipakai penjaga wallpaper untuk memastikan keyguard masih terkunci
     @Volatile private var appCtx: Context? = null
 
@@ -189,7 +209,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.13 loaded into SystemUI")
+        log("v0.14 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -217,6 +237,7 @@ class MainHook : IXposedHookLoadPackage {
             if (cur is Enum<*>) {
                 gearClass = if (cur.javaClass.isEnum) cur.javaClass else cur.javaClass.superclass
                 sysGear = cur.name
+                once("gears") { log("gear tersedia: ${gearClass?.enumConstants?.joinToString { (it as Enum<*>).name }}") }
             }
             val kids = (stackRef?.get() as? ViewGroup)?.childCount ?: -1
             logT("switchClockGear", "args=${p.args.toList()} state=$barState kids=$kids stack=${callerFull()}", discrete = true)
@@ -268,6 +289,8 @@ class MainHook : IXposedHookLoadPackage {
             wpManager = p.thisObject
             wpToken = p.args.getOrNull(0)
             val action = p.args.getOrNull(1)?.toString() ?: "?"
+            // rekam nilai diam jam depth dari System UI sendiri (skalanya bisa 1.6, bukan 1.0)
+            learnRest(p)
             // Penjaga: selama di lockscreen, alpha/scale jam depth tidak boleh diturunkan SystemUI
             val held = holdDepth(p)
             if (Config.spy || action != "systemui.wallpaper.touch") {
@@ -396,26 +419,62 @@ class MainHook : IXposedHookLoadPackage {
 
     // ---- perintah ke wallpaper ----
 
-    // alpha/scale jam depth yang seharusnya dipakai sesuai progres gestur
+    // alpha/scale jam depth yang seharusnya dipakai sesuai progres gestur (faktor relatif, 1 = diam)
     private fun wpTargetAlpha(): Float = 1f - (1f - Config.wpAlpha) * (progress - 1f).coerceIn(0f, 1f)
 
     private fun wpTargetScale(): Float = 1f - (1f - Config.wpMin) * (progress - 1f).coerceIn(0f, 1f)
 
-    // Penjaga perintah System UI -> wallpaper: kalau SystemUI meminta alpha/scale lebih kecil
-    // (menghilangkan jam depth) sementara kita masih di lockscreen, tulis ulang dengan nilai kita.
+    private fun bundleFloat(b: Bundle, key: String): Float? = try {
+        when (val v = b.get(key)) {
+            is Float -> v
+            is Int -> v.toFloat()
+            is Double -> v.toFloat()
+            is String -> v.toFloatOrNull()
+            else -> null
+        }
+    } catch (t: Throwable) { null }
+
+    // Rekam alpha/scale DIAM jam depth dari System UI (nilai terbesar yang pernah diminta saat diam).
+    // Tanpa angka ini kita tidak boleh menebak 1.0: jam depth bisa punya skala 1.6, dan memaksa 1.0
+    // membuat jam besar berubah jadi jam biasa (bug "depth clock hilang").
+    private fun learnRest(p: XC_MethodHook.MethodHookParam) {
+        if (!onKeyguardState()) return
+        appCtx?.let { if (!isLocked(it)) { restAlpha = 0f; restScale = 0f; return } }
+        val b = p.args.getOrNull(5) as? Bundle ?: return
+        for (k in b.keySet()) {
+            val lk = k.lowercase()
+            val v = bundleFloat(b, k) ?: continue
+            if (v <= 0.01f || v > 4f) continue
+            if (lk.contains("alpha")) { if (v > restAlpha) restAlpha = v }
+            else if (lk.contains("scale")) { if (v > restScale) restScale = v }
+        }
+        if (Config.spy) logT("restDepth", "alpha=$restAlpha scale=$restScale", discrete = true)
+    }
+
+    // Penjaga perintah System UI -> wallpaper: kalau SystemUI meminta alpha/scale lebih kecil dari
+    // nilai diam yang kita rekam (menghilangkan/mengecilkan jam depth), tulis ulang dengan nilai kita.
+    // Kalau nilai diam belum diketahui, jangan sentuh sama sekali (biar jam depth apa adanya).
     private fun holdDepth(p: XC_MethodHook.MethodHookParam): Boolean {
         if (!Config.gesture || !Config.holdDepth) return false
         if (!applied || bouncerFade > 0.01f || !onKeyguardState()) return false
         appCtx?.let { if (!isLocked(it)) return false }
+        val ra = restAlpha
+        val rs = restScale
+        if (ra <= 0f && rs <= 0f) return false
         val b = p.args.getOrNull(5) as? Bundle ?: return false
-        val hasA = b.containsKey("alpha")
-        val hasS = b.containsKey("scale")
-        if (!hasA && !hasS) return false
-        val a = wpTargetAlpha()
-        val s = wpTargetScale()
-        if (hasA && abs(b.getFloat("alpha", 1f) - a) > 0.004f) b.putFloat("alpha", a)
-        if (hasS && abs(b.getFloat("scale", 1f) - s) > 0.004f) b.putFloat("scale", s)
-        return true
+        val a = if (ra > 0f) ra * wpTargetAlpha() else -1f
+        val s = if (rs > 0f) rs * wpTargetScale() else -1f
+        var touched = false
+        for (k in b.keySet()) {
+            val lk = k.lowercase()
+            val cur = bundleFloat(b, k) ?: continue
+            if (lk.contains("alpha") && a >= 0f) {
+                if (abs(cur - a) > 0.004f) { b.putFloat(k, a); touched = true }
+            } else if (lk.contains("scale") && s >= 0f) {
+                if (abs(cur - s) > 0.004f) { b.putFloat(k, s); touched = true }
+            }
+        }
+        return touched
     }
 
     private fun sendWp(alpha: Float, scale: Float, force: Boolean) {
@@ -438,6 +497,25 @@ class MainHook : IXposedHookLoadPackage {
             once("wpSendFail") { log("sendWp gagal: $t") }
         } finally {
             ownCall = false
+        }
+    }
+
+    // ---- jam: kecilkan/pudarkan View jam System UI saat tahap 2 ----
+
+    // Hanya dipakai kalau clockshrink=1 (jam yang digambar System UI sendiri). Default mati,
+    // karena jam depth dikelola wallpaper dan mengubah View-nya bisa memicu jam berkedip.
+    private fun applyClock(q: Float) {
+        val on = Config.clockShrink
+        val s = if (on) 1f - (1f - Config.wpMin) * q.coerceIn(0f, 1f) else 1f
+        val a = if (on) 1f - (1f - Config.wpAlpha) * q.coerceIn(0f, 1f) else 1f
+        val touched = s < 0.999f || a < 0.999f
+        if (!touched && !clockTouched) return
+        clockTouched = touched
+        val targets = ArrayList<View>(activeClocks)
+        for (r in attachedClocks) r.get()?.let { if (targets.none { t -> t === it }) targets.add(it) }
+        for (v in targets) {
+            if (abs(v.scaleX - s) > 0.001f) { v.scaleX = s; v.scaleY = s }
+            if (abs(v.alpha - a) > 0.001f) v.alpha = a
         }
     }
 
@@ -667,7 +745,11 @@ class MainHook : IXposedHookLoadPackage {
                 gearSmall = false
                 lastP1 = 0f
                 lastQ = 0f
-                if (sentWp) { sentWp = false; sendWp(1f, 1f, true) }
+                applyClock(0f)
+                if (sentWp) {
+                    sentWp = false
+                    if (restScale > 0f) sendWp(restAlpha, restScale, true)
+                }
                 if (sv != null) applyStack(sv, 0f, 0f, fade) else hideLabels()
                 return
             }
@@ -684,17 +766,23 @@ class MainHook : IXposedHookLoadPackage {
                 if (want != null && want != (lastGearSet ?: sysGear)) setGear(want)
             }
 
-            // jam depth wallpaper: di tahap 2 jam MENGECIL (foto 4) tapi tetap terlihat,
-            // tidak boleh di-fade sampai hilang. Saat bouncer tampil berhenti mengirim (jam berkedip).
-            if (Config.wpExp && fade < 0.01f) {
+            // jam: di tahap 2 MENGECIL (foto 4) tapi tetap terlihat, tidak boleh di-fade sampai hilang.
+            // Skala/alpha dikirim RELATIF terhadap nilai diam wallpaper (jam depth skalanya besar),
+            // jadi jam depth tidak berubah jadi jam kecil. Saat bouncer tampil berhenti (jam berkedip).
+            if (Config.wpExp && fade < 0.01f && restScale > 0f) {
                 if (q > 0.001f) {
                     sentWp = true
-                    sendWp(wpTargetAlpha(), wpTargetScale(), q >= 0.999f)
+                    sendWp(restAlpha * wpTargetAlpha(), restScale * wpTargetScale(), q >= 0.999f)
                 } else if (sentWp) {
                     sentWp = false
-                    sendWp(1f, 1f, true)
+                    sendWp(restAlpha, restScale, true)
                 }
+            } else if (sentWp) {
+                sentWp = false
+                if (restScale > 0f) sendWp(restAlpha, restScale, true)
             }
+            // alternatif untuk jam yang digambar System UI (bukan wallpaper): kecilkan view-nya
+            if (fade < 0.01f) applyClock(q)
 
             if (sv != null) {
                 ensurePreDraw(sv)
@@ -738,17 +826,21 @@ class MainHook : IXposedHookLoadPackage {
         }
         if (n == 0) { hideLabels(); return }
 
-        // posisi atas stack: tahap 1 = restTop, tahap 2 naik ke endTop (foto 3)
+        // ACUAN: dasar kartu PALING BAWAH tepat di garis teks "N Notifications" (tengah bawah).
+        // Stack tumbuh ke atas dari garis itu; kalau kepanjangan, puncaknya berhenti di restFrac.
+        val anchorBottom = dm.heightPixels * Config.countFrac
         val naturalTop = loc[1] + cards[0].second
-        val redTop = if (Config.restFrac > 0f) dm.heightPixels * Config.restFrac else 0f
-        val restTop = if (redTop > naturalTop) redTop else naturalTop
-        val endTop = if (Config.endFrac > 0f) dm.heightPixels * Config.endFrac else naturalTop
-        val top = restTop + (endTop - restTop) * q
-        val shift = top - naturalTop
+        val lowest = cards[n - 1]
+        val naturalBottom = loc[1] + lowest.second + lowest.first.height
+        var shift1 = anchorBottom - naturalBottom
+        val minTop = if (Config.restFrac > 0f) dm.heightPixels * Config.restFrac else Float.NEGATIVE_INFINITY
+        if (naturalTop + shift1 < minTop) shift1 = minTop - naturalTop
+        // tahap 2: puncak stack naik ke endFrac (foto 4)
+        val shift2 = if (Config.endFrac > 0f) dm.heightPixels * Config.endFrac - naturalTop else shift1
+        val shift = shift1 + (shift2 - shift1) * q
 
-        var topVisual = top
+        var topVisual = naturalTop + shift
         var leftVisual = loc[0].toFloat()
-        val pileCenter = dm.heightPixels * Config.pileFrac
         for (i in 0 until n) {
             val card = cards[i].first
             val baseY = cards[i].second
@@ -757,7 +849,8 @@ class MainHook : IXposedHookLoadPackage {
 
             val base2 = baseY + shift
             val naturalCenter = loc[1] + base2 + h / 2f
-            val targetCenter = pileCenter + i * Config.peekDp * d
+            // tertutup: kartu menumpuk ke atas dari garis teks yang sama (kartu bawah tetap di acuan)
+            val targetCenter = anchorBottom - h / 2f - (n - 1 - i) * Config.peekDp * d
             var wy = base2 + (1f - p1) * (targetCenter - naturalCenter)
 
             val collapsed = (Config.pileScale - 0.05f * i).coerceAtLeast(0.55f)
@@ -896,22 +989,64 @@ class MainHook : IXposedHookLoadPackage {
         val pillH = kh + 10f * d
         bub.pillW = pillW
         bub.pillH = pillH
-        bub.backdrop = backdropFor(
-            bub.context, pillW, pillH,
-            hl[0] + sv.width / 2f, hl[1] + k.translationY + kh / 2f,
-            sv.width, screenH
-        )
+        bub.screenX = hl[0] + sv.width / 2f
+        bub.screenY = hl[1] + k.translationY + kh / 2f
+        // live blur: render ulang lapisan wallpaper yang sedang tampil, jadi blur ikut bergerak
+        val live = liveWallSource(host)
+        bub.liveSrc = live
+        bub.liveAnimating = p1 > 0.01f
+        bub.fallback = if (live?.get() == null) {
+            backdropFor(bub.context, pillW, pillH, bub.screenX, bub.screenY, sv.width, screenH)
+        } else null
+        bub.invalidate()
+    }
+
+    // ---- cari lapisan wallpaper yang tampil di keyguard (sumber blur live) ----
+
+    private fun liveWallSource(host: View): WeakReference<View>? {
+        if (!Config.liveBlur) return null
+        val cached = liveRef?.get()
+        if (cached != null && cached.isShown && cached.width > 0 && cached.height > 0) return liveRef
+        val now = System.currentTimeMillis()
+        if (now - liveScanAt < 1000L) return liveRef?.takeIf { it.get() != null }
+        liveScanAt = now
+        val root = host.rootView
+        val found = ArrayList<View>()
+        findViews(root, 0, found) { v ->
+            v !== root && v !== host && v.isShown && v.width > 0 && v.height > 0 &&
+                v.width >= host.width * 0.9f && v.height >= host.height * 0.55f &&
+                (
+                    idName(v).contains("wallpaper") || idName(v).contains("background") ||
+                        v.javaClass.simpleName.contains("Wallpaper") ||
+                        v.javaClass.simpleName.contains("Background")
+                    )
+        }
+        val v = found.firstOrNull()
+        if (v == null) {
+            once("noWallView") { log("lapisan wallpaper tidak ditemukan, bubble pakai potongan statis") }
+            liveRef = null
+            return null
+        }
+        if (liveRef?.get() !== v) {
+            log("blur live dari ${v.javaClass.simpleName} #${idName(v)}")
+            liveRef = WeakReference(v)
+        }
+        return liveRef
     }
 
     private fun reset(sv: View?) {
         hideLabels()
         bouncerFade = 0f
         bouncerRef = null
-        // kembalikan wallpaper ke keadaan normal
+        applyClock(0f)
+        // kembalikan wallpaper ke keadaan normal (nilai diam yang dipakai System UI)
         if (sentWp) {
             sentWp = false
-            sendWp(1f, 1f, true)
+            if (restScale > 0f) sendWp(restAlpha, restScale, true)
         }
+        // nilai diam jam depth dipelajari ulang tiap kali masuk lockscreen
+        restAlpha = 0f
+        restScale = 0f
         // kembalikan gear jam ke permintaan sistem
         gearSmall = false
         val sg = sysGear
@@ -1043,34 +1178,10 @@ class MainHook : IXposedHookLoadPackage {
         val px = IntArray(w * h)
         bmp.getPixels(px, 0, w, 0, 0, w, h)
         repeat(2) {
-            boxBlurPass(px, w, h, 3, true)
-            boxBlurPass(px, w, h, 3, false)
+            boxBlur(px, w, h, 3, true)
+            boxBlur(px, w, h, 3, false)
         }
         bmp.setPixels(px, 0, w, 0, 0, w, h)
-    }
-
-    private fun boxBlurPass(px: IntArray, w: Int, h: Int, r: Int, horizontal: Boolean) {
-        val src = px.copyOf()
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                var sa = 0
-                var sr = 0
-                var sg = 0
-                var sb = 0
-                var n = 0
-                for (k in -r..r) {
-                    val xx = if (horizontal) (x + k).coerceIn(0, w - 1) else x
-                    val yy = if (horizontal) y else (y + k).coerceIn(0, h - 1)
-                    val p = src[yy * w + xx]
-                    sa += (p ushr 24) and 0xFF
-                    sr += (p ushr 16) and 0xFF
-                    sg += (p ushr 8) and 0xFF
-                    sb += p and 0xFF
-                    n++
-                }
-                px[y * w + x] = ((sa / n) shl 24) or ((sr / n) shl 16) or ((sg / n) shl 8) or (sb / n)
-            }
-        }
     }
 
     private fun idName(v: View): String = try {
@@ -1123,12 +1234,54 @@ class MainHook : IXposedHookLoadPackage {
     }
 }
 
-// Pill frosted di belakang "N Notifications": potongan wallpaper lockscreen yang diburamkan,
-// bentuk kapsul seperti tombol flash/kamera, dengan lapisan gelap transparan + tepi tipis.
+// kotak blur sederhana (dipakai bubble untuk memblur potongan kecil)
+private fun boxBlur(px: IntArray, w: Int, h: Int, r: Int, horizontal: Boolean) {
+    val src = px.copyOf()
+    for (y in 0 until h) {
+        for (x in 0 until w) {
+            var sa = 0
+            var sr = 0
+            var sg = 0
+            var sb = 0
+            var n = 0
+            for (k in -r..r) {
+                val xx = if (horizontal) (x + k).coerceIn(0, w - 1) else x
+                val yy = if (horizontal) y else (y + k).coerceIn(0, h - 1)
+                val p = src[yy * w + xx]
+                sa += (p ushr 24) and 0xFF
+                sr += (p ushr 16) and 0xFF
+                sg += (p ushr 8) and 0xFF
+                sb += p and 0xFF
+                n++
+            }
+            px[y * w + x] = ((sa / n) shl 24) or ((sr / n) shl 16) or ((sg / n) shl 8) or (sb / n)
+        }
+    }
+}
+
+private fun bubbleLog(msg: String) {
+    XposedBridge.log("[IOSLock] $msg")
+    android.util.Log.i("IOSLock", msg)
+}
+
+// Pill frosted di belakang "N Notifications": blur LIVE dari lapisan wallpaper yang sedang tampil
+// (dirender ulang tiap ~120 ms, jadi ikut bergerak bersama wallpaper/depth), bentuk kapsul seperti
+// tombol flash/kamera, plus lapisan gelap transparan + tepi tipis.
 private class CountBubble(ctx: Context) : View(ctx) {
     var pillW: Float = 0f
     var pillH: Float = 0f
-    var backdrop: Bitmap? = null
+    // koordinat layar titik tengah pill
+    var screenX: Float = 0f
+    var screenY: Float = 0f
+    // sumber live (lapisan wallpaper di keyguard) dan cadangan potongan statis
+    var liveSrc: WeakReference<View>? = null
+    var fallback: Bitmap? = null
+    // saat diam wallpaper tidak bergerak: cukup refresh 1 detik sekali (hemat CPU)
+    var liveAnimating: Boolean = false
+
+    private var liveBmp: Bitmap? = null
+    private var liveAt = 0L
+    private var liveBroken = false
 
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
     private val scrim = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x59000000 }
@@ -1147,13 +1300,61 @@ private class CountBubble(ctx: Context) : View(ctx) {
         visibility = INVISIBLE
     }
 
+    // Render isi lapisan wallpaper tepat di area pill, sekarang juga (live).
+    private fun liveShot(): Bitmap? {
+        if (liveBroken) return null
+        val src = liveSrc?.get() ?: return null
+        if (!src.isShown || pillW <= 1f || pillH <= 1f) return null
+        val now = SystemClock.uptimeMillis()
+        val interval = if (liveAnimating) 120L else 1000L
+        if (liveAt != 0L && now - liveAt < interval) return liveBmp
+        return try {
+            val w = 84
+            val k = w / pillW
+            val h = (pillH * k).toInt().coerceIn(8, 64)
+            val bmp = liveBmp?.takeIf { !it.isRecycled && it.width == w && it.height == h }
+                ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { liveBmp = it }
+            val c = Canvas(bmp)
+            c.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            val loc = IntArray(2)
+            src.getLocationOnScreen(loc)
+            val save = c.save()
+            c.clipRect(0f, 0f, w.toFloat(), h.toFloat())
+            c.scale(k, k)
+            c.translate(
+                loc[0] - (screenX - pillW / 2f),
+                loc[1] - (screenY - pillH / 2f)
+            )
+            src.draw(c)
+            c.restoreToCount(save)
+            val px = IntArray(w * h)
+            bmp.getPixels(px, 0, w, 0, 0, w, h)
+            if (px.none { it != 0 }) {
+                liveBroken = true
+                bubbleLog("blur live kosong (lapisan wallpaper tidak bisa dirender), pakai potongan statis")
+                return null
+            }
+            repeat(2) {
+                boxBlur(px, w, h, 3, true)
+                boxBlur(px, w, h, 3, false)
+            }
+            bmp.setPixels(px, 0, w, 0, 0, w, h)
+            liveAt = now
+            bmp
+        } catch (t: Throwable) {
+            liveBroken = true
+            bubbleLog("blur live gagal: $t")
+            null
+        }
+    }
+
     override fun onDraw(c: Canvas) {
         if (pillW <= 0f || pillH <= 0f) return
         val cx = width / 2f
         val cy = height / 2f
         rect.set(cx - pillW / 2f, cy - pillH / 2f, cx + pillW / 2f, cy + pillH / 2f)
         val r = pillH / 2f
-        val b = backdrop
+        val b = liveShot() ?: fallback
         if (b != null && !b.isRecycled) {
             path.reset()
             path.addRoundRect(rect, r, r, Path.Direction.CW)
