@@ -3,32 +3,30 @@ package com.miko.ioslock
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
-import android.view.ViewParent
-import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
-import java.lang.reflect.Modifier
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+import kotlin.math.min
 
 object Config {
     private val cache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     private fun prop(key: String): String {
         val now = System.currentTimeMillis()
-        cache[key]?.let { if (now - it.first < 500) return it.second }
+        cache[key]?.let { if (now - it.first < 400) return it.second }
         val v = try {
             XposedHelpers.callStaticMethod(
                 Class.forName("android.os.SystemProperties"), "get", key, ""
@@ -40,28 +38,33 @@ object Config {
 
     // Menyala otomatis; matikan dengan: setprop debug.ioslock.gesture 0
     val gesture: Boolean get() = prop("debug.ioslock.gesture") != "0"
-    // jam wallpaper mengecil mengikuti swipe (perintah systemui.wallpaper.touch)
+
+    // jam wallpaper mengecil mengikuti tahap 2 (perintah systemui.wallpaper.touch)
     val wpExp: Boolean get() = prop("debug.ioslock.wpexp") != "0"
     val wpMin: Float get() = prop("debug.ioslock.wpmin").toFloatOrNull() ?: 0.6f
     val wpAlpha: Float get() = prop("debug.ioslock.wpalpha").toFloatOrNull() ?: 1f
-    // gear jam: LARGE saat diam, SMALL setelah swipe melewati gearat
-    val gearSwipe: Boolean get() = prop("debug.ioslock.gearswipe") != "0"
-    val gearAt: Float get() = prop("debug.ioslock.gearat").toFloatOrNull() ?: 0.5f
-    // paksa gear mutlak: LARGE atau SMALL (kosongkan = otomatis)
-    val gear: String get() = prop("debug.ioslock.gear").trim().uppercase()
 
-    val forceClockLevel: Int? get() = prop("debug.ioslock.level").toIntOrNull()
-    val pushDp: Float get() = prop("debug.ioslock.pushdp").toFloatOrNull() ?: 120f
-    val minScale: Float get() = prop("debug.ioslock.minscale").toFloatOrNull() ?: 0.5f
+    // tahap 2: swipe lanjutan setelah stack muncul (jam mengecil)
+    val stage2: Boolean get() = prop("debug.ioslock.stage2") != "0"
+    val stage2Dp: Float get() = prop("debug.ioslock.stage2dp").toFloatOrNull() ?: 120f
+    // jarak swipe tahap 1 (dp)
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 300f
+    // posisi atas stack saat diam (0..1 dari tinggi layar); 0 = ikut posisi sistem
+    val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0f
+
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
     val pileFrac: Float get() = prop("debug.ioslock.pilefrac").toFloatOrNull() ?: 0.84f
     val pileScale: Float get() = prop("debug.ioslock.pilescale").toFloatOrNull() ?: 0.80f
     val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 14f
-    val clockId: String get() = prop("debug.ioslock.clockid")
-    val dumpToken: String get() = prop("debug.ioslock.dump")
-    // pelacakan class jam (log banyak), default mati
-    val discover: Boolean get() = prop("debug.ioslock.discover") == "1"
+
+    // gear jam (hasil uji: tidak memengaruhi jam wallpaper, dan membuat stack teracak)
+    val gearSwipe: Boolean get() = prop("debug.ioslock.gearswipe") == "1"
+    val gear: String get() = prop("debug.ioslock.gear").trim().uppercase()
+    val gearAt: Float get() = prop("debug.ioslock.gearat").toFloatOrNull() ?: 1.0f
+
+    // alat penemuan
+    val spy: Boolean get() = prop("debug.ioslock.spy") == "1"
+    val wpSend: String get() = prop("debug.ioslock.wpsend")
 }
 
 class MainHook : IXposedHookLoadPackage {
@@ -70,8 +73,6 @@ class MainHook : IXposedHookLoadPackage {
     private val lastLog = ConcurrentHashMap<String, Long>()
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
-    private val discoverRegex = Regex("(?i)(ClockControllerImpl|WallpaperTouch|KeyguardClockInteractor|ClockViewBinder)")
-    private val traceCount = AtomicInteger(0)
 
     private val attachedClocks = CopyOnWriteArrayList<WeakReference<View>>()
     @Volatile private var activeClocks: List<View> = emptyList()
@@ -89,14 +90,15 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var ownCall = false
     private var lastWpSend = 0L
     private var sentWp = false
+    private var lastCustomSend = ""
 
-    // kontrol gear jam
+    // kontrol gear jam (opsional, default mati)
     @Volatile private var interactorRef: WeakReference<Any>? = null
     @Volatile private var gearClass: Class<*>? = null
     @Volatile private var ownGear = false
     private var lastGearSet: String? = null
 
-    // state gestur
+    // state gestur. progress: 0..1 = tahap 1 (stack muncul), 1..2 = tahap 2 (jam mengecil)
     @Volatile private var progress = 0f
     private var downX = 0f
     private var downY = 0f
@@ -106,15 +108,13 @@ class MainHook : IXposedHookLoadPackage {
     private var taken = false
     private var applied = false
     private var animator: ValueAnimator? = null
-    private var lastDumpToken = ""
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.9 loaded into SystemUI")
+        log("v0.10 loaded into SystemUI")
 
         val clockView = "com.transsion.keyguard.clock.ui.KeyguardClockView"
-        val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
         val panel = "com.android.systemui.shade.TrNotificationPanelViewController"
         val stack = "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayoutController"
@@ -125,21 +125,13 @@ class MainHook : IXposedHookLoadPackage {
             val v = p.thisObject as? View ?: return@hook
             if (!isRealClock(v)) return@hook
             attachedClocks.add(WeakReference(v))
-            logT("clockAttached", "total=${attachedClocks.size} ${describeView(v)}", discrete = true)
         })
         hook(cl, clockView, "onDetachedFromWindow", after = { p ->
             val v = p.thisObject as? View ?: return@hook
             attachedClocks.removeAll { it.get() == null || it.get() === v }
         })
-        hook(cl, clockView, "setClockLevel", before = { p ->
-            logT("setClockLevel", "arg=${p.args.getOrNull(0)}", discrete = true)
-            Config.forceClockLevel?.let { lv ->
-                try { p.args[0] = lv } catch (t: Throwable) { log("force level gagal: $t") }
-            }
-        }, after = { applyState() })
-        hook(cl, clockView, "updateClockViewParams", after = { applyState() })
 
-        // Gear jam: LARGE (jam tinggi) / SMALL (jam biasa)
+        // Gear jam: dicatat dengan jejak lengkap (untuk mencari pemicunya)
         hook(cl, clockInteractor, "switchClockGear", before = { p ->
             if (ownGear) return@hook
             val inst = p.thisObject
@@ -148,7 +140,7 @@ class MainHook : IXposedHookLoadPackage {
             if (cur is Enum<*>) {
                 gearClass = if (cur.javaClass.isEnum) cur.javaClass else cur.javaClass.superclass
             }
-            logT("switchClockGear", "args=${p.args.toList()} progress=$progress state=$barState", discrete = true)
+            logT("switchClockGear", "args=${p.args.toList()} state=$barState stack=${callerFull()}", discrete = true)
             var want = Config.gear
             if (want.isEmpty() && Config.gearSwipe && Config.gesture && barState == 1) {
                 want = if (progress >= Config.gearAt) "SMALL" else "LARGE"
@@ -162,11 +154,6 @@ class MainHook : IXposedHookLoadPackage {
             }
         })
 
-        // Kapan jam bawaan disembunyikan karena tema / wallpaper
-        hook(cl, clockHelper, "updateKeyguardClockVisibility", before = { p ->
-            logT("clockVisibility", "args=${p.args.toList()}", discrete = true)
-        })
-
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
 
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
@@ -174,7 +161,6 @@ class MainHook : IXposedHookLoadPackage {
             val s = p.args.getOrNull(0) as? Int ?: return@hook
             barState = s
             logT("barState", "state=$s", discrete = true)
-            if (s == 1) resetDumps()
             applyState()
         })
 
@@ -183,10 +169,7 @@ class MainHook : IXposedHookLoadPackage {
             val v = try {
                 XposedHelpers.getObjectField(p.thisObject, "mView") as? View
             } catch (t: Throwable) { null }
-            if (v != null) {
-                stackRef = WeakReference(v)
-                once("stackView") { log("stack view: " + describeView(v)) }
-            }
+            if (v != null) stackRef = WeakReference(v)
         })
 
         // Tangkap sentuhan di window shade
@@ -197,18 +180,101 @@ class MainHook : IXposedHookLoadPackage {
             if (ownCall) return@hook
             wpManager = p.thisObject
             wpToken = p.args.getOrNull(0)
+            val action = p.args.getOrNull(1)?.toString() ?: "?"
+            if (Config.spy || action != "systemui.wallpaper.touch") {
+                val rest = p.args.drop(1).joinToString(" ") { brief(it) }
+                logT("WPCMD:$action", rest, discrete = true)
+            }
         })
 
-        if (Config.discover) startDiscovery(cl)
+        hookSpy(cl)
     }
 
-    private fun resetDumps() {
-        dumped.remove("tree2")
-        dumped.remove("custom")
-        dumped.remove("dump:clock")
+    // ---- mode spy: catat semua saluran keluar System UI ----
+
+    private fun spyIntent(kind: String, a: Any?) {
+        if (!Config.spy) return
+        val intent = a as? Intent ?: return
+        logT(
+            "$kind:${intent.action}:${intent.component}",
+            "act=${intent.action} cmp=${intent.component} pkg=${intent.getPackage()} extras=${intent.extras?.keySet()}",
+            discrete = true
+        )
     }
 
-    // ---- gear jam ----
+    private fun hookSpy(cl: ClassLoader) {
+        for (cls in listOf("android.provider.Settings\$System", "android.provider.Settings\$Secure", "android.provider.Settings\$Global")) {
+            val which = cls.substringAfterLast('$')
+            hook(cl, cls, "putStringForUser", before = { p ->
+                if (!Config.spy) return@hook
+                val name = p.args.getOrNull(1)?.toString() ?: return@hook
+                logT("SET:$which:$name", "$name=${p.args.getOrNull(2)}", discrete = true)
+            })
+        }
+        for (m in listOf("sendBroadcast", "sendBroadcastAsUser")) {
+            hook(cl, "android.app.ContextImpl", m, before = { p -> spyIntent("BCAST", p.args.getOrNull(0)) })
+        }
+        for (m in listOf("startService", "startServiceAsUser", "bindService", "bindServiceAsUser")) {
+            hook(cl, "android.app.ContextImpl", m, before = { p -> spyIntent("SVC", p.args.getOrNull(0)) })
+        }
+        for (m in listOf("call", "insert", "update", "notifyChange")) {
+            hook(cl, "android.content.ContentResolver", m, before = { p ->
+                if (!Config.spy) return@hook
+                val first = p.args.getOrNull(0)?.toString() ?: "?"
+                logT("CR:$m:$first", p.args.take(3).joinToString(" | ") { brief(it) }, discrete = true)
+            })
+        }
+    }
+
+    private fun brief(a: Any?): String = try {
+        when (a) {
+            null -> "null"
+            is View -> a.javaClass.simpleName
+            is Bundle -> "Bundle{" + a.keySet().joinToString(",") { k -> k + "=" + a.get(k) } + "}"
+            else -> a.toString().take(160)
+        }
+    } catch (t: Throwable) { "?" }
+
+    // ---- kirim perintah uji ke wallpaper: "aksi,x,y,z,kunci=nilai,..." ----
+
+    private fun maybeSendCustom() {
+        val s = Config.wpSend
+        if (s == lastCustomSend) return
+        lastCustomSend = s
+        if (s.isEmpty()) return
+        val wm = wpManager
+        val tk = wpToken
+        if (wm == null || tk == null) { log("wpsend: belum ada manager/token (tunggu layar menyala)"); return }
+        val parts = s.split(",")
+        if (parts.size < 4) { log("wpsend: format salah: $s"); return }
+        val b = Bundle()
+        for (kv in parts.drop(4)) {
+            val i = kv.indexOf('=')
+            if (i <= 0) continue
+            val k = kv.substring(0, i)
+            val v = kv.substring(i + 1)
+            when {
+                v == "true" || v == "false" -> b.putBoolean(k, v == "true")
+                v.toIntOrNull() != null -> b.putInt(k, v.toInt())
+                v.toFloatOrNull() != null -> b.putFloat(k, v.toFloat())
+                else -> b.putString(k, v)
+            }
+        }
+        try {
+            ownCall = true
+            XposedHelpers.callMethod(
+                wm, "sendWallpaperCommand", tk, parts[0],
+                parts[1].toIntOrNull() ?: 0, parts[2].toIntOrNull() ?: 0, parts[3].toIntOrNull() ?: 0, b
+            )
+            log("wpsend terkirim: $s")
+        } catch (t: Throwable) {
+            log("wpsend gagal: $t")
+        } finally {
+            ownCall = false
+        }
+    }
+
+    // ---- gear jam (opsional) ----
 
     private fun enumByName(name: String): Any? {
         val ec = gearClass ?: return null
@@ -233,82 +299,6 @@ class MainHook : IXposedHookLoadPackage {
             ownGear = false
         }
     }
-
-    // ---- pelacakan opsional ----
-
-    private fun startDiscovery(cl: ClassLoader) {
-        Thread {
-            try {
-                val names = ArrayList<String>()
-                val pathList = XposedHelpers.getObjectField(cl, "pathList")
-                val elements = XposedHelpers.getObjectField(pathList, "dexElements") as Array<*>
-                for (e in elements) {
-                    if (e == null) continue
-                    val df = XposedHelpers.getObjectField(e, "dexFile") ?: continue
-                    val en = XposedHelpers.callMethod(df, "entries") as java.util.Enumeration<*>
-                    while (en.hasMoreElements()) {
-                        val name = en.nextElement() as String
-                        if (names.size >= 14) break
-                        val simple = name.substringAfterLast('.')
-                        if (simple.contains('$')) continue
-                        if (discoverRegex.containsMatchIn(simple)) names.add(name)
-                    }
-                }
-                log("discovered: " + names.joinToString(" | "))
-                for (n in names) trace(cl, n)
-            } catch (t: Throwable) {
-                log("discovery gagal: $t")
-            }
-        }.start()
-    }
-
-    private fun trace(cl: ClassLoader, cls: String) {
-        try {
-            val c = XposedHelpers.findClassIfExists(cls, cl) ?: return
-            val short = c.simpleName
-            var n = 0
-            for (m in c.declaredMethods) {
-                val name = m.name
-                if (n >= 70) break
-                if (Modifier.isAbstract(m.modifiers) || Modifier.isNative(m.modifiers)) continue
-                if (name.startsWith("access$") || name.contains('$')) continue
-                if (name.startsWith("get") || name.startsWith("is") || name.startsWith("has")) continue
-                if (name == "toString" || name == "hashCode" || name == "equals") continue
-                XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(p: MethodHookParam) {
-                        try {
-                            val key = "TR:$short.$name"
-                            if (!allow(key)) return
-                            log("$key(" + p.args.joinToString { brief(it) } + ")")
-                        } catch (t: Throwable) { }
-                    }
-                })
-                n++
-            }
-            log("trace $short: $n method(s) hooked")
-        } catch (t: Throwable) {
-            log("trace gagal $cls: $t")
-        }
-    }
-
-    private fun allow(key: String): Boolean {
-        if (traceCount.get() > 2500) return false
-        val now = System.currentTimeMillis()
-        val last = lastLog[key] ?: 0L
-        if (now - last < 250) return false
-        lastLog[key] = now
-        traceCount.incrementAndGet()
-        return true
-    }
-
-    private fun brief(a: Any?): String = try {
-        when (a) {
-            null -> "null"
-            is View -> a.javaClass.simpleName
-            is Bundle -> "Bundle{" + a.keySet().joinToString(",") { k -> k + "=" + a.get(k) } + "}"
-            else -> a.toString().take(160)
-        }
-    } catch (t: Throwable) { "?" }
 
     // ---- perintah ke wallpaper ----
 
@@ -356,20 +346,11 @@ class MainHook : IXposedHookLoadPackage {
     private fun refreshTargets(root: View) {
         val top = root.rootView
         val known = attachedClocks.mapNotNull { it.get() }.filter { it.isAttachedToWindow && it.width > 0 }
-        var list: List<View> = if (known.isNotEmpty()) known else {
+        activeClocks = if (known.isNotEmpty()) known else {
             val found = ArrayList<View>()
             findViews(top, 0, found) { isRealClock(it) && it.width > 0 }
             found
         }
-        val extra = Config.clockId
-        if (extra.isNotEmpty()) {
-            val found = ArrayList<View>()
-            findViews(top, 0, found) { idName(it) == extra }
-            val current = list
-            list = current + found.filter { it !in current }
-        }
-        activeClocks = list
-
         val sv = stackRef?.get()
         if (sv == null || !sv.isAttachedToWindow) {
             val found = ArrayList<View>()
@@ -379,86 +360,48 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun dumpAll(v: View, depth: Int, maxDepth: Int, sb: StringBuilder, count: IntArray) {
-        if (depth > maxDepth || count[0] > 90) return
-        sb.append("\n").append("  ".repeat(depth)).append(v.javaClass.simpleName)
-            .append(" id=").append(idName(v)).append(" shown=").append(v.isShown)
-            .append(" ").append(v.width).append("x").append(v.height)
-        count[0]++
-        if (v is ViewGroup) {
-            for (i in 0 until v.childCount) dumpAll(v.getChildAt(i), depth + 1, maxDepth, sb, count)
-        }
+    // ---- konversi progres <-> jarak (tahap 1 dan tahap 2 punya panjang berbeda) ----
+
+    private fun maxProgress(): Float = if (Config.stage2) 2f else 1f
+
+    private fun progressToDist(p: Float): Float {
+        val l1 = Config.rangeDp
+        val l2 = Config.stage2Dp
+        return if (p <= 1f) p * l1 else l1 + (p - 1f) * l2
     }
 
-    private fun scanBig(v: View, depth: Int, sb: StringBuilder, count: IntArray) {
-        if (depth > 18 || count[0] > 30) return
-        val isBig = v.isShown && v.width >= 300 && v.height >= 120 &&
-            !(v.width >= 1000 && v.height >= 2000)
-        if (isBig) {
-            sb.append("\n  ").append(v.javaClass.name.substringAfterLast('.'))
-            sb.append(" id=").append(idName(v))
-            sb.append(" ").append(v.width).append("x").append(v.height)
-            if (v is TextView) {
-                sb.append(" text='").append(v.text?.toString()?.take(12)).append("'")
-            }
-            sb.append(" <").append(parentNames(v))
-            count[0]++
-        }
-        if (v is ViewGroup) {
-            for (i in 0 until v.childCount) scanBig(v.getChildAt(i), depth + 1, sb, count)
-        }
-    }
-
-    private fun parentNames(v: View): String {
-        val out = StringBuilder()
-        var par: ViewParent? = v.parent
-        var n = 0
-        while (par != null && n < 3) {
-            val pv = par as? View ?: break
-            out.append(" ").append(pv.javaClass.simpleName).append("#").append(idName(pv))
-            par = pv.parent
-            n++
-        }
-        return out.toString()
+    private fun distToProgress(d: Float): Float {
+        val l1 = Config.rangeDp
+        val l2 = Config.stage2Dp
+        return if (d <= l1) d / l1 else 1f + (d - l1) / l2
     }
 
     // ---- sentuhan ----
 
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
-        if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
-        val root = p.thisObject as? View ?: return
         val ev = p.args[0] as? MotionEvent ?: return
-        val dm = root.resources.displayMetrics
+        val root = p.thisObject as? View ?: return
         val a = ev.actionMasked
+        if (a == MotionEvent.ACTION_DOWN) maybeSendCustom()
+
+        if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
+        val dm = root.resources.displayMetrics
 
         if (a == MotionEvent.ACTION_DOWN) {
             animator?.cancel()
             taken = false
             downX = ev.rawX
             downY = ev.rawY
-            val token = Config.dumpToken
-            if (token != lastDumpToken) {
-                lastDumpToken = token
-                resetDumps()
-            }
             val locked = isLocked(root.context)
             if (locked) {
                 refreshTargets(root)
-                once("tree2") {
-                    val sb = StringBuilder("tree2:")
-                    dumpAll(root.rootView, 0, 5, sb, intArrayOf(0))
-                    log(sb.toString())
-                }
-                val big = StringBuilder("visibleBig:")
-                scanBig(root.rootView, 0, big, intArrayOf(0))
-                logT("visibleBig", big.toString(), discrete = true)
             } else if (applied) {
                 progress = 0f
                 applyState()
             }
             logT(
                 "touchSeen",
-                "locked=$locked state=$barState clocks=${activeClocks.size} stack=${stackRef?.get() != null} wp=${wpManager != null} gear=${interactorRef?.get() != null}",
+                "locked=$locked state=$barState stack=${stackRef?.get() != null} wp=${wpManager != null}",
                 discrete = true
             )
             tracking = locked && onKeyguardState() &&
@@ -471,7 +414,7 @@ class MainHook : IXposedHookLoadPackage {
             val dy = downY - ev.rawY
             val dx = ev.rawX - downX
             val slop = ViewConfiguration.get(root.context).scaledTouchSlop
-            val up = dy > slop
+            val up = dy > slop && progress < maxProgress()
             val down = progress > 0f && -dy > slop
             if ((up || down) && abs(dy) > abs(dx) * 1.2f) {
                 try {
@@ -490,13 +433,21 @@ class MainHook : IXposedHookLoadPackage {
         if (taken) {
             when (a) {
                 MotionEvent.ACTION_MOVE -> {
-                    progress = (baseProgress + (startY - ev.rawY) / (Config.rangeDp * dm.density)).coerceIn(0f, 1f)
+                    val moved = (startY - ev.rawY) / dm.density
+                    val d = progressToDist(baseProgress) + moved
+                    progress = distToProgress(d.coerceAtLeast(0f)).coerceIn(0f, maxProgress())
                     applyState()
                     logT("progress", "p=$progress")
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     taken = false
-                    snap(if (progress > 0.35f) 1f else 0f)
+                    // lepas di tahap 1: menempel ke posisi diam; di tahap 2: tetap di tempat
+                    val target = when {
+                        progress < 0.35f -> 0f
+                        progress < 1.25f -> 1f
+                        else -> progress
+                    }
+                    if (target != progress) snap(target)
                 }
             }
             p.result = true
@@ -522,41 +473,32 @@ class MainHook : IXposedHookLoadPackage {
             val locked = ctx != null && isLocked(ctx)
             val onKeyguard = locked && onKeyguardState()
             if (!Config.gesture || !onKeyguard) {
-                if (applied) { reset(clocks, sv); applied = false }
+                if (applied) { reset(sv); applied = false }
                 if (!locked) progress = 0f
                 return
             }
             applied = true
             val p = progress
+            val p1 = min(p, 1f)
+            val q = (p - 1f).coerceIn(0f, 1f)
 
-            // jam bawaan System UI (tidak terlihat, tapi dipertahankan sebagai cadangan)
-            for (clock in clocks) {
-                val d = clock.resources.displayMetrics.density
-                val s = 1f - (1f - Config.minScale) * p
-                clock.pivotX = clock.width / 2f
-                clock.pivotY = 0f
-                clock.scaleX = s
-                clock.scaleY = s
-                clock.translationY = -Config.pushDp * d * p
-            }
-
-            // gear jam: LARGE saat diam, SMALL setelah melewati gearAt
+            // gear jam (opsional)
             if (Config.gearSwipe && Config.gear.isEmpty()) {
                 setGear(if (p >= Config.gearAt) "SMALL" else "LARGE")
             }
 
-            // jam wallpaper: skala mengikuti progres
+            // jam wallpaper: mengecil hanya di tahap 2
             if (Config.wpExp) {
-                if (p > 0.001f) {
+                if (q > 0.001f) {
                     sentWp = true
-                    sendWp(Config.wpAlpha, 1f - (1f - Config.wpMin) * p, false)
+                    sendWp(Config.wpAlpha, 1f - (1f - Config.wpMin) * q, false)
                 } else if (sentWp) {
                     sentWp = false
                     sendWp(1f, 1f, true)
                 }
             }
 
-            if (sv != null) applyStack(sv, p)
+            if (sv != null) applyStack(sv, p1, q)
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
@@ -570,10 +512,11 @@ class MainHook : IXposedHookLoadPackage {
         return if (st != null && abs(v.translationZ - st[3]) < 0.01f) st[2] else v.translationZ
     }
 
-    private fun applyStack(sv: View, p: Float) {
+    // p1: 0..1 (tumpukan di bawah -> posisi diam), q: 0..1 (posisi diam -> posisi sistem)
+    private fun applyStack(sv: View, p1: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
-        sv.alpha = (p * 2.5f).coerceAtMost(1f)
+        sv.alpha = (p1 * 2.5f).coerceAtMost(1f)
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         val loc = IntArray(2)
@@ -590,19 +533,27 @@ class MainHook : IXposedHookLoadPackage {
         val n = cards.size
         if (n == 0) return
 
+        // posisi diam (garis merah): bagian atas stack di restFrac * tinggi layar
+        val naturalTop = loc[1] + cards[0].second
+        val redTop = if (Config.restFrac > 0f) dm.heightPixels * Config.restFrac else 0f
+        val restDelta = if (redTop > naturalTop) redTop - naturalTop else 0f
+        val shift = restDelta * (1f - q)
+
         val pileCenter = dm.heightPixels * Config.pileFrac
         for (i in 0 until n) {
             val card = cards[i].first
             val baseY = cards[i].second
             val baseZ = baseOfZ(card)
             val h = card.height.toFloat()
-            val naturalCenter = loc[1] + baseY + h / 2f
+
+            val base2 = baseY + shift
+            val naturalCenter = loc[1] + base2 + h / 2f
             val targetCenter = pileCenter + i * Config.peekDp * d
-            val wy = baseY + (1f - p) * (targetCenter - naturalCenter)
+            val wy = base2 + (1f - p1) * (targetCenter - naturalCenter)
 
             val collapsed = (Config.pileScale - 0.05f * i).coerceAtLeast(0.55f)
-            val s = 1f - (1f - p) * (1f - collapsed)
-            val wz = baseZ + (1f - p) * (n - i) * 3f * d
+            val s = 1f - (1f - p1) * (1f - collapsed)
+            val wz = baseZ + (1f - p1) * (n - i) * 3f * d
 
             card.pivotX = card.width / 2f
             card.pivotY = h / 2f
@@ -614,12 +565,7 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun reset(clocks: List<View>, sv: View?) {
-        for (c in clocks) {
-            c.scaleX = 1f
-            c.scaleY = 1f
-            c.translationY = 0f
-        }
+    private fun reset(sv: View?) {
         // kembalikan wallpaper ke keadaan normal
         if (sentWp) {
             sentWp = false
@@ -642,10 +588,6 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
     }
-
-    private fun describeView(v: View): String =
-        "${v.javaClass.name} id=${idName(v)} size=${v.width}x${v.height} y=${v.y} " +
-            "scale=${v.scaleX}/${v.scaleY} transY=${v.translationY} alpha=${v.alpha} vis=${v.visibility} shown=${v.isShown}"
 
     private fun idName(v: View): String = try {
         if (v.id == View.NO_ID) "none" else v.resources.getResourceEntryName(v.id)
@@ -672,6 +614,11 @@ class MainHook : IXposedHookLoadPackage {
             log("hook fail $cls.$method: $t")
         }
     }
+
+    private fun callerFull(): String =
+        Throwable().stackTrace.drop(3)
+            .filter { it.className.contains("systemui") || it.className.contains("transsion") }
+            .take(10).joinToString(" < ") { "${it.className}.${it.methodName}" }
 
     private fun once(key: String, block: () -> Unit) { if (dumped.add(key)) block() }
 
