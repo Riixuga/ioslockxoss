@@ -63,12 +63,13 @@ object Config {
     // posisi bagian atas kartu teratas (0..1 tinggi layar): keadaan 2 (bawah jam tinggi) dan keadaan 3 (bawah jam biasa)
     val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0.575f
     val smallFrac: Float get() = prop("debug.ioslock.smallfrac").toFloatOrNull() ?: 0.345f
-    // batas bawah daftar kartu (di atas fingerprint dan teks bawah)
+    // batas bawah daftar kartu keadaan 3 (di atas fingerprint dan teks bawah)
     val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.83f
-    // keadaan 2: ketebalan pita kartu yang menumpuk di bawah
-    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 48f
-    // pita tidak boleh lebih tebal dari sekian kali tinggi kartu (supaya tetap menumpuk di belakang kartu depan)
-    val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.62f
+    // keadaan 2: posisi tepi bawah pita tumpukan TERAKHIR (0..1 tinggi layar) = garis merah.
+    // Ketebalan pita dihitung otomatis supaya dasar tumpukan tepat di sini.
+    val bottom2Frac: Float get() = prop("debug.ioslock.bottom2").toFloatOrNull() ?: 0.807f
+    // pita tidak boleh lebih tebal dari sekian kali tinggi kartu (supaya tetap menumpuk di belakang kartu depan, tanpa celah)
+    val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.95f
     // ketebalan minimal sebuah kartu yang menumpuk (dp)
     val minPeekDp: Float get() = prop("debug.ioslock.minpeekdp").toFloatOrNull() ?: 12f
     // meluncur tambahan saat kartu muncul; 0 = kartu keluar dari dasar tumpukan saja (lihat originFrac)
@@ -83,17 +84,14 @@ object Config {
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
-    // keadaan 3: tumpukan bertingkat tanpa celah. Kartu paling atas tampil penuh, tiap kartu di bawahnya
-    // tertutup kartu di atasnya dan terlihat makin sedikit, sampai batas bawah (listBottomFrac).
+    // keadaan 3: tumpukan bertingkat tanpa celah dengan jarak SERAGAM antar kartu.
+    // Jarak kartu 1 -> kartu 2 (A ke B) dipakai untuk semua kartu berikutnya.
     // cascadeMax = jumlah kartu yang terlihat (sisanya bersembunyi di belakang yang terakhir)
-    // cascadeCap = bagian maksimum kartu ke-2 yang terlihat saat ruang lega (1 = penuh); tiap kartu berikutnya
-    //   dikali cascadeCapDecay, jadi makin ke bawah makin tertutup walau ruang masih lega
-    // cascadeDecay = saat ruang sempit, tiap kartu menyisakan bagian sekian kali kartu di atasnya
+    // cascadeCap = jarak A ke B sebagai bagian dari tinggi kartu ke-2 (1 = penuh). Kalau tumpukan tidak muat
+    //   sampai batas bawah (listBottomFrac), semua jarak dikecilkan sama rata.
     // scale3Step = pengecilan skala tiap tingkat, overlapDp = tumpang tindih minimal antar kartu (tidak pernah ada celah)
-    val cascadeMax: Int get() = prop("debug.ioslock.cascademax").toIntOrNull() ?: 6
+    val cascadeMax: Int get() = prop("debug.ioslock.cascademax").toIntOrNull() ?: 30
     val cascadeCap: Float get() = prop("debug.ioslock.cascadecap").toFloatOrNull() ?: 0.86f
-    val cascadeCapDecay: Float get() = prop("debug.ioslock.cascadecapdecay").toFloatOrNull() ?: 0.92f
-    val cascadeDecay: Float get() = prop("debug.ioslock.cascadedecay").toFloatOrNull() ?: 0.75f
     val scale3Step: Float get() = prop("debug.ioslock.scale3step").toFloatOrNull() ?: 0.03f
     val overlapDp: Float get() = prop("debug.ioslock.overlapdp").toFloatOrNull() ?: 8f
     // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
@@ -170,7 +168,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.20 loaded into SystemUI")
+        log("v0.21 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -597,10 +595,11 @@ class MainHook : IXposedHookLoadPackage {
     // Dihitung dari posisi asli kartu di stack bawaan (baseYs, urut dari atas).
     // top: posisi atas kartu teratas. gap: jarak tambahan antar kartu penuh.
     // maxFull: jumlah kartu penuh paling banyak. maxBands: jumlah pita tumpukan yang terlihat.
-    // peekMax: ketebalan pita pertama; dikecilkan otomatis kalau ruang sampai batas bawah tidak cukup.
+    // limit: posisi tepi bawah pita TERAKHIR (garis merah). Ketebalan pita dihitung supaya dasar
+    // tumpukan tepat di limit (dibatasi maxFrac * tinggi kartu supaya tidak ada celah).
     private fun layoutState(
         baseYs: FloatArray, hs: FloatArray, top: Float, gap: Float,
-        maxFull: Int, maxBands: Int, limit: Float, peekMax: Float, minPeek: Float, maxFrac: Float,
+        maxFull: Int, maxBands: Int, limit: Float, minPeek: Float, maxFrac: Float,
         decay: Float, scaleStep: Float
     ): StateLayout {
         val n = baseYs.size
@@ -619,14 +618,14 @@ class MainHook : IXposedHookLoadPackage {
         val lastIdx = k - 1
         val lastBottom = spread(lastIdx)
 
-        // ketebalan pita: selebar mungkin sampai batas bawah, tapi tidak lebih dari peekMax
+        // ketebalan pita: dihitung supaya pita terakhir berakhir tepat di limit (garis merah)
         val nb = min(n - k, maxBands)
-        var peek = peekMax
+        var peek = minPeek
         if (nb > 0) {
             var minH = Float.MAX_VALUE
             for (i in k until n) minH = min(minH, hs[i])
             val room = (limit - lastBottom) / bandOffset(nb, 1f, decay)
-            peek = min(min(peekMax, maxFrac * minH), room.coerceAtLeast(minPeek))
+            peek = min(maxFrac * minH, room).coerceAtLeast(minPeek)
         }
 
         for (i in 0 until n) {
@@ -645,15 +644,15 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
-    // Tata letak keadaan 3: tumpukan bertingkat tanpa celah (A sampai D dst).
-    // Kartu 0 tampil penuh. Tiap kartu di bawahnya berada di belakang kartu di atasnya, jadi yang terlihat
-    // hanya bagian bawahnya setebal t(i): makin ke bawah makin sedikit yang terlihat dan skalanya makin kecil.
-    // t(i) = clamp(lam * decay^(i-1) * tinggi, tipis, maks). lam dicari supaya tepi bawah kartu terakhir tepat
-    // di batas bawah (limit) bila notifikasinya banyak. Bila sedikit, t(i) berhenti di batas maks (hampir penuh,
-    // tetap ada tumpang tindih minimal) sehingga isi kartu terlihat dan tumpukan berakhir di atas limit.
+    // Tata letak keadaan 3: tumpukan bertingkat tanpa celah dengan jarak SERAGAM.
+    // Kartu 0 tampil penuh. Tiap kartu di bawahnya berada di belakang kartu di atasnya, dan jarak tepi bawah
+    // antar kartu sama dengan jarak kartu A -> kartu B (step = tinggi kartu ke-2 * capBase, dengan tumpang
+    // tindih minimal overlapMin). Jadi semua kartu tersusun rapi dengan jarak yang sama, skalanya mengecil
+    // sedikit tiap tingkat. Kalau tumpukan tidak muat sampai limit, semua jarak dikecilkan sama rata
+    // (lam < 1); kalau masih tidak muat, jumlah kartu yang terlihat dikurangi.
     private fun layoutCascade(
         hs: FloatArray, top: Float, limit: Float, minPeek: Float, overlapMin: Float,
-        maxVisible: Int, capBase: Float, capDecay: Float, decay: Float, scaleStep: Float
+        maxVisible: Int, capBase: Float, scaleStep: Float
     ): StateLayout {
         val n = hs.size
         val out = StateLayout(n)
@@ -663,12 +662,13 @@ class MainHook : IXposedHookLoadPackage {
         out.kind[0] = 0
         if (n == 1) return out
 
-        // tebal terlihat kartu i: paling tipis (pita) dan paling tebal (hampir penuh)
+        // tebal terlihat paling tipis (pita)
         fun lo(i: Int): Float = min(minPeek, hs[i] * sc(i))
-        fun hi(i: Int): Float {
-            val full = hs[i] * sc(i)
-            return max(min(full * capBase * powf(capDecay, i - 1), full - overlapMin), lo(i))
-        }
+
+        // jarak A -> B: dipakai untuk semua kartu
+        val step = max(min(hs[1] * sc(1) * capBase, hs[1] * sc(1) - overlapMin), lo(1))
+        // batas atas jarak kartu i (tidak boleh melebihi tinggi kartu itu sendiri, supaya tidak ada celah)
+        fun hi(i: Int): Float = max(min(step, hs[i] * sc(i) - overlapMin), lo(i))
 
         val room = limit - out.bottom[0]
 
@@ -681,18 +681,18 @@ class MainHook : IXposedHookLoadPackage {
             m--
         }
 
-        fun t(i: Int, lam: Float): Float = (lam * powf(decay, i - 1) * hs[i] * sc(i)).coerceIn(lo(i), hi(i))
+        fun t(i: Int, lam: Float): Float = (lam * step).coerceIn(lo(i), hi(i))
         fun total(lam: Float): Float {
             var s = 0f
             for (i in 1 until m) s += t(i, lam)
             return s
         }
 
-        // lam cukup besar membuat semua kartu mencapai batas maksimum; kalau tidak muat, cari lam dengan bisection
-        var lam = 1f / powf(decay, m)
-        if (total(lam) > room) {
+        // lam = 1: jarak penuh seperti A -> B. Kalau tidak muat, kecilkan semua jarak sama rata (bisection)
+        var lam = 1f
+        if (total(1f) > room) {
             var l = 0f
-            var h = lam
+            var h = 1f
             for (iter in 0 until 28) {
                 val mid = (l + h) / 2f
                 if (total(mid) > room) h = mid else l = mid
@@ -789,10 +789,10 @@ class MainHook : IXposedHookLoadPackage {
 
     // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari dasar tumpukan (kartu depan dulu)
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya.
-    // Keadaan 3 (q=1): tumpukan bertingkat tanpa celah; kartu atas penuh, makin ke bawah makin tertutup
-    // dan mengecil, berakhir di batas bawah (listBottomFrac). Notifikasi sedikit = isi kartu terlihat.
-    // Semakin ke atas di-swipe, jarak antar kartu semakin renggang; semakin ke bawah, semakin menumpuk.
+    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya; dasar pita terakhir
+    // tepat di bottom2Frac (garis merah).
+    // Keadaan 3 (q=1): semua kartu tersusun dengan jarak seragam seperti kartu A ke B; kartu atas penuh,
+    // tiap kartu di bawahnya mengecil sedikit, berakhir paling jauh di batas bawah (listBottomFrac).
     // Kartu yang menumpuk adalah kartu asli (tanpa clip, tanpa disembunyikan): digeser ke belakang
     // kartu di atasnya dan diperkecil, sehingga hanya bagian bawahnya yang menyembul.
     // Tata letak dua keadaan dihitung terpisah, lalu composeStack menggabungkannya dengan a dan q.
@@ -827,6 +827,7 @@ class MainHook : IXposedHookLoadPackage {
         if (n == 0) return
 
         val limit = dm.heightPixels * Config.listBottomFrac
+        val bottom2 = dm.heightPixels * Config.bottom2Frac
         val minPeek = Config.minPeekDp * d
         val slide = (1f - a) * Config.slideDp * d
 
@@ -834,11 +835,10 @@ class MainHook : IXposedHookLoadPackage {
         val hs = FloatArray(n) { visH(cards[it].first) }
         val decay = Config.bandDecay.coerceIn(0.3f, 1f)
         val step = Config.scaleStep.coerceIn(0f, 0.12f)
-        val la = layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, limit,
-            Config.peekDp * d, minPeek, Config.peekMaxFrac, decay, step)
+        val la = layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
+            minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
         val lb = layoutCascade(hs, smallTop, limit, minPeek, Config.overlapDp * d, Config.cascadeMax,
-            Config.cascadeCap.coerceIn(0.2f, 1f), Config.cascadeCapDecay.coerceIn(0.5f, 1f),
-            Config.cascadeDecay.coerceIn(0.3f, 1f), Config.scale3Step.coerceIn(0f, 0.08f))
+            Config.cascadeCap.coerceIn(0.2f, 1f), Config.scale3Step.coerceIn(0f, 0.08f))
 
         // titik asal animasi buka: dasar tumpukan (tepi bawah kartu terakhir di keadaan 2),
         // minimal originFrac supaya tetap di dekat teks "N Notifications" walau kartunya sedikit
@@ -1024,4 +1024,3 @@ class MainHook : IXposedHookLoadPackage {
         android.util.Log.i("IOSLock", msg)
     }
 }
-
