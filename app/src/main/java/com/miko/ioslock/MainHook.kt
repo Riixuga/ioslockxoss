@@ -24,6 +24,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
+import android.view.animation.DecelerateInterpolator
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -34,6 +35,7 @@ import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
 
@@ -78,8 +80,15 @@ object Config {
     // keadaan 3: jumlah pita tumpukan yang terlihat (sedikit saja), jumlah kartu minimal yang
     // selalu masuk tumpukan (0 = tumpukan hanya muncul kalau tidak muat), dan jarak tambahan antar kartu
     val bands3: Int get() = prop("debug.ioslock.bands3").toIntOrNull() ?: 2
-    val stack3Min: Int get() = prop("debug.ioslock.stack3min").toIntOrNull() ?: 1
+    val stack3Min: Int get() = prop("debug.ioslock.stack3min").toIntOrNull() ?: 0
     val gapDp: Float get() = prop("debug.ioslock.gapdp").toFloatOrNull() ?: 10f
+    // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
+    // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
+    val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
+    // tiap pita tumpukan lebih tipis dari pita di depannya (1 = sama tebal),
+    // dan pengecilan skala tiap pita (0.05 = 5% per pita)
+    val bandDecay: Float get() = prop("debug.ioslock.banddecay").toFloatOrNull() ?: 0.8f
+    val scaleStep: Float get() = prop("debug.ioslock.scalestep").toFloatOrNull() ?: 0.05f
     // posisi teks "N Notifications", dan apakah tetap tampil saat kartu muncul
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.845f
     val countAlways: Boolean get() = prop("debug.ioslock.countalways") == "1"
@@ -147,7 +156,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.18 loaded into SystemUI")
+        log("v0.19 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -486,7 +495,9 @@ class MainHook : IXposedHookLoadPackage {
     private fun snap(target: Float) {
         animator?.cancel()
         val an = ValueAnimator.ofFloat(progress, target)
-        an.duration = 280
+        // jarak dekat = singkat; melambat di akhir supaya kartu "mendarat" halus
+        an.duration = (180f + 200f * abs(target - progress)).toLong()
+        an.interpolator = DecelerateInterpolator(1.6f)
         an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
         animator = an
         an.start()
@@ -547,59 +558,119 @@ class MainHook : IXposedHookLoadPackage {
         clipOrig.clear()
     }
 
-    // Hitung tata letak satu keadaan. Hasil per kartu: [pusatY, skala, jenis, tebalPita]
-    // jenis: 0 = kartu penuh, 1 = pita tumpukan, 2 = tersembunyi di belakang pita terakhir.
-    // gap: jarak tambahan antar kartu penuh. maxFull: jumlah kartu penuh paling banyak.
-    // maxBands: jumlah pita tumpukan yang terlihat.
-    // peekMax: ketebalan pita; dikecilkan otomatis kalau ruang sampai batas bawah tidak cukup.
-    private fun layoutCards(
-        cards: List<Pair<View, Float>>, hs: FloatArray, targetTop: Float, gap: Float,
-        maxFull: Int, maxBands: Int, limit: Float, peekMax: Float, minPeek: Float, maxFrac: Float
-    ): Array<FloatArray> {
-        val n = cards.size
-        val base0 = cards[0].second
+    // ---- tata letak tumpukan ----
+
+    // Hasil tata letak satu keadaan (keadaan 2 atau keadaan 3), per kartu:
+    // bottom = tepi bawah kartu setelah diskala, scale = skala kartu,
+    // kind: 0 = kartu penuh, 1 = pita tumpukan, 2 = tersembunyi di belakang pita terakhir.
+    private class StateLayout(n: Int) {
+        val bottom = FloatArray(n)
+        val scale = FloatArray(n)
+        val kind = IntArray(n)
+    }
+
+    private fun smooth(t: Float): Float {
+        val x = t.coerceIn(0f, 1f)
+        return x * x * (3f - 2f * x)
+    }
+
+    // Jarak kumulatif pita ke-m di bawah kartu penuh terakhir. Tiap pita lebih tipis dari pita
+    // di depannya (peek * decay^(m-1)), supaya tumpukan terlihat berkedalaman dan proporsional.
+    private fun bandOffset(m: Int, peek: Float, decay: Float): Float {
+        if (m <= 0) return 0f
+        if (decay >= 0.999f) return m * peek
+        return peek * (1f - Math.pow(decay.toDouble(), m.toDouble()).toFloat()) / (1f - decay)
+    }
+
+    // Hitung tata letak satu keadaan dari posisi asli kartu di stack bawaan (baseYs, urut dari atas).
+    // top: posisi atas kartu teratas. gap: jarak tambahan antar kartu penuh.
+    // maxFull: jumlah kartu penuh paling banyak. maxBands: jumlah pita tumpukan yang terlihat.
+    // peekMax: ketebalan pita pertama; dikecilkan otomatis kalau ruang sampai batas bawah tidak cukup.
+    private fun layoutState(
+        baseYs: FloatArray, hs: FloatArray, top: Float, gap: Float,
+        maxFull: Int, maxBands: Int, limit: Float, peekMax: Float, minPeek: Float, maxFrac: Float,
+        decay: Float, scaleStep: Float
+    ): StateLayout {
+        val n = baseYs.size
+        val out = StateLayout(n)
+
+        // tepi bawah kartu ke-i kalau dibentangkan (jarak asli antar kartu + gap tambahan)
+        fun spread(i: Int): Float = top + (baseYs[i] - baseYs[0]) + i * gap + hs[i]
 
         // berapa kartu yang tampil penuh (minimal satu); pita dihitung dengan ketebalan minimal
         var k = 0
         for (i in 0 until min(maxFull.coerceAtLeast(1), n)) {
-            val rel = cards[i].second - base0 + i * gap
-            val h = hs[i]
             val bands = min(n - 1 - i, maxBands)
-            val need = targetTop + rel + h + bands * minPeek
-            if (need <= limit) k = i + 1 else break
+            if (spread(i) + bandOffset(bands, minPeek, decay) <= limit) k = i + 1 else break
         }
         if (k < 1) k = 1
         val lastIdx = k - 1
-        val lastBottom = targetTop + (cards[lastIdx].second - base0) + lastIdx * gap +
-            hs[lastIdx]
+        val lastBottom = spread(lastIdx)
 
         // ketebalan pita: selebar mungkin sampai batas bawah, tapi tidak lebih dari peekMax
         val nb = min(n - k, maxBands)
-        var minH = Float.MAX_VALUE
-        for (i in k until n) minH = min(minH, hs[i])
-        val capPeek = if (nb > 0) maxFrac * minH else peekMax
-        val peek = if (nb > 0) min(min(peekMax, capPeek), ((limit - lastBottom) / nb).coerceAtLeast(minPeek)) else peekMax
+        var peek = peekMax
+        if (nb > 0) {
+            var minH = Float.MAX_VALUE
+            for (i in k until n) minH = min(minH, hs[i])
+            val room = (limit - lastBottom) / bandOffset(nb, 1f, decay)
+            peek = min(min(peekMax, maxFrac * minH), room.coerceAtLeast(minPeek))
+        }
 
-        val out = Array(n) { FloatArray(4) }
         for (i in 0 until n) {
-            val h = hs[i]
             if (i < k) {
-                out[i][0] = targetTop + (cards[i].second - base0) + i * gap + h / 2f
-                out[i][1] = 1f
-                out[i][2] = 0f
-                out[i][3] = 0f
+                out.bottom[i] = spread(i)
+                out.scale[i] = 1f
+                out.kind[i] = 0
             } else {
                 val j = i - lastIdx
                 val jj = min(j, maxBands)
-                val s = 1f - 0.05f * jj
-                val bottom = lastBottom + jj * peek
-                out[i][0] = bottom - h * s / 2f
-                out[i][1] = s
-                out[i][2] = if (j > maxBands) 2f else 1f
-                out[i][3] = peek
+                out.bottom[i] = lastBottom + bandOffset(jj, peek, decay)
+                out.scale[i] = 1f - scaleStep * jj
+                out.kind[i] = if (j > maxBands) 2 else 1
             }
         }
         return out
+    }
+
+    // Seberapa jauh kartu ke-i (1..n-1) sudah keluar dari tumpukan pada kemajuan q:
+    // 0 = masih menumpuk, 1 = sudah renggang penuh. Dengan stagger > 0 kartu depan keluar lebih dulu
+    // dan kartu di belakangnya menyusul; semuanya tepat selesai saat q = 1.
+    private fun spreadProgress(i: Int, n: Int, q: Float, stagger: Float): Float {
+        val lag = stagger.coerceIn(0f, 0.8f)
+        val m = n - 1
+        val start = if (m > 1) lag * (i - 1) / (m - 1) else 0f
+        val t = ((q - start) / (1f - lag)).coerceIn(0f, 1f)
+        // campuran linear (mengikuti jari, proporsional) dan smoothstep (awal/akhir lembut)
+        return t + (t * t * (3f - 2f * t) - t) * 0.5f
+    }
+
+    // Gabungkan keadaan 2 (la) dan keadaan 3 (lb) jadi posisi tiap kartu pada kemajuan (a, q).
+    // Jarak tiap kartu ke kartu di depannya bergerak dari tebal pita (menumpuk) ke jarak penuh (renggang),
+    // jadi kartu selalu berurutan, tidak pernah saling menyeberang, dan tidak melewati batas bawah.
+    // Kartu pertama mengikuti jari secara linear; tepi bawah tiap kartu dibatasi oleh posisi terjauh
+    // kedua keadaan, jadi tidak ada kartu yang melampaui tempat akhirnya lalu mundur.
+    private fun composeStack(
+        la: StateLayout, lb: StateLayout, a: Float, q: Float, stagger: Float,
+        outBottom: FloatArray, outScale: FloatArray
+    ) {
+        val n = outBottom.size
+        // saat kartu baru muncul (a < 1) pita keluar dari belakang kartu depan
+        val fan = smooth(a)
+        var prev = la.bottom[0] + (lb.bottom[0] - la.bottom[0]) * q
+        outBottom[0] = prev
+        outScale[0] = 1f
+        for (i in 1 until n) {
+            val e = spreadProgress(i, n, q, stagger)
+            val f = if (la.kind[i] != 0) fan else 1f
+            val dA = (la.bottom[i] - la.bottom[i - 1]) * f
+            val dB = lb.bottom[i] - lb.bottom[i - 1]
+            val cap = max(la.bottom[i], lb.bottom[i])
+            prev = min(prev + dA + (dB - dA) * e, cap)
+            outBottom[i] = prev
+            val sA = 1f - (1f - la.scale[i]) * f
+            outScale[i] = sA + (lb.scale[i] - sA) * e
+        }
     }
 
     // Terapkan ulang efek tiap frame (sebelum digambar), supaya posisi
@@ -620,10 +691,12 @@ class MainHook : IXposedHookLoadPackage {
     // a: 0..1 kartu muncul (meluncur naik sambil memudar masuk)
     // q: 0..1 jam mengecil dan daftar naik
     // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya.
-    // Keadaan 3 (q=1): kartu direnggangkan, hanya sedikit yang menumpuk, pita lebih tebal supaya terbaca.
+    // Keadaan 3 (q=1): kartu direnggangkan memakai ruang yang tersedia; hanya kartu yang tidak muat
+    // menumpuk di bawah (pita lebih tebal supaya terbaca).
+    // Semakin ke atas di-swipe, jarak antar kartu semakin renggang; semakin ke bawah, semakin menumpuk.
     // Kartu yang menumpuk adalah kartu asli (tanpa clip, tanpa disembunyikan): digeser ke belakang
     // kartu depan dan diperkecil, sehingga hanya bagian bawahnya yang menyembul.
-    // Tata letak dua keadaan dihitung terpisah lalu diinterpolasi dengan q.
+    // Tata letak dua keadaan dihitung terpisah, lalu composeStack menggabungkannya dengan q.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -658,11 +731,18 @@ class MainHook : IXposedHookLoadPackage {
         val minPeek = Config.minPeekDp * d
         val slide = (1f - a) * Config.slideDp * d
 
+        val baseYs = FloatArray(n) { cards[it].second }
         val hs = FloatArray(n) { visH(cards[it].first) }
-        val la = layoutCards(cards, hs, restTop, 0f, Config.full2, Config.bands2, limit,
-            Config.peekDp * d, minPeek, Config.peekMaxFrac)
-        val lb = layoutCards(cards, hs, smallTop, Config.gapDp * d, (n - Config.stack3Min).coerceAtLeast(1),
-            Config.bands3, limit, Config.peek3Dp * d, minPeek, Config.peekMaxFrac)
+        val decay = Config.bandDecay.coerceIn(0.3f, 1f)
+        val step = Config.scaleStep.coerceIn(0f, 0.12f)
+        val la = layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, limit,
+            Config.peekDp * d, minPeek, Config.peekMaxFrac, decay, step)
+        val lb = layoutState(baseYs, hs, smallTop, Config.gapDp * d, (n - Config.stack3Min).coerceAtLeast(1),
+            Config.bands3, limit, Config.peek3Dp * d, minPeek, Config.peekMaxFrac, decay, step)
+
+        val bottoms = FloatArray(n)
+        val scales = FloatArray(n)
+        composeStack(la, lb, a, q, Config.stagger, bottoms, scales)
 
         // info untuk debug: logcat | grep IOSLock
         val sb = StringBuilder("n=$n q=${"%.2f".format(q)}")
@@ -674,10 +754,10 @@ class MainHook : IXposedHookLoadPackage {
             val h = hs[i]
             val naturalCenter = loc[1] + baseY + h / 2f
 
-            val kind = if (q < 0.5f) la[i][2] else lb[i][2]
-            val center = la[i][0] + (lb[i][0] - la[i][0]) * q
-            val s = la[i][1] + (lb[i][1] - la[i][1]) * q
-            sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind.toInt())
+            val kind = if (q < 0.5f) la.kind[i] else lb.kind[i]
+            val s = scales[i]
+            val center = bottoms[i] - h * s / 2f
+            sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind)
                 .append(" h=").append(card.height).append("/").append(h.toInt()).append("]")
 
             val wy = baseY + (center + slide - naturalCenter)
