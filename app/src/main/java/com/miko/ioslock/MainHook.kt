@@ -57,11 +57,21 @@ object Config {
     // batas bawah daftar kartu (di atas fingerprint dan teks bawah)
     val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.83f
     // ketebalan pita kartu yang menumpuk di bawah, dan jarak meluncur saat muncul
-    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 12f
+    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 14f
     val slideDp: Float get() = prop("debug.ioslock.slidedp").toFloatOrNull() ?: 120f
+    // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
+    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
+    // keadaan 3: jumlah pita tumpukan yang terlihat (sedikit saja), jumlah kartu minimal yang
+    // selalu masuk tumpukan (0 = tumpukan hanya muncul kalau tidak muat), dan jarak tambahan antar kartu
+    val bands3: Int get() = prop("debug.ioslock.bands3").toIntOrNull() ?: 1
+    val stack3Min: Int get() = prop("debug.ioslock.stack3min").toIntOrNull() ?: 1
+    val gapDp: Float get() = prop("debug.ioslock.gapdp").toFloatOrNull() ?: 10f
     // posisi teks "N Notifications", dan apakah tetap tampil saat kartu muncul
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.845f
     val countAlways: Boolean get() = prop("debug.ioslock.countalways") == "1"
+    // teks "Notification Center": jarak dari tepi kiri (dp) dan ukuran (sp)
+    val labelLeftDp: Float get() = prop("debug.ioslock.labelleftdp").toFloatOrNull() ?: 28f
+    val labelSp: Float get() = prop("debug.ioslock.labelsp").toFloatOrNull() ?: 15f
 
     // jarak swipe tiap tahap (dp)
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 220f
@@ -87,6 +97,9 @@ class MainHook : IXposedHookLoadPackage {
 
     // posisi asli tiap kartu: [dasarY, tulisY, dasarZ, tulisZ]
     private val rowState = WeakHashMap<View, FloatArray>()
+
+    // pengaturan clip asli view induk stack: [clipChildren, clipToPadding]
+    private val clipOrig = WeakHashMap<ViewGroup, BooleanArray>()
 
     // kontrol setting gear jam wallpaper
     @Volatile private var ownWrite = false
@@ -118,7 +131,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.13 loaded into SystemUI")
+        log("v0.14 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -465,10 +478,80 @@ class MainHook : IXposedHookLoadPackage {
         return if (st != null && abs(v.translationZ - st[3]) < 0.01f) st[2] else v.translationZ
     }
 
+    // Lepas pemotongan (clip) di stack dan view induknya supaya pita tumpukan
+    // yang berada di luar batas stack tidak ikut terpotong. Nilai asli disimpan untuk dipulihkan.
+    private fun freeClip(sv: View) {
+        var v: View? = sv
+        var depth = 0
+        while (v is ViewGroup && depth < 4) {
+            if (!clipOrig.containsKey(v)) clipOrig[v] = booleanArrayOf(v.clipChildren, v.clipToPadding)
+            v.clipChildren = false
+            v.clipToPadding = false
+            v = v.parent as? View
+            depth++
+        }
+    }
+
+    private fun restoreClip() {
+        for ((k, o) in clipOrig.entries.toList()) {
+            k.clipChildren = o[0]
+            k.clipToPadding = o[1]
+        }
+        clipOrig.clear()
+    }
+
+    // Hitung tata letak satu keadaan. Hasil per kartu: [pusatY, skala, potongAtas]
+    // potongAtas: 0 = kartu penuh, h = tersembunyi, di antaranya = pita bawah saja.
+    // gap: jarak tambahan antar kartu penuh. minStack: jumlah kartu minimal yang dipaksa masuk tumpukan.
+    // maxBands: jumlah pita tumpukan yang terlihat; kartu lebih banyak disembunyikan di belakangnya.
+    private fun layoutCards(
+        cards: List<Pair<View, Float>>, targetTop: Float, gap: Float,
+        minStack: Int, maxBands: Int, limit: Float, peek: Float, d: Float
+    ): Array<FloatArray> {
+        val n = cards.size
+        val base0 = cards[0].second
+        val maxFull = (n - minStack).coerceAtLeast(1)
+
+        // berapa kartu yang tampil penuh (minimal satu)
+        var k = 0
+        for (i in 0 until maxFull) {
+            val rel = cards[i].second - base0 + i * gap
+            val h = cards[i].first.height.toFloat()
+            val bands = min(n - 1 - i, maxBands)
+            val need = targetTop + rel + h + bands * peek
+            if (need <= limit) k = i + 1 else break
+        }
+        if (k < 1) k = 1
+        val lastIdx = k - 1
+        val lastBottom = targetTop + (cards[lastIdx].second - base0) + lastIdx * gap +
+            cards[lastIdx].first.height
+
+        val out = Array(n) { FloatArray(3) }
+        for (i in 0 until n) {
+            val h = cards[i].first.height.toFloat()
+            if (i < k) {
+                out[i][0] = targetTop + (cards[i].second - base0) + i * gap + h / 2f
+                out[i][1] = 1f
+                out[i][2] = 0f
+            } else {
+                // menumpuk di belakang kartu penuh terakhir; hanya pita bawah yang terlihat
+                val j = i - lastIdx
+                val jj = min(j, maxBands)
+                val s = 1f - 0.06f * jj
+                val bottom = lastBottom + jj * peek
+                out[i][0] = bottom - h * s / 2f
+                out[i][1] = s
+                out[i][2] = if (j > maxBands) h else (h - (peek / s + 2f * d)).coerceAtLeast(0f)
+            }
+        }
+        return out
+    }
+
     // a: 0..1 kartu muncul (meluncur naik sambil memudar masuk)
     // q: 0..1 jam mengecil dan daftar naik
-    // Kartu teratas selalu di batas bawah jam. Kartu yang tidak muat sebelum batas bawah
-    // menumpuk di belakang kartu penuh terakhir sebagai pita tipis.
+    // Keadaan 2 (q=0): kartu rapat, kartu yang tidak muat menumpuk (sampai 2 pita) di belakang kartu depan.
+    // Keadaan 3 (q=1): kartu direnggangkan, tumpukan hanya sedikit (1 pita).
+    // Tata letak kedua keadaan dihitung terpisah lalu diinterpolasi dengan q.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -477,6 +560,7 @@ class MainHook : IXposedHookLoadPackage {
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
+        freeClip(sv)
         val loc = IntArray(2)
         sv.getLocationOnScreen(loc)
 
@@ -497,23 +581,12 @@ class MainHook : IXposedHookLoadPackage {
         updateLabels(sv, a, targetTop, notifCount(g))
         if (n == 0) return
 
-        val bottomLimit = dm.heightPixels * Config.listBottomFrac
+        val limit = dm.heightPixels * Config.listBottomFrac
         val peek = Config.peekDp * d
         val slide = (1f - a) * Config.slideDp * d
-        val base0 = cards[0].second
 
-        // berapa kartu yang tampil penuh (minimal satu)
-        var k = 0
-        for (i in 0 until n) {
-            val rel = cards[i].second - base0
-            val h = cards[i].first.height.toFloat()
-            val rest = n - 1 - i
-            val need = targetTop + rel + h + min(rest, 2) * peek
-            if (need <= bottomLimit) k = i + 1 else break
-        }
-        if (k < 1) k = 1
-        val lastIdx = k - 1
-        val lastBottom = targetTop + (cards[lastIdx].second - base0) + cards[lastIdx].first.height
+        val la = layoutCards(cards, restTop, 0f, 0, Config.bands2, limit, peek, d)
+        val lb = layoutCards(cards, smallTop, Config.gapDp * d, Config.stack3Min, Config.bands3, limit, peek, d)
 
         for (i in 0 until n) {
             val card = cards[i].first
@@ -522,25 +595,10 @@ class MainHook : IXposedHookLoadPackage {
             val h = card.height.toFloat()
             val naturalCenter = loc[1] + baseY + h / 2f
 
-            val center: Float
-            var s = 1f
-            var clip: Rect? = null
-            if (i < k) {
-                center = targetTop + (baseY - base0) + h / 2f
-            } else {
-                // kartu menumpuk di belakang kartu penuh terakhir; hanya pita bawah yang terlihat
-                val j = i - lastIdx
-                val jj = min(j, 2)
-                s = 1f - 0.06f * jj
-                val bottom = lastBottom + jj * peek
-                center = bottom - h * s / 2f
-                clip = if (j > 2) {
-                    Rect(0, 0, 0, 0)
-                } else {
-                    val band = (peek / s + 2f * d).toInt()
-                    Rect(0, (h.toInt() - band).coerceAtLeast(0), card.width, h.toInt())
-                }
-            }
+            val center = la[i][0] + (lb[i][0] - la[i][0]) * q
+            val s = la[i][1] + (lb[i][1] - la[i][1]) * q
+            val ct = la[i][2] + (lb[i][2] - la[i][2]) * q
+            val clip: Rect? = if (ct < 1f) null else Rect(0, ct.toInt(), card.width, h.toInt())
 
             val wy = baseY + (center + slide - naturalCenter)
             // kartu yang lebih atas selalu di depan
@@ -559,13 +617,14 @@ class MainHook : IXposedHookLoadPackage {
 
     // ---- label ----
 
-    private fun makeLabel(ctx: Context, sp: Float, bold: Boolean, d: Float): TextView {
+    private fun makeLabel(ctx: Context, sp: Float, bold: Boolean, gravity: Int): TextView {
         val t = TextView(ctx)
         t.setTextColor(Color.WHITE)
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
         t.typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-        t.setShadowLayer(3f * d, 0f, 1f * d, 0x66000000)
-        t.gravity = Gravity.CENTER_HORIZONTAL
+        // tanpa bayangan hitam
+        t.setShadowLayer(0f, 0f, 0f, Color.TRANSPARENT)
+        t.gravity = gravity
         t.alpha = 0f
         t.visibility = View.INVISIBLE
         t.isClickable = false
@@ -578,10 +637,9 @@ class MainHook : IXposedHookLoadPackage {
         (labelCenter?.parent as? ViewGroup)?.removeView(labelCenter)
         (labelCount?.parent as? ViewGroup)?.removeView(labelCount)
         val ctx = root.context
-        val d = ctx.resources.displayMetrics.density
-        val lc = makeLabel(ctx, 17f, true, d)
+        val lc = makeLabel(ctx, Config.labelSp, true, Gravity.START)
         lc.text = "Notification Center"
-        val ln = makeLabel(ctx, 14f, false, d)
+        val ln = makeLabel(ctx, 14f, false, Gravity.CENTER_HORIZONTAL)
         root.addView(lc, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(ln, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         labelCenter = lc
@@ -605,11 +663,13 @@ class MainHook : IXposedHookLoadPackage {
         val rl = IntArray(2)
         root.getLocationOnScreen(rl)
 
-        // "Notification Center": muncul di atas daftar
+        // "Notification Center": rata kiri, muncul di atas daftar
         val a1 = ((a - 0.3f) / 0.5f).coerceIn(0f, 1f)
         lc.visibility = if (a1 > 0.01f) View.VISIBLE else View.INVISIBLE
         lc.alpha = a1
-        val hc = if (lc.height > 0) lc.height.toFloat() else 28f * d
+        lc.setTextSize(TypedValue.COMPLEX_UNIT_SP, Config.labelSp)
+        lc.setPadding((Config.labelLeftDp * d).toInt(), 0, 0, 0)
+        val hc = if (lc.height > 0) lc.height.toFloat() else 26f * d
         lc.translationY = targetTop - rl[1] - hc - 6f * d
 
         // "N Notification(s)": saat kartu belum dimunculkan (atau selalu, jika countalways 1)
@@ -634,6 +694,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun reset(sv: View?, ctx: Context?) {
         restoreGear(ctx)
         hideLabels()
+        restoreClip()
         if (sv == null) return
         sv.alpha = 1f
         sv.visibility = View.VISIBLE
