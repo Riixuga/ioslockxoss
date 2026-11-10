@@ -17,6 +17,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -57,13 +58,16 @@ object Config {
     // batas bawah daftar kartu (di atas fingerprint dan teks bawah)
     val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.83f
     // ketebalan pita kartu yang menumpuk di bawah, dan jarak meluncur saat muncul
-    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 14f
+    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 36f
+    // keadaan 3: ketebalan pita tumpukan (lebih tebal supaya isi kartu terbaca), dan ketebalan minimal
+    val peek3Dp: Float get() = prop("debug.ioslock.peek3dp").toFloatOrNull() ?: 58f
+    val minPeekDp: Float get() = prop("debug.ioslock.minpeekdp").toFloatOrNull() ?: 12f
     val slideDp: Float get() = prop("debug.ioslock.slidedp").toFloatOrNull() ?: 120f
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
-    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
+    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 3
     // keadaan 3: jumlah pita tumpukan yang terlihat (sedikit saja), jumlah kartu minimal yang
     // selalu masuk tumpukan (0 = tumpukan hanya muncul kalau tidak muat), dan jarak tambahan antar kartu
-    val bands3: Int get() = prop("debug.ioslock.bands3").toIntOrNull() ?: 1
+    val bands3: Int get() = prop("debug.ioslock.bands3").toIntOrNull() ?: 2
     val stack3Min: Int get() = prop("debug.ioslock.stack3min").toIntOrNull() ?: 1
     val gapDp: Float get() = prop("debug.ioslock.gapdp").toFloatOrNull() ?: 10f
     // posisi teks "N Notifications", dan apakah tetap tampil saat kartu muncul
@@ -101,6 +105,10 @@ class MainHook : IXposedHookLoadPackage {
     // pengaturan clip asli view induk stack: [clipChildren, clipToPadding]
     private val clipOrig = WeakHashMap<ViewGroup, BooleanArray>()
 
+    // baris notifikasi yang clip-nya sudah kita matikan (dipulihkan saat keluar)
+    private val rowClipOff = WeakHashMap<View, Boolean>()
+    private var drawHookView: WeakReference<View>? = null
+
     // kontrol setting gear jam wallpaper
     @Volatile private var ownWrite = false
     @Volatile private var sysGearValue = ""
@@ -131,7 +139,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.14 loaded into SystemUI")
+        log("v0.15 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -329,21 +337,30 @@ class MainHook : IXposedHookLoadPackage {
         val g = stackRef?.get() as? ViewGroup ?: return false
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
-            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0) return true
+            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0 && isCard(c)) return true
         }
         return false
     }
 
-    // jumlah notifikasi (kartu musik dan senter tidak dihitung)
+    // kartu sungguhan di stack (bukan footer, header seksi, atau view kosong)
+    private fun isCard(c: View): Boolean {
+        val n = c.javaClass.name
+        return !(n.contains("Footer") || n.contains("SectionHeader") || n.contains("EmptyShade") ||
+            n.contains("Spacer"))
+    }
+
+    // jumlah notifikasi: semua kartu (termasuk kartu musik dan senter); grup dihitung per anak
     private fun notifCount(g: ViewGroup): Int {
         var n = 0
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
-            if (c.javaClass.name.contains("ExpandableNotificationRow") && c.height > 0) {
+            if (c.height > 0 && c.width > 0 && c.visibility != View.GONE && isCard(c)) {
                 var k = 0
-                try {
-                    k = (XposedHelpers.callMethod(c, "getNumberOfNotificationChildren") as? Int) ?: 0
-                } catch (t: Throwable) { }
+                if (c.javaClass.name.contains("ExpandableNotificationRow")) {
+                    try {
+                        k = (XposedHelpers.callMethod(c, "getNumberOfNotificationChildren") as? Int) ?: 0
+                    } catch (t: Throwable) { }
+                }
                 n += if (k > 0) k else 1
             }
         }
@@ -504,27 +521,32 @@ class MainHook : IXposedHookLoadPackage {
     // potongAtas: 0 = kartu penuh, h = tersembunyi, di antaranya = pita bawah saja.
     // gap: jarak tambahan antar kartu penuh. minStack: jumlah kartu minimal yang dipaksa masuk tumpukan.
     // maxBands: jumlah pita tumpukan yang terlihat; kartu lebih banyak disembunyikan di belakangnya.
+    // peekMax: ketebalan pita; dikecilkan otomatis kalau ruang sampai batas bawah tidak cukup.
     private fun layoutCards(
         cards: List<Pair<View, Float>>, targetTop: Float, gap: Float,
-        minStack: Int, maxBands: Int, limit: Float, peek: Float, d: Float
+        minStack: Int, maxBands: Int, limit: Float, peekMax: Float, minPeek: Float, d: Float
     ): Array<FloatArray> {
         val n = cards.size
         val base0 = cards[0].second
         val maxFull = (n - minStack).coerceAtLeast(1)
 
-        // berapa kartu yang tampil penuh (minimal satu)
+        // berapa kartu yang tampil penuh (minimal satu); pita dihitung dengan ketebalan minimal
         var k = 0
         for (i in 0 until maxFull) {
             val rel = cards[i].second - base0 + i * gap
             val h = cards[i].first.height.toFloat()
             val bands = min(n - 1 - i, maxBands)
-            val need = targetTop + rel + h + bands * peek
+            val need = targetTop + rel + h + bands * minPeek
             if (need <= limit) k = i + 1 else break
         }
         if (k < 1) k = 1
         val lastIdx = k - 1
         val lastBottom = targetTop + (cards[lastIdx].second - base0) + lastIdx * gap +
             cards[lastIdx].first.height
+
+        // ketebalan pita: selebar mungkin sampai batas bawah, tapi tidak lebih dari peekMax
+        val nb = min(n - k, maxBands)
+        val peek = if (nb > 0) min(peekMax, ((limit - lastBottom) / nb).coerceAtLeast(minPeek)) else peekMax
 
         val out = Array(n) { FloatArray(3) }
         for (i in 0 until n) {
@@ -537,7 +559,7 @@ class MainHook : IXposedHookLoadPackage {
                 // menumpuk di belakang kartu penuh terakhir; hanya pita bawah yang terlihat
                 val j = i - lastIdx
                 val jj = min(j, maxBands)
-                val s = 1f - 0.06f * jj
+                val s = 1f - 0.05f * jj
                 val bottom = lastBottom + jj * peek
                 out[i][0] = bottom - h * s / 2f
                 out[i][1] = s
@@ -545,6 +567,38 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
         return out
+    }
+
+    // Baris notifikasi (ExpandableView) mengatur clip-nya sendiri dan menimpa clipBounds kita,
+    // jadi clip-nya dimatikan sekali per baris.
+    private fun releaseRowClip(c: View) {
+        if (rowClipOff.containsKey(c)) return
+        rowClipOff[c] = true
+        try { XposedHelpers.callMethod(c, "setClipToActualHeight", false) } catch (t: Throwable) { }
+        try { XposedHelpers.callMethod(c, "setClipTopAmount", 0) } catch (t: Throwable) { }
+        try { XposedHelpers.callMethod(c, "setClipBottomAmount", 0) } catch (t: Throwable) { }
+    }
+
+    private fun restoreRowClip() {
+        for (k in rowClipOff.keys.toList()) {
+            try { XposedHelpers.callMethod(k, "setClipToActualHeight", true) } catch (t: Throwable) { }
+        }
+        rowClipOff.clear()
+    }
+
+    // Terapkan ulang efek tiap frame (sebelum digambar), supaya posisi dan clip
+    // tidak ditimpa lagi oleh stack notifikasi bawaan.
+    private fun ensureDrawHook(sv: View) {
+        if (drawHookView?.get() === sv) return
+        val vto = sv.viewTreeObserver
+        if (!vto.isAlive) return
+        drawHookView = WeakReference(sv)
+        vto.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (applied && !screenOff) applyState()
+                return true
+            }
+        })
     }
 
     // a: 0..1 kartu muncul (meluncur naik sambil memudar masuk)
@@ -561,13 +615,14 @@ class MainHook : IXposedHookLoadPackage {
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
+        ensureDrawHook(sv)
         val loc = IntArray(2)
         sv.getLocationOnScreen(loc)
 
         val cards = ArrayList<Pair<View, Float>>()
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
-            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0) {
+            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0 && isCard(c)) {
                 cards.add(Pair(c, baseOfY(c)))
             }
         }
@@ -582,11 +637,21 @@ class MainHook : IXposedHookLoadPackage {
         if (n == 0) return
 
         val limit = dm.heightPixels * Config.listBottomFrac
-        val peek = Config.peekDp * d
+        val minPeek = Config.minPeekDp * d
         val slide = (1f - a) * Config.slideDp * d
 
-        val la = layoutCards(cards, restTop, 0f, 0, Config.bands2, limit, peek, d)
-        val lb = layoutCards(cards, smallTop, Config.gapDp * d, Config.stack3Min, Config.bands3, limit, peek, d)
+        val la = layoutCards(cards, restTop, 0f, 0, Config.bands2, limit, Config.peekDp * d, minPeek, d)
+        val lb = layoutCards(cards, smallTop, Config.gapDp * d, Config.stack3Min, Config.bands3, limit,
+            Config.peek3Dp * d, minPeek, d)
+
+        // info untuk debug: logcat | grep IOSLock
+        val sb = StringBuilder("n=$n q=${"%.2f".format(q)}")
+        for (i in 0 until n) {
+            val c = cards[i].first
+            sb.append(" [").append(c.javaClass.simpleName.take(16)).append(" v=").append(c.visibility)
+                .append(" a=").append("%.1f".format(c.alpha)).append(" h=").append(c.height).append("]")
+        }
+        logT("cards", sb.toString())
 
         for (i in 0 until n) {
             val card = cards[i].first
@@ -598,6 +663,7 @@ class MainHook : IXposedHookLoadPackage {
             val center = la[i][0] + (lb[i][0] - la[i][0]) * q
             val s = la[i][1] + (lb[i][1] - la[i][1]) * q
             val ct = la[i][2] + (lb[i][2] - la[i][2]) * q
+            releaseRowClip(card)
             val clip: Rect? = if (ct < 1f) null else Rect(0, ct.toInt(), card.width, h.toInt())
 
             val wy = baseY + (center + slide - naturalCenter)
@@ -695,6 +761,7 @@ class MainHook : IXposedHookLoadPackage {
         restoreGear(ctx)
         hideLabels()
         restoreClip()
+        restoreRowClip()
         if (sv == null) return
         sv.alpha = 1f
         sv.visibility = View.VISIBLE
