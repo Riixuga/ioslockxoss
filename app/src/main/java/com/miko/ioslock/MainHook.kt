@@ -63,49 +63,46 @@ object Config {
     // posisi bagian atas kartu teratas (0..1 tinggi layar): keadaan 2 (bawah jam tinggi) dan keadaan 3 (bawah jam biasa)
     val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0.575f
     val smallFrac: Float get() = prop("debug.ioslock.smallfrac").toFloatOrNull() ?: 0.345f
-    // batas bawah daftar kartu (di atas fingerprint dan teks bawah). Dipakai keadaan 1/2/3.
+    // batas bawah daftar kartu (di atas fingerprint dan teks bawah)
     val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.83f
-
-    // ---- keadaan 2 (kartu muncul, tumpukan di bawah kartu depan) ----
-    // ketebalan pita tumpukan di bawah kartu penuh terakhir
+    // keadaan 2: ketebalan pita kartu yang menumpuk di bawah
     val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 48f
     // pita tidak boleh lebih tebal dari sekian kali tinggi kartu (supaya tetap menumpuk di belakang kartu depan)
     val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.62f
-    // ketebalan minimal sebuah pita
+    // ketebalan minimal sebuah kartu yang menumpuk (dp)
     val minPeekDp: Float get() = prop("debug.ioslock.minpeekdp").toFloatOrNull() ?: 12f
-    // jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
+    // meluncur tambahan saat kartu muncul; 0 = kartu keluar dari dasar tumpukan saja (lihat originFrac)
+    val slideDp: Float get() = prop("debug.ioslock.slidedp").toFloatOrNull() ?: 0f
+    // animasi buka tumpukan (keadaan 1 -> 2): semua kartu keluar dari satu titik di dasar tumpukan
+    // (di atas teks "N Notifications"), kartu depan lebih dulu, kartu terakhir tetap di tempatnya.
+    // originFrac = tepi bawah titik asal itu (0..1 tinggi layar; dipakai kalau dasar tumpukan keadaan 2
+    // lebih tinggi dari ini, misalnya hanya 1-2 notifikasi). openStagger = seberapa bergantian (0 = serentak, maks 0.8)
+    val originFrac: Float get() = prop("debug.ioslock.originfrac").toFloatOrNull() ?: 0.80f
+    val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
+    // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
-    // jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
+    // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
+    // keadaan 3: tumpukan bertingkat tanpa celah. Kartu paling atas tampil penuh, tiap kartu di bawahnya
+    // tertutup kartu di atasnya dan terlihat makin sedikit, sampai batas bawah (listBottomFrac).
+    // cascadeMax = jumlah kartu yang terlihat (sisanya bersembunyi di belakang yang terakhir)
+    // cascadeCap = bagian maksimum kartu ke-2 yang terlihat saat ruang lega (1 = penuh); tiap kartu berikutnya
+    //   dikali cascadeCapDecay, jadi makin ke bawah makin tertutup walau ruang masih lega
+    // cascadeDecay = saat ruang sempit, tiap kartu menyisakan bagian sekian kali kartu di atasnya
+    // scale3Step = pengecilan skala tiap tingkat, overlapDp = tumpang tindih minimal antar kartu (tidak pernah ada celah)
+    val cascadeMax: Int get() = prop("debug.ioslock.cascademax").toIntOrNull() ?: 6
+    val cascadeCap: Float get() = prop("debug.ioslock.cascadecap").toFloatOrNull() ?: 0.86f
+    val cascadeCapDecay: Float get() = prop("debug.ioslock.cascadecapdecay").toFloatOrNull() ?: 0.92f
+    val cascadeDecay: Float get() = prop("debug.ioslock.cascadedecay").toFloatOrNull() ?: 0.75f
+    val scale3Step: Float get() = prop("debug.ioslock.scale3step").toFloatOrNull() ?: 0.03f
+    val overlapDp: Float get() = prop("debug.ioslock.overlapdp").toFloatOrNull() ?: 8f
+    // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
+    // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
+    val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
     // tiap pita tumpukan lebih tipis dari pita di depannya (1 = sama tebal),
     // dan pengecilan skala tiap pita (0.05 = 5% per pita)
     val bandDecay: Float get() = prop("debug.ioslock.banddecay").toFloatOrNull() ?: 0.8f
     val scaleStep: Float get() = prop("debug.ioslock.scalestep").toFloatOrNull() ?: 0.05f
-
-    // ---- animasi buka tumpukan (keadaan 1 -> 2) ----
-    // Semua kartu mulai menumpuk di tempat kartu paling akhir (di keadaan 2), lalu keluar satu per satu
-    // (kartu depan lebih dulu). 0 = semua keluar bersamaan, makin besar makin bergantian (maksimum 0.8)
-    val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.5f
-
-    // ---- keadaan 3 (jam kecil, tumpukan progresif) ----
-    // Kartu pertama tampil penuh. Kartu ke-2 dst saling menimpa tanpa jarak: makin ke bawah makin
-    // sedikit bagian kartu yang terlihat. Batas paling bawah tetap listBottomFrac.
-    // jumlah kartu paling banyak yang terlihat sebagai tumpukan (sisanya bersembunyi di belakang yang terakhir)
-    val maxCards3: Int get() = prop("debug.ioslock.maxcards3").toIntOrNull() ?: 8
-    // bagian kartu ke-2 yang terlihat paling banyak (0..1). 1 = penuh tanpa menimpa.
-    // Kalau ruang sampai batas bawah masih sisa, bagian terlihat dibesarkan sampai angka ini;
-    // kalau ruang kurang (notifikasi terlalu banyak), dikecilkan otomatis supaya muat.
-    // Isi lebih dari 1 supaya kartu-kartu bawah juga terbuka penuh saat ruang masih banyak.
-    val vis3Max: Float get() = prop("debug.ioslock.vis3max").toFloatOrNull() ?: 0.92f
-    // tiap kartu berikutnya terlihat sekian kali dari kartu di depannya (makin kecil = tumpukan makin rapat)
-    val vis3Decay: Float get() = prop("debug.ioslock.vis3decay").toFloatOrNull() ?: 0.7f
-    // pengecilan skala tiap kartu dalam tumpukan (0.03 = 3% per kartu), berhenti setelah sekian kartu
-    val scale3Step: Float get() = prop("debug.ioslock.scale3step").toFloatOrNull() ?: 0.03f
-    val scale3Max: Int get() = prop("debug.ioslock.scale3max").toIntOrNull() ?: 5
-    // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
-    // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
-    val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
-
     // posisi teks "N Notifications", dan apakah tetap tampil saat kartu muncul
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.845f
     val countAlways: Boolean get() = prop("debug.ioslock.countalways") == "1"
@@ -586,20 +583,18 @@ class MainHook : IXposedHookLoadPackage {
         val kind = IntArray(n)
     }
 
-    private fun smooth(t: Float): Float {
-        val x = t.coerceIn(0f, 1f)
-        return x * x * (3f - 2f * x)
-    }
+    private fun powf(b: Float, e: Int): Float = Math.pow(b.toDouble(), e.toDouble()).toFloat()
 
     // Jarak kumulatif pita ke-m di bawah kartu penuh terakhir. Tiap pita lebih tipis dari pita
     // di depannya (peek * decay^(m-1)), supaya tumpukan terlihat berkedalaman dan proporsional.
     private fun bandOffset(m: Int, peek: Float, decay: Float): Float {
         if (m <= 0) return 0f
         if (decay >= 0.999f) return m * peek
-        return peek * (1f - Math.pow(decay.toDouble(), m.toDouble()).toFloat()) / (1f - decay)
+        return peek * (1f - powf(decay, m)) / (1f - decay)
     }
 
-    // KEADAAN 2. Hitung tata letak dari posisi asli kartu di stack bawaan (baseYs, urut dari atas).
+    // Tata letak keadaan 2: kartu depan penuh, sisanya menumpuk di belakangnya sebagai pita.
+    // Dihitung dari posisi asli kartu di stack bawaan (baseYs, urut dari atas).
     // top: posisi atas kartu teratas. gap: jarak tambahan antar kartu penuh.
     // maxFull: jumlah kartu penuh paling banyak. maxBands: jumlah pita tumpukan yang terlihat.
     // peekMax: ketebalan pita pertama; dikecilkan otomatis kalau ruang sampai batas bawah tidak cukup.
@@ -650,73 +645,83 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
-    // KEADAAN 3. Tumpukan progresif tanpa jarak antar kartu.
-    // Kartu pertama tampil penuh. Kartu ke-i (i >= 1) menimpa bagian atas kartu i+1 sehingga yang
-    // terlihat dari kartu i hanya pita bawahnya setebal p_i = f * decay^(i-1) * tinggi kartu (maks. tinggi
-    // penuh). Makin ke bawah pita makin tipis, jadi isi kartu makin sedikit terlihat dan tumpukan makin jelas.
-    // Skala tiap kartu juga mengecil sedikit ke bawah.
-    // f dicari supaya tepi bawah kartu terakhir pas di batas bawah (limit):
-    //   - ruang sisa (notifikasi sedikit)  -> f dibesarkan sampai fMax, isi kartu terlihat lebih banyak
-    //   - ruang kurang (notifikasi banyak) -> f dikecilkan sampai pas, dan kalau pita minimal pun tidak
-    //     muat, kartu paling bawah bersembunyi di belakang kartu terakhir yang terlihat.
-    // Bagian atas kartu tidak pernah naik melewati top (supaya kartu tinggi tidak menembus jam / label).
-    private fun layoutProgressive(
-        hs: FloatArray, top: Float, limit: Float, minPeek: Float,
-        maxCards: Int, decay: Float, fMax: Float, scaleStep: Float, scaleMax: Int
+    // Tata letak keadaan 3: tumpukan bertingkat tanpa celah (A sampai D dst).
+    // Kartu 0 tampil penuh. Tiap kartu di bawahnya berada di belakang kartu di atasnya, jadi yang terlihat
+    // hanya bagian bawahnya setebal t(i): makin ke bawah makin sedikit yang terlihat dan skalanya makin kecil.
+    // t(i) = clamp(lam * decay^(i-1) * tinggi, tipis, maks). lam dicari supaya tepi bawah kartu terakhir tepat
+    // di batas bawah (limit) bila notifikasinya banyak. Bila sedikit, t(i) berhenti di batas maks (hampir penuh,
+    // tetap ada tumpang tindih minimal) sehingga isi kartu terlihat dan tumpukan berakhir di atas limit.
+    private fun layoutCascade(
+        hs: FloatArray, top: Float, limit: Float, minPeek: Float, overlapMin: Float,
+        maxVisible: Int, capBase: Float, capDecay: Float, decay: Float, scaleStep: Float
     ): StateLayout {
         val n = hs.size
         val out = StateLayout(n)
+        fun sc(i: Int): Float = 1f - scaleStep * min(i, 4)
+        out.bottom[0] = top + hs[0]
+        out.scale[0] = 1f
+        out.kind[0] = 0
+        if (n == 1) return out
 
-        val sc = FloatArray(n) { 1f - scaleStep * min(it, scaleMax.coerceAtLeast(0)) }
-        val hh = FloatArray(n) { hs[it] * sc[it] }
-        val w = FloatArray(n) {
-            if (it == 0) 1f else Math.pow(decay.toDouble(), (it - 1).toDouble()).toFloat()
+        // tebal terlihat kartu i: paling tipis (pita) dan paling tebal (hampir penuh)
+        fun lo(i: Int): Float = min(minPeek, hs[i] * sc(i))
+        fun hi(i: Int): Float {
+            val full = hs[i] * sc(i)
+            return max(min(full * capBase * powf(capDecay, i - 1), full - overlapMin), lo(i))
         }
-        val tmp = FloatArray(n)
 
-        // tepi bawah tiap kartu untuk faktor f dan cnt kartu pertama; kembalikan tepi bawah kartu terakhir
-        fun fill(f: Float, cnt: Int, dst: FloatArray): Float {
-            var b = top + hh[0]
-            dst[0] = b
-            for (i in 1 until cnt) {
-                val minP = min(minPeek, hh[i])
-                val want = b + max(minP, f * w[i] * hh[i])
-                b = min(b + hh[i], max(want, top + hh[i]))
-                dst[i] = b
+        val room = limit - out.bottom[0]
+
+        // jumlah kartu yang terlihat: dikurangi sampai semuanya muat dengan ketebalan minimum
+        var m = min(n, max(maxVisible, 1))
+        while (m > 1) {
+            var s = 0f
+            for (i in 1 until m) s += lo(i)
+            if (s <= room) break
+            m--
+        }
+
+        fun t(i: Int, lam: Float): Float = (lam * powf(decay, i - 1) * hs[i] * sc(i)).coerceIn(lo(i), hi(i))
+        fun total(lam: Float): Float {
+            var s = 0f
+            for (i in 1 until m) s += t(i, lam)
+            return s
+        }
+
+        // lam cukup besar membuat semua kartu mencapai batas maksimum; kalau tidak muat, cari lam dengan bisection
+        var lam = 1f / powf(decay, m)
+        if (total(lam) > room) {
+            var l = 0f
+            var h = lam
+            for (iter in 0 until 28) {
+                val mid = (l + h) / 2f
+                if (total(mid) > room) h = mid else l = mid
             }
-            return b
+            lam = l
         }
 
-        // jumlah kartu yang terlihat: sebanyak mungkin selama pita minimal masih muat
-        val cap = min(n, maxCards.coerceAtLeast(1))
-        var m = 1
-        while (m < cap && fill(0f, m + 1, tmp) <= limit) m++
-
-        // faktor f terbesar (maks. fMax) yang masih muat sampai batas bawah
-        val fCap = fMax.coerceAtLeast(0f)
-        var f = fCap
-        if (fill(fCap, m, tmp) > limit) {
-            var lo = 0f
-            var hi = fCap
-            for (k in 0 until 24) {
-                val mid = (lo + hi) / 2f
-                if (fill(mid, m, tmp) <= limit) lo = mid else hi = mid
-            }
-            f = lo
-        }
-        fill(f, m, out.bottom)
-
-        for (i in 0 until n) {
+        for (i in 1 until n) {
             if (i < m) {
-                out.scale[i] = sc[i]
-                out.kind[i] = if (i == 0 || out.bottom[i] - out.bottom[i - 1] >= hh[i] - 0.5f) 0 else 1
+                out.bottom[i] = out.bottom[i - 1] + t(i, lam)
+                out.scale[i] = sc(i)
+                out.kind[i] = 1
             } else {
+                // kartu yang tidak terlihat bersembunyi di belakang kartu terakhir yang terlihat
                 out.bottom[i] = out.bottom[m - 1]
-                out.scale[i] = sc[m - 1]
+                out.scale[i] = sc(m)
                 out.kind[i] = 2
             }
         }
         return out
+    }
+
+    // Seberapa jauh kartu ke-i sudah keluar dari titik asal pada kemajuan a (0..1) animasi buka tumpukan:
+    // kartu depan keluar lebih dulu, kartu di belakangnya menyusul, kartu terakhir paling akhir.
+    private fun openProgress(i: Int, n: Int, a: Float, lag: Float): Float {
+        val l = if (n > 1) lag.coerceIn(0f, 0.8f) else 0f
+        val start = if (n > 1) l * i / (n - 1) else 0f
+        val t = ((a - start) / (1f - l)).coerceIn(0f, 1f)
+        return t + (t * t * (3f - 2f * t) - t) * 0.5f
     }
 
     // Seberapa jauh kartu ke-i (1..n-1) sudah keluar dari tumpukan pada kemajuan q:
@@ -731,14 +736,17 @@ class MainHook : IXposedHookLoadPackage {
         return t + (t * t * (3f - 2f * t) - t) * 0.5f
     }
 
-    // Gabungkan keadaan 2 (la) dan keadaan 3 (lb) jadi posisi tiap kartu pada kemajuan q.
-    // Jarak tiap kartu ke kartu di depannya bergerak dari tebal pita (menumpuk) ke jarak keadaan 3,
+    // Gabungkan keadaan 2 (la) dan keadaan 3 (lb) jadi posisi tiap kartu pada kemajuan (a, q).
+    // Jarak tiap kartu ke kartu di depannya bergerak dari tebal pita (menumpuk) ke jarak penuh (renggang),
     // jadi kartu selalu berurutan, tidak pernah saling menyeberang, dan tidak melewati batas bawah.
     // Kartu pertama mengikuti jari secara linear; tepi bawah tiap kartu dibatasi oleh posisi terjauh
     // kedua keadaan, jadi tidak ada kartu yang melampaui tempat akhirnya lalu mundur.
+    // Saat a < 1 (animasi buka tumpukan, keadaan 1 -> 2) semua kartu berangkat dari satu titik asal
+    // (origin = tepi bawah dasar tumpukan) lalu keluar bergantian ke posisinya di keadaan 2;
+    // kartu terakhir berada di dasar tumpukan itu sejak awal, jadi tumpukannya tetap terlihat.
     private fun composeStack(
-        la: StateLayout, lb: StateLayout, q: Float, stagger: Float,
-        outBottom: FloatArray, outScale: FloatArray
+        la: StateLayout, lb: StateLayout, a: Float, q: Float, stagger: Float,
+        openStagger: Float, origin: Float, outBottom: FloatArray, outScale: FloatArray
     ) {
         val n = outBottom.size
         var prev = la.bottom[0] + (lb.bottom[0] - la.bottom[0]) * q
@@ -753,43 +761,14 @@ class MainHook : IXposedHookLoadPackage {
             outBottom[i] = prev
             outScale[i] = la.scale[i] + (lb.scale[i] - la.scale[i]) * e
         }
-    }
-
-    // Kemajuan buka kartu ke-i dari `count` kartu yang bergerak (a = 0..1).
-    // Kartu depan (i kecil) berangkat lebih dulu, kartu di belakangnya menyusul; semuanya selesai saat a = 1.
-    private fun openProgress(i: Int, count: Int, a: Float, lag: Float): Float {
-        val lg = lag.coerceIn(0f, 0.8f)
-        val start = if (count > 1) lg * i / (count - 1) else 0f
-        val t = ((a - start) / (1f - lg)).coerceIn(0f, 1f)
-        return t + (smooth(t) - t) * 0.5f
-    }
-
-    // ANIMASI BUKA (a < 1): semua kartu mulai menumpuk di tempat kartu paling akhir keadaan 2
-    // (pita paling bawah, area lingkar merah di keadaan 1), lalu keluar satu per satu ke posisinya di keadaan 2.
-    // Kartu paling akhir (dan kartu yang bersembunyi di belakangnya) tidak bergerak, jadi
-    // tumpukan tetap terlihat di tempatnya sepanjang animasi.
-    private fun openStack(
-        la: StateLayout, a: Float, extra: Float, limit: Float, step: Float,
-        bottoms: FloatArray, scales: FloatArray
-    ) {
-        val n = bottoms.size
-        val ab: Float
-        val asc: Float
-        if (n >= 2) {
-            ab = la.bottom[n - 1]
-            asc = la.scale[n - 1]
-        } else {
-            // hanya satu kartu: keluar dari sedikit di bawah posisinya, seperti pita tumpukan
-            ab = min(la.bottom[0] + extra, max(limit, la.bottom[0]))
-            asc = 1f - step
-        }
-        // kartu yang posisi akhirnya berbeda dari titik tumpukan = kartu yang bergerak (selalu awalan urutan)
-        var moving = 0
-        while (moving < n && (abs(la.bottom[moving] - ab) > 0.5f || abs(la.scale[moving] - asc) > 0.001f)) moving++
-        for (i in 0 until moving) {
-            val t = openProgress(i, moving, a, Config.openStagger)
-            bottoms[i] = ab + (bottoms[i] - ab) * t
-            scales[i] = asc + (scales[i] - asc) * t
+        if (a < 1f) {
+            // di titik asal semua kartu sekecil pita terakhir; makin keluar makin besar
+            val sO = la.scale[n - 1]
+            for (i in 0 until n) {
+                val ea = openProgress(i, n, a, openStagger)
+                outBottom[i] = origin + (outBottom[i] - origin) * ea
+                outScale[i] = sO + (outScale[i] - sO) * ea
+            }
         }
     }
 
@@ -808,15 +787,15 @@ class MainHook : IXposedHookLoadPackage {
         })
     }
 
-    // a: 0..1 kartu muncul (keluar satu per satu dari tumpukan di bawah sambil memudar masuk)
+    // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari dasar tumpukan (kartu depan dulu)
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya (pita tipis di bawah).
-    // Keadaan 3 (q=1): tumpukan progresif tanpa jarak, makin ke bawah makin sedikit isi kartu yang terlihat,
-    // batas paling bawah tetap sama dengan keadaan 1/2 (listBottomFrac).
+    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya.
+    // Keadaan 3 (q=1): tumpukan bertingkat tanpa celah; kartu atas penuh, makin ke bawah makin tertutup
+    // dan mengecil, berakhir di batas bawah (listBottomFrac). Notifikasi sedikit = isi kartu terlihat.
+    // Semakin ke atas di-swipe, jarak antar kartu semakin renggang; semakin ke bawah, semakin menumpuk.
     // Kartu yang menumpuk adalah kartu asli (tanpa clip, tanpa disembunyikan): digeser ke belakang
-    // kartu depan dan diperkecil, sehingga hanya bagian bawahnya yang menyembul.
-    // Tata letak dua keadaan dihitung terpisah, composeStack menggabungkannya dengan q,
-    // lalu openStack menarik kartu ke titik tumpukan saat a < 1.
+    // kartu di atasnya dan diperkecil, sehingga hanya bagian bawahnya yang menyembul.
+    // Tata letak dua keadaan dihitung terpisah, lalu composeStack menggabungkannya dengan a dan q.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -849,6 +828,7 @@ class MainHook : IXposedHookLoadPackage {
 
         val limit = dm.heightPixels * Config.listBottomFrac
         val minPeek = Config.minPeekDp * d
+        val slide = (1f - a) * Config.slideDp * d
 
         val baseYs = FloatArray(n) { cards[it].second }
         val hs = FloatArray(n) { visH(cards[it].first) }
@@ -856,17 +836,21 @@ class MainHook : IXposedHookLoadPackage {
         val step = Config.scaleStep.coerceIn(0f, 0.12f)
         val la = layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, limit,
             Config.peekDp * d, minPeek, Config.peekMaxFrac, decay, step)
-        val lb = layoutProgressive(hs, smallTop, limit, minPeek, Config.maxCards3,
-            Config.vis3Decay.coerceIn(0.3f, 1f), Config.vis3Max,
-            Config.scale3Step.coerceIn(0f, 0.08f), Config.scale3Max)
+        val lb = layoutCascade(hs, smallTop, limit, minPeek, Config.overlapDp * d, Config.cascadeMax,
+            Config.cascadeCap.coerceIn(0.2f, 1f), Config.cascadeCapDecay.coerceIn(0.5f, 1f),
+            Config.cascadeDecay.coerceIn(0.3f, 1f), Config.scale3Step.coerceIn(0f, 0.08f))
+
+        // titik asal animasi buka: dasar tumpukan (tepi bawah kartu terakhir di keadaan 2),
+        // minimal originFrac supaya tetap di dekat teks "N Notifications" walau kartunya sedikit
+        var origin = dm.heightPixels * Config.originFrac
+        for (i in 0 until n) origin = max(origin, la.bottom[i])
 
         val bottoms = FloatArray(n)
         val scales = FloatArray(n)
-        composeStack(la, lb, q, Config.stagger, bottoms, scales)
-        if (a < 1f) openStack(la, a, Config.peekDp * d, limit, step, bottoms, scales)
+        composeStack(la, lb, a, q, Config.stagger, Config.openStagger, origin, bottoms, scales)
 
         // info untuk debug: logcat | grep IOSLock
-        val sb = StringBuilder("n=$n a=${"%.2f".format(a)} q=${"%.2f".format(q)}")
+        val sb = StringBuilder("n=$n q=${"%.2f".format(q)}")
 
         for (i in 0 until n) {
             val card = cards[i].first
@@ -881,7 +865,7 @@ class MainHook : IXposedHookLoadPackage {
             sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind)
                 .append(" h=").append(card.height).append("/").append(h.toInt()).append("]")
 
-            val wy = baseY + (center - naturalCenter)
+            val wy = baseY + (center + slide - naturalCenter)
             // kartu yang lebih atas selalu di depan
             val wz = baseZ + (n - i) * 3f * d
 
@@ -1040,3 +1024,4 @@ class MainHook : IXposedHookLoadPackage {
         android.util.Log.i("IOSLock", msg)
     }
 }
+
