@@ -67,6 +67,8 @@ object Config {
     val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 48f
     // keadaan 3: ketebalan pita tumpukan (lebih tebal supaya isi kartu terbaca), dan ketebalan minimal
     val peek3Dp: Float get() = prop("debug.ioslock.peek3dp").toFloatOrNull() ?: 64f
+    // pita tidak boleh lebih tebal dari sekian kali tinggi kartu (supaya tetap menumpuk di belakang kartu depan)
+    val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.62f
     val minPeekDp: Float get() = prop("debug.ioslock.minpeekdp").toFloatOrNull() ?: 12f
     val slideDp: Float get() = prop("debug.ioslock.slidedp").toFloatOrNull() ?: 120f
     // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
@@ -145,7 +147,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.17 loaded into SystemUI")
+        log("v0.18 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -355,11 +357,25 @@ class MainHook : IXposedHookLoadPackage {
             n.contains("Spacer"))
     }
 
+    // tinggi kartu yang benar-benar terlihat. Baris notifikasi punya tinggi view (getHeight) yang bisa
+    // jauh lebih besar dari tinggi yang digambar (getActualHeight), terutama notifikasi pesan/GIF.
+    private val noActualH = ConcurrentHashMap.newKeySet<Class<*>>()
+    private fun visH(c: View): Float {
+        val cls = c.javaClass
+        if (!noActualH.contains(cls)) {
+            try {
+                val v = XposedHelpers.callMethod(c, "getActualHeight") as? Int
+                if (v != null && v > 0) return v.coerceAtMost(c.height).toFloat()
+            } catch (t: Throwable) { noActualH.add(cls) }
+        }
+        return c.height.toFloat()
+    }
+
     // kartu nyata: bukan view hantu (tidak terlihat atau terlalu pendek)
     private fun isReal(c: View): Boolean {
         if (!isCard(c)) return false
         val dp = c.resources.displayMetrics.density
-        if (c.height < 56f * dp) return false
+        if (visH(c) < 56f * dp) return false
         return c.alpha > 0.05f
     }
 
@@ -537,8 +553,8 @@ class MainHook : IXposedHookLoadPackage {
     // maxBands: jumlah pita tumpukan yang terlihat.
     // peekMax: ketebalan pita; dikecilkan otomatis kalau ruang sampai batas bawah tidak cukup.
     private fun layoutCards(
-        cards: List<Pair<View, Float>>, targetTop: Float, gap: Float,
-        maxFull: Int, maxBands: Int, limit: Float, peekMax: Float, minPeek: Float
+        cards: List<Pair<View, Float>>, hs: FloatArray, targetTop: Float, gap: Float,
+        maxFull: Int, maxBands: Int, limit: Float, peekMax: Float, minPeek: Float, maxFrac: Float
     ): Array<FloatArray> {
         val n = cards.size
         val base0 = cards[0].second
@@ -547,7 +563,7 @@ class MainHook : IXposedHookLoadPackage {
         var k = 0
         for (i in 0 until min(maxFull.coerceAtLeast(1), n)) {
             val rel = cards[i].second - base0 + i * gap
-            val h = cards[i].first.height.toFloat()
+            val h = hs[i]
             val bands = min(n - 1 - i, maxBands)
             val need = targetTop + rel + h + bands * minPeek
             if (need <= limit) k = i + 1 else break
@@ -555,15 +571,18 @@ class MainHook : IXposedHookLoadPackage {
         if (k < 1) k = 1
         val lastIdx = k - 1
         val lastBottom = targetTop + (cards[lastIdx].second - base0) + lastIdx * gap +
-            cards[lastIdx].first.height
+            hs[lastIdx]
 
         // ketebalan pita: selebar mungkin sampai batas bawah, tapi tidak lebih dari peekMax
         val nb = min(n - k, maxBands)
-        val peek = if (nb > 0) min(peekMax, ((limit - lastBottom) / nb).coerceAtLeast(minPeek)) else peekMax
+        var minH = Float.MAX_VALUE
+        for (i in k until n) minH = min(minH, hs[i])
+        val capPeek = if (nb > 0) maxFrac * minH else peekMax
+        val peek = if (nb > 0) min(min(peekMax, capPeek), ((limit - lastBottom) / nb).coerceAtLeast(minPeek)) else peekMax
 
         val out = Array(n) { FloatArray(4) }
         for (i in 0 until n) {
-            val h = cards[i].first.height.toFloat()
+            val h = hs[i]
             if (i < k) {
                 out[i][0] = targetTop + (cards[i].second - base0) + i * gap + h / 2f
                 out[i][1] = 1f
@@ -639,10 +658,11 @@ class MainHook : IXposedHookLoadPackage {
         val minPeek = Config.minPeekDp * d
         val slide = (1f - a) * Config.slideDp * d
 
-        val la = layoutCards(cards, restTop, 0f, Config.full2, Config.bands2, limit,
-            Config.peekDp * d, minPeek)
-        val lb = layoutCards(cards, smallTop, Config.gapDp * d, (n - Config.stack3Min).coerceAtLeast(1),
-            Config.bands3, limit, Config.peek3Dp * d, minPeek)
+        val hs = FloatArray(n) { visH(cards[it].first) }
+        val la = layoutCards(cards, hs, restTop, 0f, Config.full2, Config.bands2, limit,
+            Config.peekDp * d, minPeek, Config.peekMaxFrac)
+        val lb = layoutCards(cards, hs, smallTop, Config.gapDp * d, (n - Config.stack3Min).coerceAtLeast(1),
+            Config.bands3, limit, Config.peek3Dp * d, minPeek, Config.peekMaxFrac)
 
         // info untuk debug: logcat | grep IOSLock
         val sb = StringBuilder("n=$n q=${"%.2f".format(q)}")
@@ -651,14 +671,14 @@ class MainHook : IXposedHookLoadPackage {
             val card = cards[i].first
             val baseY = cards[i].second
             val baseZ = baseOfZ(card)
-            val h = card.height.toFloat()
+            val h = hs[i]
             val naturalCenter = loc[1] + baseY + h / 2f
 
             val kind = if (q < 0.5f) la[i][2] else lb[i][2]
             val center = la[i][0] + (lb[i][0] - la[i][0]) * q
             val s = la[i][1] + (lb[i][1] - la[i][1]) * q
             sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind.toInt())
-                .append(" h=").append(card.height).append("]")
+                .append(" h=").append(card.height).append("/").append(h.toInt()).append("]")
 
             val wy = baseY + (center + slide - naturalCenter)
             // kartu yang lebih atas selalu di depan
