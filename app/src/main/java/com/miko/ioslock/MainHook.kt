@@ -64,7 +64,7 @@ object Config {
     // batas bawah daftar kartu (di atas fingerprint dan teks bawah)
     val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.83f
     // ketebalan pita kartu yang menumpuk di bawah, dan jarak meluncur saat muncul
-    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 36f
+    val peekDp: Float get() = prop("debug.ioslock.peekdp").toFloatOrNull() ?: 48f
     // keadaan 3: ketebalan pita tumpukan (lebih tebal supaya isi kartu terbaca), dan ketebalan minimal
     val peek3Dp: Float get() = prop("debug.ioslock.peek3dp").toFloatOrNull() ?: 64f
     val minPeekDp: Float get() = prop("debug.ioslock.minpeekdp").toFloatOrNull() ?: 12f
@@ -72,7 +72,7 @@ object Config {
     // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
-    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 3
+    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
     // keadaan 3: jumlah pita tumpukan yang terlihat (sedikit saja), jumlah kartu minimal yang
     // selalu masuk tumpukan (0 = tumpukan hanya muncul kalau tidak muat), dan jarak tambahan antar kartu
     val bands3: Int get() = prop("debug.ioslock.bands3").toIntOrNull() ?: 2
@@ -113,11 +113,6 @@ class MainHook : IXposedHookLoadPackage {
     // pengaturan clip asli view induk stack: [clipChildren, clipToPadding]
     private val clipOrig = WeakHashMap<ViewGroup, BooleanArray>()
 
-    // kartu asli yang kita sembunyikan (alpha 0) karena digambar sebagai pita tumpukan
-    private val hiddenByUs = WeakHashMap<View, Boolean>()
-    // gambar terakhir tiap kartu, dipakai untuk pita tumpukan
-    private val snaps = WeakHashMap<View, Snap>()
-    private var bandsView: BandsView? = null
     private var drawHookView: WeakReference<View>? = null
 
     // kontrol setting gear jam wallpaper
@@ -150,7 +145,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.16 loaded into SystemUI")
+        log("v0.17 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -365,7 +360,7 @@ class MainHook : IXposedHookLoadPackage {
         if (!isCard(c)) return false
         val dp = c.resources.displayMetrics.density
         if (c.height < 56f * dp) return false
-        return c.alpha > 0.05f || hiddenByUs.containsKey(c)
+        return c.alpha > 0.05f
     }
 
     // jumlah notifikasi: semua kartu (termasuk kartu musik dan senter); grup dihitung per anak
@@ -588,42 +583,6 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
-    // Gambar kartu ke bitmap (dipakai untuk pita tumpukan). Hanya diambil saat kartu
-    // masih tampil asli; kalau sudah kita sembunyikan, pakai gambar terakhir.
-    private fun snapOf(card: View): Snap? {
-        val now = SystemClock.uptimeMillis()
-        val old = snaps[card]
-        val w = card.width
-        val h = card.height
-        val canCapture = !hiddenByUs.containsKey(card) && card.alpha > 0.5f && w > 0 && h > 0
-        val stale = old == null || now - old.time > 700 || old.bmp.width != w || old.bmp.height != h
-        if (canCapture && stale) {
-            try {
-                val reuse = old != null && old.bmp.width == w && old.bmp.height == h
-                val bmp = if (reuse) old!!.bmp else Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                bmp.eraseColor(0)
-                card.draw(Canvas(bmp))
-                val sn = Snap(bmp, now)
-                snaps[card] = sn
-                return sn
-            } catch (t: Throwable) {
-                once("snapFail") { log("snapshot kartu gagal: $t") }
-            }
-        }
-        return old
-    }
-
-    private fun ensureBandsView(root: ViewGroup): BandsView {
-        val cur = bandsView
-        if (cur != null && cur.parent === root) return cur
-        (cur?.parent as? ViewGroup)?.removeView(cur)
-        val v = BandsView(root.context)
-        v.radius = 18f * root.resources.displayMetrics.density
-        root.addView(v, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        bandsView = v
-        return v
-    }
-
     // Terapkan ulang efek tiap frame (sebelum digambar), supaya posisi
     // tidak ditimpa lagi oleh stack notifikasi bawaan.
     private fun ensureDrawHook(sv: View) {
@@ -641,10 +600,11 @@ class MainHook : IXposedHookLoadPackage {
 
     // a: 0..1 kartu muncul (meluncur naik sambil memudar masuk)
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk rapat di belakangnya (pita).
+    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya.
     // Keadaan 3 (q=1): kartu direnggangkan, hanya sedikit yang menumpuk, pita lebih tebal supaya terbaca.
-    // Kartu yang menumpuk digambar sebagai pita dari gambar kartunya (BandsView),
-    // sedangkan kartu aslinya disembunyikan. Tata letak dua keadaan diinterpolasi dengan q.
+    // Kartu yang menumpuk adalah kartu asli (tanpa clip, tanpa disembunyikan): digeser ke belakang
+    // kartu depan dan diperkecil, sehingga hanya bagian bawahnya yang menyembul.
+    // Tata letak dua keadaan dihitung terpisah lalu diinterpolasi dengan q.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -673,10 +633,7 @@ class MainHook : IXposedHookLoadPackage {
         val targetTop = restTop + (smallTop - restTop) * q
 
         updateLabels(sv, a, targetTop, notifCount(g))
-        val root = sv.rootView as? ViewGroup
-        val bv = if (root != null) ensureBandsView(root) else null
-        if (n == 0) { bv?.setBands(emptyList()); return }
-        val blocked = root != null && labelsBlocked(root)
+        if (n == 0) return
 
         val limit = dm.heightPixels * Config.listBottomFrac
         val minPeek = Config.minPeekDp * d
@@ -686,11 +643,6 @@ class MainHook : IXposedHookLoadPackage {
             Config.peekDp * d, minPeek)
         val lb = layoutCards(cards, smallTop, Config.gapDp * d, (n - Config.stack3Min).coerceAtLeast(1),
             Config.bands3, limit, Config.peek3Dp * d, minPeek)
-
-        val rl = IntArray(2)
-        if (root != null) root.getLocationOnScreen(rl)
-        val bandAlpha = (sv.alpha * 255f).toInt().coerceIn(0, 255)
-        val bandList = ArrayList<BandsView.Band>()
 
         // info untuk debug: logcat | grep IOSLock
         val sb = StringBuilder("n=$n q=${"%.2f".format(q)}")
@@ -702,9 +654,7 @@ class MainHook : IXposedHookLoadPackage {
             val h = card.height.toFloat()
             val naturalCenter = loc[1] + baseY + h / 2f
 
-            val ka = la[i][2]
-            val kb = lb[i][2]
-            val kind = if (q < 0.5f) ka else kb
+            val kind = if (q < 0.5f) la[i][2] else lb[i][2]
             val center = la[i][0] + (lb[i][0] - la[i][0]) * q
             val s = la[i][1] + (lb[i][1] - la[i][1]) * q
             sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind.toInt())
@@ -722,30 +672,7 @@ class MainHook : IXposedHookLoadPackage {
             card.scaleY = s
             card.clipBounds = null
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz)
-
-            if (kind == 0f) {
-                if (hiddenByUs.remove(card) != null) card.alpha = 1f
-            } else {
-                // pita: ambil gambar kartu dulu (selagi masih tampil), baru sembunyikan kartu aslinya
-                val sn = if (kind == 1f) snapOf(card) else null
-                card.alpha = 0f
-                hiddenByUs[card] = true
-                if (kind == 1f && sn != null && !blocked && root != null) {
-                    val pk = if (ka == 1f && kb == 1f) la[i][3] + (lb[i][3] - la[i][3]) * q
-                        else if (q < 0.5f) la[i][3] else lb[i][3]
-                    val cx = loc[0] + card.left + card.width / 2f
-                    val bottom = center + slide + h * s / 2f
-                    val bw = card.width * s
-                    val dst = RectF(cx - bw / 2f - rl[0], bottom - pk - rl[1], cx + bw / 2f - rl[0], bottom - rl[1])
-                    val srcH = (pk / s).toInt().coerceIn(1, sn.bmp.height)
-                    val src = android.graphics.Rect(0, sn.bmp.height - srcH, sn.bmp.width, sn.bmp.height)
-                    bandList.add(BandsView.Band(sn.bmp, src, dst, bandAlpha, sn.time))
-                }
-            }
         }
-        // pita paling belakang digambar lebih dulu
-        bandList.reverse()
-        bv?.setBands(bandList)
         logT("cards", sb.toString())
     }
 
@@ -821,7 +748,6 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun hideLabels() {
-        bandsView?.setBands(emptyList())
         labelCenter?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
         labelCount?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
     }
@@ -830,10 +756,6 @@ class MainHook : IXposedHookLoadPackage {
         restoreGear(ctx)
         hideLabels()
         restoreClip()
-        for (k in hiddenByUs.keys.toList()) k.alpha = 1f
-        hiddenByUs.clear()
-        snaps.clear()
-        bandsView?.setBands(emptyList())
         if (sv == null) return
         sv.alpha = 1f
         sv.visibility = View.VISIBLE
@@ -898,43 +820,3 @@ class MainHook : IXposedHookLoadPackage {
     }
 }
 
-// Gambar terakhir sebuah kartu
-private class Snap(val bmp: Bitmap, val time: Long)
-
-// View penuh layar yang menggambar pita tumpukan (bagian bawah kartu di belakang kartu depan).
-private class BandsView(ctx: Context) : View(ctx) {
-    class Band(val bmp: Bitmap, val src: android.graphics.Rect, val dst: RectF, val alpha: Int, val stamp: Long) {
-        fun same(o: Band): Boolean = bmp === o.bmp && stamp == o.stamp && alpha == o.alpha &&
-            dst == o.dst && src == o.src
-    }
-
-    private var bands: List<Band> = emptyList()
-    var radius = 0f
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val shade = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x40000000 }
-    private val path = Path()
-    private val radii = FloatArray(8)
-
-    fun setBands(b: List<Band>) {
-        var same = b.size == bands.size
-        if (same) for (i in b.indices) if (!b[i].same(bands[i])) { same = false; break }
-        if (same) return
-        bands = b
-        invalidate()
-    }
-
-    override fun onDraw(c: Canvas) {
-        for (b in bands) {
-            c.save()
-            path.reset()
-            radii[4] = radius; radii[5] = radius; radii[6] = radius; radii[7] = radius
-            path.addRoundRect(b.dst, radii, Path.Direction.CW)
-            c.clipPath(path)
-            paint.alpha = b.alpha
-            c.drawBitmap(b.bmp, b.src, b.dst, paint)
-            shade.alpha = (0x40 * b.alpha) / 255
-            c.drawRect(b.dst, shade)
-            c.restore()
-        }
-    }
-}
