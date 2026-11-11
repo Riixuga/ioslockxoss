@@ -96,7 +96,8 @@ object Config {
     // keadaan 2 -> 3: kartu ke-4 dan seterusnya tetap di posisi awal sampai kartu di depannya
     // mencapai lockAt (0..1 dari gerakan kartu itu). Makin kecil = makin cepat kartu berikutnya ikut bergerak.
     val lockAt: Float get() = prop("debug.ioslock.lockat").toFloatOrNull() ?: 0.5f
-    // keadaan 2: jumlah kartu penuh (kartu depan). Kartu sisanya menumpuk di belakang kartu penuh terakhir seperti dock stage 3.
+    // keadaan 2: jumlah kartu penuh (kartu depan), ini batas maksimum; kalau tidak muat sampai garis (mis. ada
+    // media player) jumlahnya dikurangi otomatis. Kartu sisanya menumpuk di belakang kartu penuh terakhir seperti dock stage 3.
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 3
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir (dipakai kalau dockstack2 0)
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
@@ -108,15 +109,10 @@ object Config {
     // keadaan 2: mode dock (kartu di belakang kartu penuh menumpuk seperti stage 3). Default nyala.
     // Matikan dengan: setprop debug.ioslock.dockstack2 0
     val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") != "0"
-    // keadaan 2 mode dock: kalau kartu penuh kurang muat, jarak antar kartu boleh negatif sampai sekian dp
-    // (kartu menumpuk sedikit di belakang kartu di depannya). Lebih dari ini = tumpukan 100%/95%/90% (tightStack).
+    // keadaan 2: kalau kartu penuh kurang muat, jarak antar kartu boleh negatif sampai sekian dp (kartu menumpuk
+    // sedikit di belakang kartu di depannya). Kalau masih kurang, jumlah kartu penuh dikurangi: kartu di bawahnya
+    // menumpuk sebagai S, sama seperti notifikasi lain (mis. kalau kartu depan adalah media player yang tinggi).
     val overlap2Dp: Float get() = prop("debug.ioslock.overlap2dp").toFloatOrNull() ?: 12f
-    // keadaan 2 saat kartu penuh tidak muat sampai garis (mis. kartu depan media player yang tinggi):
-    // hanya kartu depan tampil penuh (100%), kartu di belakangnya menumpuk sebagai pita dengan skala
-    // turun tiap kartu (tightStep 0.05 = 95%, 90%), kartu sisanya (S) menumpuk tipis di bawah pita terakhir.
-    // Matikan dengan: setprop debug.ioslock.tightstack 0
-    val tightStack: Boolean get() = prop("debug.ioslock.tightstack") != "0"
-    val tightScaleStep: Float get() = prop("debug.ioslock.tightstep").toFloatOrNull() ?: 0.05f
     // keadaan 3: semua kartu tampil penuh dengan jarak kecil gap3Dp; bagian atas dipotong dengan fade.
     // Kartu yang tidak muat di bawah (batas listBottomFrac) tetap kecil dan menumpuk setebal dockDp,
     // lalu membesar saat daftar di-swipe naik. dockScale = pengecilan skala maksimum kartu di tumpukan bawah,
@@ -260,7 +256,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.35 loaded into SystemUI")
+        log("v0.36 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -922,7 +918,7 @@ class MainHook : IXposedHookLoadPackage {
     // Kartu penuh TIDAK pernah dinaikkan: posisi atasnya tetap di top. Kalau totalnya lebih tinggi dari ruang
     // yang tersedia (sampai limit, dikurangi minDock), jarak antar kartu penuh dikecilkan; kalau masih kurang,
     // jaraknya boleh negatif sampai overlapMax (kartu menumpuk sedikit di belakang kartu di depannya).
-    // Kalau masih kurang juga, applyStack memakai layoutFrontStack.
+    // Kalau masih kurang juga, applyStack mengurangi jumlah kartu penuh (full), jadi kartu di bawahnya jadi S.
     // frontScale: skala kartu penuh terakhir (di depan tumpukan), hanya kalau memang ada kartu di belakangnya.
     private fun layoutDockStack(
         hs: FloatArray, top: Float, gap: Float, full: Int,
@@ -962,43 +958,6 @@ class MainHook : IXposedHookLoadPackage {
         for (i in 0 until k) sum += hs[i]
         val avail = limit - (if (n > k) minDock else 0f) - top
         return if (k > 1) (avail - sum) / (k - 1) >= -overlapMax else sum <= avail
-    }
-
-    // Tata letak keadaan 2 saat kartu penuh benar-benar tidak muat (kartu depan tinggi, mis. media player):
-    // kartu 1 penuh (100%), kartu 2..full menumpuk di belakangnya sebagai pita yang mengintip di bawahnya
-    // (skala 1 - scaleStep * m, mis. 95% dan 90%), kartu sisanya (S) menumpuk tipis di bawah pita terakhir.
-    // Tepi bawah kartu paling bawah = limit (garis yang sama dengan keadaan 3).
-    private fun layoutFrontStack(
-        hs: FloatArray, top: Float, gap: Float, full: Int,
-        limit: Float, ref: Float, dScale: Float,
-        minPeek: Float, maxFrac: Float, scaleStep: Float, decay: Float
-    ): StateLayout {
-        val n = hs.size
-        val out = StateLayout(n)
-        val front = top + hs[0]
-        out.bottom[0] = front
-        out.scale[0] = 1f
-        out.kind[0] = 0
-        if (n == 1) return out
-
-        val nPeek = min((full - 1).coerceAtLeast(1), n - 1)
-        val hasS = n > 1 + nPeek
-        val reserve = if (hasS) minPeek else 0f
-
-        // tebal pita: dipaskan ke ruang yang ada, tapi tidak lebih tebal dari maxFrac * tinggi kartu pita
-        // (supaya tetap menumpuk di belakang kartu depan, tanpa celah); sisa ruang diisi tumpukan S
-        var minH = Float.MAX_VALUE
-        for (i in 1..nPeek) minH = min(minH, hs[i])
-        val room = (limit - front - reserve).coerceAtLeast(0f)
-        val peek = min(maxFrac * minH, room / bandOffset(nPeek, 1f, decay)).coerceAtLeast(minPeek)
-
-        for (m in 1..nPeek) {
-            out.bottom[m] = front + bandOffset(m, peek, decay)
-            out.scale[m] = 1f - scaleStep * m
-            out.kind[m] = 1
-        }
-        placeDock(out, nPeek + 1, out.bottom[nPeek], out.scale[nPeek], hs, gap, limit, minPeek, ref, dScale)
-        return out
     }
 
     // Seberapa jauh kartu ke-i sudah keluar dari titik asal pada kemajuan a (0..1) animasi buka tumpukan:
@@ -1097,8 +1056,9 @@ class MainHook : IXposedHookLoadPackage {
     // Keadaan 2 (q=0): kartu penuh sebanyak full2, sisanya menumpuk di belakang kartu penuh terakhir
     // seperti dock keadaan 3 (dockStack2). Kalau dockStack2 mati, kartu di belakang jadi pita (layoutState).
     // Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
-    // Kalau kartu penuh tidak muat sampai garis (mis. kartu depan media player), pakai layoutFrontStack:
-    // kartu 1 = 100%, kartu 2 = 95%, kartu 3 = 90% menumpuk di belakangnya, kartu 4+ = S (tumpukan kecil).
+    // Kalau kartu penuh tidak muat sampai garis (mis. kartu depan media player), jumlah kartu penuh dikurangi dan
+    // kartu di bawahnya menumpuk sebagai S, sama seperti notifikasi lain. Kartu paling bawah selalu tepat di garis
+    // bawah yang sama dengan keadaan 3.
     // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil; atas dipotong di garis dengan fade. Kartu yang melewati batas bawah
     // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
     // Wallpaper digelapkan sedikit saat masuk keadaan 3.
@@ -1160,24 +1120,17 @@ class MainHook : IXposedHookLoadPackage {
             list2 != null -> list2
             // keadaan 2 gaya dock: kartu penuh sebanyak full2, sisanya menumpuk di belakang kartu penuh terakhir
             Config.dockStack2 -> {
-                val full = min(Config.full2.coerceAtLeast(1), n)
                 val refPx = (Config.dockRefDp * d).coerceAtLeast(1f)
                 val dScale = Config.dockScale.coerceIn(0f, 0.3f)
                 val overlapPx = Config.overlap2Dp * d
-                if (Config.tightStack && n > 1 && !dockFits(hs, restTop, full, bottom2, minPeek, overlapPx)) {
-                    // kartu penuh benar-benar tidak muat (mis. media player): 100% / 95% / 90% lalu S
-                    layoutFrontStack(
-                        hs, restTop, Config.gap2Dp * d, full, bottom2, refPx, dScale,
-                        minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f),
-                        Config.tightScaleStep.coerceIn(0f, 0.15f), decay
-                    )
-                } else {
-                    // kartu penuh muat: 100% semua + tumpukan S tipis, kartu paling bawah tepat di garis bawah
-                    layoutDockStack(
-                        hs, restTop, Config.gap2Dp * d, full, bottom2, refPx, dScale,
-                        Config.front2Scale.coerceIn(1f, 1.2f), minPeek, overlapPx
-                    )
-                }
+                // jumlah kartu penuh = sebanyak yang muat sampai garis (maksimal full2). Kalau kartu depan tinggi
+                // (mis. media player), kartu penuh berkurang dan kartu di bawahnya menumpuk sebagai S seperti biasa.
+                var full = min(Config.full2.coerceAtLeast(1), n)
+                while (full > 1 && !dockFits(hs, restTop, full, bottom2, minPeek, overlapPx)) full--
+                layoutDockStack(
+                    hs, restTop, Config.gap2Dp * d, full, bottom2, refPx, dScale,
+                    Config.front2Scale.coerceIn(1f, 1.2f), minPeek, overlapPx
+                )
             }
             else -> layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
                 minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
