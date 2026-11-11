@@ -25,6 +25,7 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -35,6 +36,7 @@ import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
@@ -80,38 +82,43 @@ object Config {
     // lebih tinggi dari ini, misalnya hanya 1-2 notifikasi). openStagger = seberapa bergantian (0 = serentak, maks 0.8)
     val originFrac: Float get() = prop("debug.ioslock.originfrac").toFloatOrNull() ?: 0.855f
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
+    // skala awal kartu saat tumpukan dibuka (kecil, di garis asal), lalu membesar ke ukuran keadaan 2
+    val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.55f
     // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
-    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 4
+    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
     // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan (semua kartu tampil penuh, jarak gap2Dp)
     val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 3
     val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
-    // keadaan 3: tumpukan bertingkat tanpa celah dengan jarak SERAGAM antar kartu.
-    // Jarak kartu 1 -> kartu 2 (A ke B) dipakai untuk semua kartu berikutnya.
-    // cascadeMax = jumlah kartu yang terlihat (sisanya bersembunyi di belakang yang terakhir)
-    // cascadeCap = jarak A ke B sebagai bagian dari tinggi kartu ke-2 (1 = penuh). Kalau tumpukan tidak muat
-    //   sampai batas bawah (listBottomFrac), daftar bisa digulir (swipe naik atau seret slider di kanan).
-    // scale3Step = pengecilan skala tiap tingkat, overlapDp = tumpang tindih minimal antar kartu (tidak pernah ada celah)
-    val cascadeMax: Int get() = prop("debug.ioslock.cascademax").toIntOrNull() ?: 99
-    val cascadeCap: Float get() = prop("debug.ioslock.cascadecap").toFloatOrNull() ?: 0.6f
-    val scale3Step: Float get() = prop("debug.ioslock.scale3step").toFloatOrNull() ?: 0.03f
-    val overlapDp: Float get() = prop("debug.ioslock.overlapdp").toFloatOrNull() ?: 8f
-    // keadaan 3: kalau jumlah kartu <= noStack3, tumpukan dihilangkan (semua kartu tampil penuh, jarak gap3Dp)
-    val noStack3: Int get() = prop("debug.ioslock.nostack3").toIntOrNull() ?: 5
+    // keadaan 3: semua kartu tampil penuh (tidak dipotong) dengan jarak kecil gap3Dp.
+    // Kartu yang tidak muat di bawah (batas listBottomFrac) tetap kecil dan menumpuk setebal dockDp,
+    // lalu membesar saat daftar di-swipe naik. dockScale = pengecilan skala maksimum kartu di tumpukan bawah,
+    // dockRefDp = seberapa jauh kartu di bawah batas sampai skalanya mencapai pengecilan maksimum.
     val gap3Dp: Float get() = prop("debug.ioslock.gap3dp").toFloatOrNull() ?: 8f
+    val dockDp: Float get() = prop("debug.ioslock.dockdp").toFloatOrNull() ?: 30f
+    val dockScale: Float get() = prop("debug.ioslock.dockscale").toFloatOrNull() ?: 0.12f
+    val dockRefDp: Float get() = prop("debug.ioslock.dockrefdp").toFloatOrNull() ?: 240f
     // buka batas jumlah notifikasi yang ditampilkan sistem di lockscreen (matikan: setprop debug.ioslock.unlimit 0)
     val unlimit: Boolean get() = prop("debug.ioslock.unlimit") != "0"
-    // slider scroll di tepi kanan keadaan 3: lebar dan jarak dari tepi kanan (dp)
+    // slider scroll keadaan 3: lebar (dp), tampil/hilang (ms). Posisinya otomatis di tengah celah tepi layar dan kartu.
     val sliderDp: Float get() = prop("debug.ioslock.sliderdp").toFloatOrNull() ?: 4f
-    val sliderRightDp: Float get() = prop("debug.ioslock.sliderrightdp").toFloatOrNull() ?: 10f
+    val sliderHideMs: Long get() = prop("debug.ioslock.sliderhidems").toLongOrNull() ?: 900L
+    val sliderFadeInMs: Long get() = prop("debug.ioslock.sliderfadein").toLongOrNull() ?: 150L
+    val sliderFadeOutMs: Long get() = prop("debug.ioslock.sliderfadeout").toLongOrNull() ?: 350L
+    // jam saat daftar keadaan 3 di-swipe naik: mengecil sedikit dan naik dengan efek bounce.
+    // clockId = nama id view jam kalau pencarian otomatis salah (lihat logcat "clockScan")
+    val clockBounce: Boolean get() = prop("debug.ioslock.clockbounce") != "0"
+    val clockShrink: Float get() = prop("debug.ioslock.clockshrink").toFloatOrNull() ?: 0.12f
+    val clockUpDp: Float get() = prop("debug.ioslock.clockupdp").toFloatOrNull() ?: 36f
+    val clockId: String get() = prop("debug.ioslock.clockid")
     // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
     // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
     val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
     // tiap pita tumpukan lebih tipis dari pita di depannya (1 = sama tebal),
     // dan pengecilan skala tiap pita (0.05 = 5% per pita)
-    val bandDecay: Float get() = prop("debug.ioslock.banddecay").toFloatOrNull() ?: 0.8f
-    val scaleStep: Float get() = prop("debug.ioslock.scalestep").toFloatOrNull() ?: 0.05f
+    val bandDecay: Float get() = prop("debug.ioslock.banddecay").toFloatOrNull() ?: 0.85f
+    val scaleStep: Float get() = prop("debug.ioslock.scalestep").toFloatOrNull() ?: 0.035f
     // posisi teks "N Notifications", dan apakah tetap tampil saat kartu muncul
     val countFrac: Float get() = prop("debug.ioslock.countfrac").toFloatOrNull() ?: 0.845f
     val countAlways: Boolean get() = prop("debug.ioslock.countalways") == "1"
@@ -186,11 +193,23 @@ class MainHook : IXposedHookLoadPackage {
     private var sliderTrackTop = 0f
     private var sliderTrackH = 0f
     private var sliderThumbH = 0f
+    private var sliderOn = false
+    @Volatile private var sliderPoke = false
+    private var lastScrollSeen = 0f
+    private val sliderHideRunnable = Runnable { fadeSlider(false) }
+
+    // jam (view jam di lockscreen): mengecil dan naik dengan bounce saat daftar di-scroll
+    private var clockRef: WeakReference<View>? = null
+    private var clockApplied = false
+    private val clockOrig = FloatArray(5)
+    private var clockAnim: ValueAnimator? = null
+    private var clockWant = false
+    @Volatile private var clockProg = 0f
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.22 loaded into SystemUI")
+        log("v0.23 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -303,6 +322,7 @@ class MainHook : IXposedHookLoadPackage {
                                 scrollY = 0f
                                 bouncerHook = false
                                 lastGearWritten = null
+                                restoreClock()
                                 hideLabels()
                             }
                             Intent.ACTION_SCREEN_ON -> {
@@ -497,7 +517,7 @@ class MainHook : IXposedHookLoadPackage {
         // slider di tepi kanan (keadaan 3): seret untuk menggulir daftar
         if (a == MotionEvent.ACTION_DOWN) {
             val dd = dm.density
-            sliderDrag = sliderShown && ev.rawX >= dm.widthPixels - 40f * dd &&
+            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 40f * dd &&
                 ev.rawY >= sliderTrackTop - 16f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * dd
             if (sliderDrag) {
                 animator?.cancel()
@@ -565,6 +585,7 @@ class MainHook : IXposedHookLoadPackage {
                     val dist = progressToDist(baseProgress) + baseScroll / dm.density + moved
                     progress = distToProgress(min(dist, l12).coerceAtLeast(0f)).coerceIn(0f, 2f)
                     scrollY = ((dist - l12) * dm.density).coerceIn(0f, scrollMaxPx)
+                    if (scrollMaxPx > 2f && progress >= 1.99f) sliderPoke = true
                     applyState()
                     logT("progress", "p=$progress")
                 }
@@ -734,43 +755,6 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
-    // Tata letak keadaan 3 (kartu banyak): tumpukan bertingkat tanpa celah dengan jarak SERAGAM.
-    // Kartu 0 tampil penuh. Tiap kartu di bawahnya berada di belakang kartu di atasnya, dan jarak tepi bawah
-    // antar kartu sama dengan jarak kartu A -> kartu B (step = tinggi kartu ke-2 * capBase, dengan tumpang
-    // tindih minimal overlapMin). Semua kartu ikut tampil; kalau tidak muat, daftar digulir (lihat applyStack).
-    private fun layoutCascade(
-        hs: FloatArray, top: Float, minPeek: Float, overlapMin: Float,
-        maxVisible: Int, capBase: Float, scaleStep: Float
-    ): StateLayout {
-        val n = hs.size
-        val out = StateLayout(n)
-        fun sc(i: Int): Float = 1f - scaleStep * min(i, 4)
-        out.bottom[0] = top + hs[0]
-        out.scale[0] = 1f
-        out.kind[0] = 0
-        if (n == 1) return out
-
-        fun lo(i: Int): Float = min(minPeek, hs[i] * sc(i))
-        // jarak A -> B: dipakai untuk semua kartu (dibatasi tinggi kartu itu sendiri, supaya tidak ada celah)
-        val step = max(min(hs[1] * sc(1) * capBase, hs[1] * sc(1) - overlapMin), lo(1))
-        fun t(i: Int): Float = max(min(step, hs[i] * sc(i) - overlapMin), lo(i))
-
-        val m = min(n, max(maxVisible, 1))
-        for (i in 1 until n) {
-            if (i < m) {
-                out.bottom[i] = out.bottom[i - 1] + t(i)
-                out.scale[i] = sc(i)
-                out.kind[i] = 1
-            } else {
-                // kartu yang tidak terlihat bersembunyi di belakang kartu terakhir yang terlihat
-                out.bottom[i] = out.bottom[m - 1]
-                out.scale[i] = sc(m)
-                out.kind[i] = 2
-            }
-        }
-        return out
-    }
-
     // Seberapa jauh kartu ke-i sudah keluar dari titik asal pada kemajuan a (0..1) animasi buka tumpukan:
     // kartu depan keluar lebih dulu, kartu di belakangnya menyusul, kartu terakhir paling akhir.
     private fun openProgress(i: Int, n: Int, a: Float, lag: Float): Float {
@@ -819,7 +803,7 @@ class MainHook : IXposedHookLoadPackage {
         }
         if (a < 1f) {
             // di titik asal semua kartu sekecil pita terakhir; makin keluar makin besar
-            val sO = min(la.scale[n - 1], 0.9f)
+            val sO = Config.openScale.coerceIn(0.2f, 1f)
             for (i in 0 until n) {
                 val ea = openProgress(i, n, a, openStagger)
                 outBottom[i] = origin + (outBottom[i] - origin) * ea
@@ -843,14 +827,14 @@ class MainHook : IXposedHookLoadPackage {
         })
     }
 
-    // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari dasar tumpukan (kartu depan dulu)
+    // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari titik asal (garis bawah) sambil
+    //    membesar dari kecil (openScale) ke ukuran keadaan 2
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): kartu <= noStack2 = semua kartu penuh (tanpa tumpukan); selain itu kartu depan penuh dan
-    // sampai 4 pita di belakangnya (maks 5 kartu), dasar pita terakhir tepat di bottom2Frac (garis merah).
-    // Keadaan 3 (q=1): kartu <= noStack3 = semua kartu penuh dengan jarak kecil; selain itu tumpukan bertingkat
-    // dengan jarak seragam seperti kartu A ke B. Kalau tidak muat sampai listBottomFrac, daftar digulir
-    // (swipe naik atau seret slider di kanan) dan kartu dipotong di batas atas dan bawah daftar.
-    // Kartu yang menumpuk adalah kartu asli: digeser ke belakang kartu di atasnya dan diperkecil.
+    // Keadaan 2 (q=0): kartu depan penuh dan maks 2 pita di belakangnya (total 3 kartu), dasar pita terakhir
+    // tepat di bottom2Frac (garis merah). Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
+    // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil, tidak dipotong. Kartu yang melewati batas bawah
+    // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
+    // Saat di-scroll, label "Notification Center" ikut bergeser bersama kartu teratas, jam mengecil dan naik (bounce).
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -877,12 +861,14 @@ class MainHook : IXposedHookLoadPackage {
         val restTop = dm.heightPixels * Config.restFrac
         val smallTop = dm.heightPixels * Config.smallFrac
         val targetTop = restTop + (smallTop - restTop) * q
+        val count = notifCount(g)
 
-        updateLabels(sv, a, targetTop, notifCount(g))
         if (n == 0) {
             scrollMaxPx = 0f
             scrollY = 0f
+            updateLabels(sv, a, targetTop, count)
             hideSlider()
+            updateClock(sv, false)
             return
         }
 
@@ -903,21 +889,16 @@ class MainHook : IXposedHookLoadPackage {
         val la = list2 ?: layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
             minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
 
-        // keadaan 3: tanpa tumpukan kalau kartunya sedikit, selain itu bertingkat dengan jarak seragam
-        val lb = if (n <= Config.noStack3) {
-            layoutList(hs, smallTop, Config.gap3Dp * d)
-        } else {
-            layoutCascade(hs, smallTop, minPeek, Config.overlapDp * d, Config.cascadeMax,
-                Config.cascadeCap.coerceIn(0.2f, 1f), Config.scale3Step.coerceIn(0f, 0.08f))
-        }
+        // keadaan 3: semua kartu penuh berurutan dengan jarak kecil
+        val lb = layoutList(hs, smallTop, Config.gap3Dp * d)
 
         // jarak gulir maksimum keadaan 3: isi daftar yang melewati batas bawah
-        var contentBottom = 0f
-        for (i in 0 until n) contentBottom = max(contentBottom, lb.bottom[i])
-        scrollMaxPx = max(0f, contentBottom - limit)
+        scrollMaxPx = max(0f, lb.bottom[n - 1] - limit)
         if (q < 0.999f) scrollY = 0f
         scrollY = scrollY.coerceIn(0f, scrollMaxPx)
         val scroll = scrollY
+
+        updateLabels(sv, a, targetTop - scroll, count)
 
         // titik asal animasi buka: dasar tumpukan keadaan 2, minimal originFrac (garis merah)
         var origin = dm.heightPixels * Config.originFrac
@@ -927,19 +908,43 @@ class MainHook : IXposedHookLoadPackage {
         val scales = FloatArray(n)
         composeStack(la, lb, a, q, Config.stagger, Config.openStagger, origin, bottoms, scales)
 
+        // gulir + "dock": kartu yang melewati batas bawah tetap kecil dan menumpuk setebal dock.
+        // Makin dekat ujung gulir, dock makin tipis, sehingga di ujung kartu terakhir tampil penuh di batas bawah.
+        val dock = if (scrollMaxPx > 0f) min(Config.dockDp * d, scrollMaxPx - scroll) else 0f
+        val fullLimit = limit - dock
+        val ref = (Config.dockRefDp * d).coerceAtLeast(1f)
+        val dScale = Config.dockScale.coerceIn(0f, 0.3f)
+        for (i in 0 until n) {
+            var b = bottoms[i] - scroll
+            var sc = scales[i]
+            if (q > 0f && scrollMaxPx > 0f) {
+                val o = b - fullLimit
+                if (o > 0f) {
+                    val nb = if (dock < 1f) fullLimit else fullLimit + dock * (1f - exp(-o / (dock * 1.3f)))
+                    val ns = sc * (1f - dScale * min(1f, o / ref))
+                    b += (nb - b) * q
+                    sc += (ns - sc) * q
+                }
+            }
+            bottoms[i] = b
+            scales[i] = sc
+        }
+
         // info untuk debug: logcat | grep IOSLock
         val sb = StringBuilder("n=$n q=${"%.2f".format(q)} scroll=${scroll.toInt()}/${scrollMaxPx.toInt()}")
 
+        var rightEdge = 0f
         for (i in 0 until n) {
             val card = cards[i].first
             val baseY = cards[i].second
             val baseZ = baseOfZ(card)
             val h = hs[i]
             val naturalCenter = loc[1] + baseY + h / 2f
+            rightEdge = max(rightEdge, (loc[0] + card.right).toFloat())
 
             val kind = if (q < 0.5f) la.kind[i] else lb.kind[i]
             val s = scales[i]
-            val center = bottoms[i] - scroll - h * s / 2f
+            val center = bottoms[i] - h * s / 2f
             sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind)
                 .append(" h=").append(card.height).append("/").append(h.toInt()).append("]")
 
@@ -953,25 +958,19 @@ class MainHook : IXposedHookLoadPackage {
             card.translationZ = wz
             card.scaleX = s
             card.scaleY = s
-
-            // potong kartu di luar area daftar (atas = awal daftar, bawah = batas bawah) saat menuju/di keadaan 3
-            if (q > 0f) {
-                val cs = center + slide
-                val y0 = h / 2f + (targetTop - cs) / s
-                val y1 = h / 2f + (limit - cs) / s
-                val iy0 = max(0f, y0).toInt()
-                val iy1 = min(card.height.toFloat(), y1).toInt()
-                card.clipBounds = when {
-                    iy0 <= 0 && iy1 >= card.height -> null
-                    iy1 > iy0 -> Rect(0, iy0, card.width, iy1)
-                    else -> Rect(0, 0, 0, 0)
-                }
-            } else {
-                card.clipBounds = null
-            }
+            card.clipBounds = null
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz)
         }
-        updateSlider(sv, q, smallTop, limit)
+
+        // slider: tepat di tengah celah antara tepi kartu dan tepi layar
+        val gapCenter = if (rightEdge > 0f && rightEdge < dm.widthPixels - 8f * d) {
+            (rightEdge + dm.widthPixels) / 2f
+        } else dm.widthPixels - 6f * d
+
+        // jam: mengecil dan naik (bounce) begitu daftar mulai di-scroll, kembali saat scroll 0
+        val clockOn = q >= 0.999f && scroll > (if (clockWant) 3f else 10f) * d
+        updateClock(sv, clockOn)
+        updateSlider(sv, q, smallTop, limit, gapCenter)
         logT("cards", sb.toString())
     }
 
@@ -1054,9 +1053,9 @@ class MainHook : IXposedHookLoadPackage {
 
     // ---- slider scroll (tepi kanan, keadaan 3) ----
 
+    // hanya bagian putih (thumb); trek abu-abu dihilangkan
     private class SliderView(ctx: Context) : View(ctx) {
-        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(70, 255, 255, 255) }
-        private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(210, 255, 255, 255) }
+        private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
         private var thumbTop = 0f
         private var thumbH = 0f
 
@@ -1071,7 +1070,6 @@ class MainHook : IXposedHookLoadPackage {
         override fun onDraw(canvas: Canvas) {
             val w = width.toFloat()
             val r = w / 2f
-            canvas.drawRoundRect(0f, 0f, w, height.toFloat(), r, r, trackPaint)
             canvas.drawRoundRect(0f, thumbTop, w, thumbTop + thumbH, r, r, thumbPaint)
         }
     }
@@ -1087,19 +1085,51 @@ class MainHook : IXposedHookLoadPackage {
         val d = root.resources.displayMetrics.density
         root.addView(sv, ViewGroup.LayoutParams(max(2, (Config.sliderDp * d).toInt()), (200f * d).toInt()))
         slider = sv
+        sliderOn = false
     }
 
+    // sembunyikan seketika (keluar dari keadaan 3, layar mati, dll)
     private fun hideSlider() {
-        slider?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
-        sliderShown = false
+        val s = slider
+        sliderOn = false
+        if (s == null) return
+        s.removeCallbacks(sliderHideRunnable)
+        s.animate().cancel()
+        s.alpha = 0f
+        s.visibility = View.INVISIBLE
     }
 
-    private fun updateSlider(sv: View, q: Float, top: Float, bottom: Float) {
+    // fade in / fade out
+    private fun fadeSlider(on: Boolean) {
+        val s = slider ?: return
+        if (on == sliderOn) return
+        sliderOn = on
+        s.animate().cancel()
+        if (on) {
+            s.visibility = View.VISIBLE
+            s.animate().alpha(1f).setDuration(Config.sliderFadeInMs).start()
+        } else {
+            s.animate().alpha(0f).setDuration(Config.sliderFadeOutMs).withEndAction {
+                if (!sliderOn) s.visibility = View.INVISIBLE
+            }.start()
+        }
+    }
+
+    // dipicu saat daftar bergerak: tampil, lalu hilang lagi setelah sliderHideMs tanpa gerakan
+    private fun pokeSlider(s: View) {
+        s.removeCallbacks(sliderHideRunnable)
+        fadeSlider(true)
+        s.postDelayed(sliderHideRunnable, Config.sliderHideMs)
+    }
+
+    private fun updateSlider(sv: View, q: Float, top: Float, bottom: Float, centerX: Float) {
         val root = sv.rootView as? ViewGroup ?: return
         ensureSlider(root)
         val s = slider ?: return
         if (q < 0.999f || scrollMaxPx < 2f || labelsBlocked(root)) {
             hideSlider()
+            lastScrollSeen = scrollY
+            sliderPoke = false
             return
         }
         val dm = root.resources.displayMetrics
@@ -1121,16 +1151,19 @@ class MainHook : IXposedHookLoadPackage {
             lp.height = h
             s.requestLayout()
         }
-        s.translationX = dm.widthPixels - rl[0] - Config.sliderRightDp * d - w
+        s.translationX = centerX - rl[0] - w / 2f
         s.translationY = trackTop - rl[1]
-        s.setThumb(thumbTop, thumbH)
-        s.visibility = View.VISIBLE
-        s.alpha = 1f
+        (s as SliderView).setThumb(thumbTop, thumbH)
 
         sliderTrackTop = trackTop
         sliderTrackH = trackH
         sliderThumbH = thumbH
-        sliderShown = true
+
+        if (sliderPoke || abs(scrollY - lastScrollSeen) > 0.5f) {
+            sliderPoke = false
+            pokeSlider(s)
+        }
+        lastScrollSeen = scrollY
     }
 
     // seret slider: posisi jari menentukan posisi gulir daftar
@@ -1138,12 +1171,104 @@ class MainHook : IXposedHookLoadPackage {
         val range = (sliderTrackH - sliderThumbH).coerceAtLeast(1f)
         val frac = ((y - sliderTrackTop - sliderThumbH / 2f) / range).coerceIn(0f, 1f)
         scrollY = frac * scrollMaxPx
+        sliderPoke = true
         applyState()
+    }
+
+    // ---- jam: mengecil dan naik dengan bounce saat daftar di-scroll ----
+
+    private fun collectClock(v: View, depth: Int, out: MutableList<View>, want: String) {
+        if (depth > 16 || out.size > 40) return
+        val dm = v.resources.displayMetrics
+        val id = idName(v)
+        val hit = if (want.isNotEmpty()) id == want
+        else v.javaClass.name.contains("Clock") || id.contains("clock", true)
+        if (hit && v.isShown && v.width > 0 && v.height > 100f * dm.density &&
+            v.height < dm.heightPixels * 0.6f) out.add(v)
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) collectClock(v.getChildAt(i), depth + 1, out, want)
+        }
+    }
+
+    // cari view jam. Kalau salah pilih: lihat logcat "clockScan", lalu setprop debug.ioslock.clockid <nama id>
+    private fun findClock(root: View) {
+        val cur = clockRef?.get()
+        if (cur != null && cur.isAttachedToWindow) return
+        val want = Config.clockId
+        val found = ArrayList<View>()
+        collectClock(root.rootView, 0, found, want)
+        val pick = if (want.isNotEmpty()) found.firstOrNull()
+        else found.maxByOrNull { it.width.toLong() * it.height }
+        if (pick != null) clockRef = WeakReference(pick)
+        logT("clockScan", "pick=" + (pick?.let { it.javaClass.name + "#" + idName(it) + " " + it.width + "x" + it.height } ?: "none") +
+            " candidates=" + found.take(8).joinToString { it.javaClass.simpleName + "#" + idName(it) + " " + it.width + "x" + it.height },
+            discrete = true)
+    }
+
+    private fun applyClock() {
+        val v = clockRef?.get() ?: return
+        if (!clockApplied) {
+            clockOrig[0] = v.scaleX
+            clockOrig[1] = v.scaleY
+            clockOrig[2] = v.translationY
+            clockOrig[3] = v.pivotX
+            clockOrig[4] = v.pivotY
+            clockApplied = true
+        }
+        val d = v.resources.displayMetrics.density
+        val p = clockProg
+        v.pivotX = v.width / 2f
+        v.pivotY = 0f
+        val sc = 1f - Config.clockShrink * p
+        v.scaleX = clockOrig[0] * sc
+        v.scaleY = clockOrig[1] * sc
+        v.translationY = clockOrig[2] - Config.clockUpDp * d * p
+    }
+
+    private fun restoreClock() {
+        clockAnim?.let { it.removeAllListeners(); it.cancel() }
+        clockAnim = null
+        clockWant = false
+        clockProg = 0f
+        if (clockApplied) {
+            val v = clockRef?.get()
+            if (v != null) {
+                v.scaleX = clockOrig[0]
+                v.scaleY = clockOrig[1]
+                v.translationY = clockOrig[2]
+                v.pivotX = clockOrig[3]
+                v.pivotY = clockOrig[4]
+            }
+            clockApplied = false
+        }
+    }
+
+    private fun updateClock(sv: View, want: Boolean) {
+        val root = sv.rootView as? ViewGroup ?: return
+        val w = want && Config.clockBounce && !labelsBlocked(root)
+        if (w != clockWant) {
+            clockWant = w
+            if (w) findClock(root)
+            clockAnim?.let { it.removeAllListeners(); it.cancel() }
+            val an = ValueAnimator.ofFloat(clockProg, if (w) 1f else 0f)
+            an.duration = if (w) 420L else 340L
+            an.interpolator = OvershootInterpolator(if (w) 2.6f else 2.0f)
+            an.addUpdateListener { clockProg = it.animatedValue as Float; applyClock() }
+            an.addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (!clockWant) restoreClock()
+                }
+            })
+            clockAnim = an
+            an.start()
+        }
+        if (clockApplied || clockProg != 0f) applyClock()
     }
 
     private fun reset(sv: View?, ctx: Context?) {
         restoreGear(ctx)
         scrollY = 0f
+        restoreClock()
         hideLabels()
         restoreClip()
         if (sv == null) return
