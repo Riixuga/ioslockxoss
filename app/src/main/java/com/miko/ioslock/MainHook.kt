@@ -95,7 +95,8 @@ object Config {
     // keadaan 2 -> 3: kartu ke-4 dan seterusnya tetap di posisi awal sampai kartu di depannya
     // mencapai lockAt (0..1 dari gerakan kartu itu). Makin kecil = makin cepat kartu berikutnya ikut bergerak.
     val lockAt: Float get() = prop("debug.ioslock.lockat").toFloatOrNull() ?: 0.5f
-    // keadaan 2: jumlah kartu penuh (kartu depan). Kartu sisanya menumpuk di belakang kartu penuh terakhir seperti dock stage 3.
+    // keadaan 2: jumlah kartu penuh maksimum (kartu depan). Jumlah yang benar-benar tampil dibatasi ruang yang ada,
+    // sisanya menumpuk di belakang kartu penuh terakhir tepat di garis batas.
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 3
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir (dipakai kalau dockstack2 0)
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
@@ -252,7 +253,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.33 loaded into SystemUI")
+        log("v0.34 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -882,46 +883,60 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
-    // Tata letak keadaan 2 gaya "dock": 'full' kartu depan tampil penuh, semua kartu sesudahnya menumpuk
-    // di belakang kartu penuh terakhir dengan rumus yang sama dengan tumpukan bawah keadaan 3.
-    // Kartu penuh TIDAK pernah dinaikkan: posisi atasnya tetap di top. Kalau totalnya lebih tinggi dari ruang
-    // yang tersedia (sampai limit, dikurangi minDock), jarak antar kartu penuh dikecilkan sampai 0.
-    // Tumpukan di belakang kartu penuh terakhir selalu punya ketebalan minimal minDock supaya tetap terlihat.
+    // Tata letak keadaan 2 gaya "dock".
+    // Kartu penuh TIDAK pernah dinaikkan, dan posisi atasnya tetap di top.
+    // Jumlah kartu penuh ditambah selama dasarnya + minDock masih di dalam limit (sampai maxFull).
+    // Kalau ruangnya kurang, jarak antar kartu penuh dikecilkan sampai minGap supaya lebih banyak yang muat.
+    // Kartu yang tidak muat menjadi tumpukan di belakang kartu penuh terakhir, tepat di garis batas.
+    // Kartu ke-j di belakang kartu penuh terakhir berada di fullBottom + dock * (1 - 0.6^j), jadi
+    // tiap lapisan punya offset sendiri dan kesan bertumpuk terlihat. Makin belakang makin kecil.
     // frontScale: skala kartu penuh terakhir (di depan tumpukan), hanya kalau memang ada kartu di belakangnya.
     private fun layoutDockStack(
-        hs: FloatArray, top: Float, gap: Float, full: Int,
-        dock0: Float, limit: Float, ref: Float, dScale: Float, frontScale: Float, minDock: Float
+        hs: FloatArray, top: Float, gap: Float, maxFull: Int,
+        dock0: Float, limit: Float, dScale: Float, frontScale: Float,
+        minDock: Float, minGap: Float, stepScale: Float
     ): StateLayout {
         val n = hs.size
         val out = StateLayout(n)
-        val k = full.coerceIn(1, n)
+        val cap = maxFull.coerceIn(1, n)
+        val stackDecay = 0.6f
 
-        // jarak antar kartu penuh: normal (gap), atau dikecilkan kalau ruangnya tidak cukup
-        var sumH = 0f
-        for (i in 0 until k) sumH += hs[i]
+        // jumlah kartu penuh terbanyak yang masih muat (dengan jarak minimum minGap dan ruang minDock)
+        var k = 1
+        var sumH = hs[0]
+        for (i in 1 until cap) {
+            val bottomIfAdded = top + sumH + hs[i] + i * minGap
+            if (bottomIfAdded + minDock > limit) break
+            sumH += hs[i]
+            k = i + 1
+        }
+
+        // jarak antar kartu penuh: normal, atau dikecilkan supaya muat sampai garis
         val avail = limit - minDock - top
-        val g = if (k > 1) ((avail - sumH) / (k - 1)).coerceIn(0f, gap) else gap
+        val g = if (k > 1) ((avail - sumH) / (k - 1)).coerceIn(minGap, gap) else gap
 
-        val spread = FloatArray(n)
+        val spread = FloatArray(k)
         var y = top
-        for (i in 0 until n) {
+        for (i in 0 until k) {
             y += hs[i]
             spread[i] = y
-            y += if (i < k - 1) g else gap
+            y += g
         }
 
         val fullBottom = spread[k - 1]
-        val dock = if (n > k) max(min(dock0, limit - fullBottom), minDock) else 0f
+        val hasStack = n > k
+        val dock = if (hasStack) max(min(dock0, limit - fullBottom), minDock) else 0f
+
         for (i in 0 until n) {
             if (i < k) {
                 out.bottom[i] = spread[i]
                 // kartu penuh terakhir hanya membesar kalau memang ada kartu di belakangnya
-                out.scale[i] = if (i == k - 1 && n > k) frontScale else 1f
+                out.scale[i] = if (i == k - 1 && hasStack) frontScale else 1f
                 out.kind[i] = 0
             } else {
-                val o = spread[i] - fullBottom
-                out.bottom[i] = if (dock < 1f) fullBottom else fullBottom + dock * (1f - exp(-o / (dock * 1.3f)))
-                out.scale[i] = 1f - dScale * min(1f, o / ref)
+                val j = i - (k - 1) // 1 = tepat di belakang kartu penuh terakhir
+                out.bottom[i] = fullBottom + dock * (1f - powf(stackDecay, j))
+                out.scale[i] = 1f - min(dScale, stepScale * j)
                 out.kind[i] = 1
             }
         }
@@ -1021,8 +1036,8 @@ class MainHook : IXposedHookLoadPackage {
     // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari titik asal (garis bawah) sambil
     //    membesar dari kecil (openScale) ke ukuran keadaan 2
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): kartu penuh sebanyak full2, sisanya menumpuk di belakang kartu penuh terakhir
-    // seperti dock keadaan 3 (dockStack2). Kalau dockStack2 mati, kartu di belakang jadi pita (layoutState).
+    // Keadaan 2 (q=0): kartu penuh sebanyak yang muat (maks full2), sisanya menumpuk di belakang kartu penuh
+    // terakhir tepat di garis batas (dockStack2). Kalau dockStack2 mati, kartu di belakang jadi pita (layoutState).
     // Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
     // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil; atas dipotong di garis dengan fade. Kartu yang melewati batas bawah
     // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
@@ -1083,14 +1098,15 @@ class MainHook : IXposedHookLoadPackage {
         } else null
         val la = when {
             list2 != null -> list2
-            // keadaan 2 gaya dock: kartu penuh sebanyak full2, sisanya menumpuk di belakang kartu penuh terakhir
+            // keadaan 2 gaya dock: kartu penuh sebanyak yang muat, sisanya menumpuk di belakang kartu penuh terakhir
             Config.dockStack2 -> {
                 val dockPx = (if (Config.dock2Dp > 0f) Config.dock2Dp else Config.dockDp) * d
                 layoutDockStack(
-                    hs, restTop, Config.gap2Dp * d, min(Config.full2.coerceAtLeast(1), n),
+                    hs, restTop, Config.gap2Dp * d, Config.full2,
                     dockPx, bottom2,
-                    (Config.dockRefDp * d).coerceAtLeast(1f), Config.dockScale.coerceIn(0f, 0.3f),
-                    Config.front2Scale.coerceIn(1f, 1.2f), minPeek
+                    Config.dockScale.coerceIn(0f, 0.3f),
+                    Config.front2Scale.coerceIn(1f, 1.2f),
+                    minPeek, 4f * d, step
                 )
             }
             else -> layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
