@@ -77,7 +77,7 @@ object Config {
     val smallFrac: Float get() = prop("debug.ioslock.smallfrac").toFloatOrNull() ?: 0.345f
     // batas bawah daftar kartu keadaan 3 (di atas fingerprint dan teks bawah)
     val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.865f
-    // keadaan 2: posisi tepi bawah pita tumpukan TERAKHIR (0..1 tinggi layar) = garis merah.
+    // keadaan 2: posisi tepi bawah tumpukan (0..1 tinggi layar) = garis merah.
     val bottom2Frac: Float get() = prop("debug.ioslock.bottom2").toFloatOrNull() ?: 0.855f
     // pita tidak boleh lebih tebal dari sekian kali tinggi kartu (supaya tetap menumpuk di belakang kartu depan, tanpa celah)
     val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.9f
@@ -252,7 +252,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.32 loaded into SystemUI")
+        log("v0.33 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -883,39 +883,43 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     // Tata letak keadaan 2 gaya "dock": 'full' kartu depan tampil penuh, semua kartu sesudahnya menumpuk
-    // di belakang kartu penuh terakhir dengan rumus yang sama dengan tumpukan bawah keadaan 3:
-    // tepi bawah = dasar kartu penuh terakhir + dock * (1 - exp(-o / (1.3 * dock))), skala = 1 - dScale * min(1, o / ref),
-    // o = jarak kartu itu dari kartu penuh terakhir kalau daftar dibentangkan.
-    // Kalau kartu penuh terakhir terlalu rendah (dasarnya + dock0 melewati limit), seluruh kartu penuh
-    // dinaikkan dulu supaya ruang untuk pita tumpukan selalu ada dan tetap terlihat di bawah limit.
+    // di belakang kartu penuh terakhir dengan rumus yang sama dengan tumpukan bawah keadaan 3.
+    // Kartu penuh TIDAK pernah dinaikkan: posisi atasnya tetap di top. Kalau totalnya lebih tinggi dari ruang
+    // yang tersedia (sampai limit, dikurangi minDock), jarak antar kartu penuh dikecilkan sampai 0.
+    // Tumpukan di belakang kartu penuh terakhir selalu punya ketebalan minimal minDock supaya tetap terlihat.
     // frontScale: skala kartu penuh terakhir (di depan tumpukan), hanya kalau memang ada kartu di belakangnya.
     private fun layoutDockStack(
         hs: FloatArray, top: Float, gap: Float, full: Int,
-        dock0: Float, limit: Float, ref: Float, dScale: Float, frontScale: Float
+        dock0: Float, limit: Float, ref: Float, dScale: Float, frontScale: Float, minDock: Float
     ): StateLayout {
         val n = hs.size
         val out = StateLayout(n)
         val k = full.coerceIn(1, n)
+
+        // jarak antar kartu penuh: normal (gap), atau dikecilkan kalau ruangnya tidak cukup
+        var sumH = 0f
+        for (i in 0 until k) sumH += hs[i]
+        val avail = limit - minDock - top
+        val g = if (k > 1) ((avail - sumH) / (k - 1)).coerceIn(0f, gap) else gap
+
         val spread = FloatArray(n)
         var y = top
         for (i in 0 until n) {
             y += hs[i]
             spread[i] = y
-            y += gap
+            y += if (i < k - 1) g else gap
         }
-        val lastFullRaw = spread[k - 1]
-        // naikkan kartu penuh kalau perlu supaya dasar tumpukan (dock0) masih muat di bawah limit
-        val shift = if (n > k) max(0f, lastFullRaw + dock0 - limit) else 0f
-        val fullBottom = lastFullRaw - shift
-        val dock = if (n > k) min(dock0, limit - fullBottom).coerceAtLeast(0f) else 0f
+
+        val fullBottom = spread[k - 1]
+        val dock = if (n > k) max(min(dock0, limit - fullBottom), minDock) else 0f
         for (i in 0 until n) {
             if (i < k) {
-                out.bottom[i] = spread[i] - shift
+                out.bottom[i] = spread[i]
                 // kartu penuh terakhir hanya membesar kalau memang ada kartu di belakangnya
                 out.scale[i] = if (i == k - 1 && n > k) frontScale else 1f
                 out.kind[i] = 0
             } else {
-                val o = spread[i] - lastFullRaw
+                val o = spread[i] - fullBottom
                 out.bottom[i] = if (dock < 1f) fullBottom else fullBottom + dock * (1f - exp(-o / (dock * 1.3f)))
                 out.scale[i] = 1f - dScale * min(1f, o / ref)
                 out.kind[i] = 1
@@ -1086,7 +1090,7 @@ class MainHook : IXposedHookLoadPackage {
                     hs, restTop, Config.gap2Dp * d, min(Config.full2.coerceAtLeast(1), n),
                     dockPx, bottom2,
                     (Config.dockRefDp * d).coerceAtLeast(1f), Config.dockScale.coerceIn(0f, 0.3f),
-                    Config.front2Scale.coerceIn(1f, 1.2f)
+                    Config.front2Scale.coerceIn(1f, 1.2f), minPeek
                 )
             }
             else -> layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
