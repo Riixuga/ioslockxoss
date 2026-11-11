@@ -94,6 +94,9 @@ object Config {
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // skala awal kartu saat tumpukan dibuka (kecil, di garis asal), lalu membesar ke ukuran keadaan 2
     val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.55f
+    // keadaan 2 -> 3: kartu ke-4 dan seterusnya tetap di posisi awal sampai kartu di depannya
+    // mencapai lockAt (0..1 dari gerakan kartu itu). Makin kecil = makin cepat kartu berikutnya ikut bergerak.
+    val lockAt: Float get() = prop("debug.ioslock.lockat").toFloatOrNull() ?: 0.5f
     // keadaan 2: jumlah kartu penuh (kartu depan). Sisanya tampil sebagai pita di belakang kartu depan.
     // Default 1: satu kartu penuh, lalu bands2 pita di belakangnya, sisanya menumpuk tepat di belakang pita terakhir.
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
@@ -252,7 +255,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.29 loaded into SystemUI")
+        log("v0.30 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -933,43 +936,61 @@ class MainHook : IXposedHookLoadPackage {
         return t + (t * t * (3f - 2f * t) - t) * 0.5f
     }
 
-    // Seberapa jauh kartu ke-i (1..n-1) sudah keluar dari tumpukan pada kemajuan q:
-    // 0 = masih menumpuk, 1 = sudah renggang penuh. Dengan stagger > 0 kartu depan keluar lebih dulu
-    // dan kartu di belakangnya menyusul; semuanya tepat selesai saat q = 1.
-    private fun spreadProgress(i: Int, n: Int, q: Float, stagger: Float): Float {
-        val lag = stagger.coerceIn(0f, 0.8f)
-        val m = n - 1
-        val start = if (m > 1) lag * (i - 1) / (m - 1) else 0f
-        val t = ((q - start) / (1f - lag)).coerceIn(0f, 1f)
-        // campuran linear (mengikuti jari, proporsional) dan smoothstep (awal/akhir lembut)
-        return t + (t * t * (3f - 2f * t) - t) * 0.5f
-    }
-
     // Gabungkan keadaan 2 (la) dan keadaan 3 (lb) jadi posisi tiap kartu pada kemajuan (a, q).
-    // Jarak tiap kartu ke kartu di depannya bergerak dari tebal pita (menumpuk) ke jarak penuh (renggang),
-    // jadi kartu selalu berurutan, tidak pernah saling menyeberang, dan tidak melewati batas bawah.
-    // Kartu pertama mengikuti jari secara linear; tepi bawah tiap kartu dibatasi oleh posisi terjauh
-    // kedua keadaan, jadi tidak ada kartu yang melampaui tempat akhirnya lalu mundur.
+    // Kartu ke-1..3 (index 0..2) bergerak bertahap dan tetap berurutan, seperti sebelumnya.
+    // Kartu ke-4 dan seterusnya TERKUNCI di posisi keadaan 2 (la) sampai kartu di depannya mencapai
+    // lockAt dari geraknya; lalu mulai bergerak sendiri ke posisi keadaan 3 (lb).
     // Saat a < 1 (animasi buka tumpukan, keadaan 1 -> 2) semua kartu berangkat dari satu titik asal
-    // (origin = tepi bawah dasar tumpukan) lalu keluar bergantian ke posisinya di keadaan 2;
-    // kartu terakhir berada di dasar tumpukan itu sejak awal, jadi tumpukannya tetap terlihat.
+    // (origin = tepi bawah dasar tumpukan) lalu keluar bergantian ke posisinya di keadaan 2.
     private fun composeStack(
         la: StateLayout, lb: StateLayout, a: Float, q: Float, stagger: Float,
         openStagger: Float, origin: Float, outBottom: FloatArray, outScale: FloatArray
     ) {
         val n = outBottom.size
+        val lag = stagger.coerceIn(0f, 0.8f)
+        val lockAt = Config.lockAt.coerceIn(0.05f, 0.95f)
+        val m = n - 1
+
+        // progres tiap kartu: 0 = masih di posisi keadaan 2, 1 = sudah di posisi keadaan 3
+        val e = FloatArray(n)
+        // q saat kartu sebelumnya mencapai lockAt (dipakai sebagai gerbang kartu berikutnya)
+        var gate = 0f
+        for (i in 1 until n) {
+            val start: Float
+            val span: Float
+            if (i <= 2) {
+                start = if (m > 1) lag * (i - 1) / (m - 1) else 0f
+                span = 1f - lag
+            } else {
+                start = gate.coerceAtMost(0.999f)
+                span = 1f - start
+            }
+            val t = ((q - start) / span).coerceIn(0f, 1f)
+            // campuran linear (mengikuti jari) dan smoothstep (awal/akhir lembut)
+            e[i] = t + (t * t * (3f - 2f * t) - t) * 0.5f
+            gate = start + lockAt * span
+        }
+
         var prev = la.bottom[0] + (lb.bottom[0] - la.bottom[0]) * q
         outBottom[0] = prev
         outScale[0] = 1f
         for (i in 1 until n) {
-            val e = spreadProgress(i, n, q, stagger)
-            val dA = la.bottom[i] - la.bottom[i - 1]
-            val dB = lb.bottom[i] - lb.bottom[i - 1]
-            val cap = max(la.bottom[i], lb.bottom[i])
-            prev = min(prev + dA + (dB - dA) * e, cap)
-            outBottom[i] = prev
-            outScale[i] = la.scale[i] + (lb.scale[i] - la.scale[i]) * e
+            val ei = e[i]
+            if (i <= 2) {
+                // kartu 2 dan 3: berurutan, mengikuti kartu di depannya
+                val dA = la.bottom[i] - la.bottom[i - 1]
+                val dB = lb.bottom[i] - lb.bottom[i - 1]
+                val cap = max(la.bottom[i], lb.bottom[i])
+                prev = min(prev + dA + (dB - dA) * ei, cap)
+                outBottom[i] = prev
+                outScale[i] = la.scale[i] + (lb.scale[i] - la.scale[i]) * ei
+            } else {
+                // kartu ke-4 dan seterusnya: tidak mengikuti kartu di depan, posisinya absolut
+                outBottom[i] = la.bottom[i] + (lb.bottom[i] - la.bottom[i]) * ei
+                outScale[i] = la.scale[i] + (lb.scale[i] - la.scale[i]) * ei
+            }
         }
+
         if (a < 1f) {
             // di titik asal semua kartu sekecil pita terakhir; makin keluar makin besar
             val sO = Config.openScale.coerceIn(0.2f, 1f)
