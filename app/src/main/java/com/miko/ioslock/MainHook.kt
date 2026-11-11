@@ -94,15 +94,15 @@ object Config {
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // skala awal kartu saat tumpukan dibuka (kecil, di garis asal), lalu membesar ke ukuran keadaan 2
     val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.55f
-    // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang kartu penuh terakhir)
-    val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 2 // BARU: default 2
+    // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang kartu penuh terakhir). BARU: default 3
+    val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 3
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
-    // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan. 0 = selalu menumpuk (BARU: default 0)
+    // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan. 0 = selalu menumpuk
     val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 0
     val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
     // keadaan 2: kartu penuh terakhir (di depan tumpukan) diperbesar sedikit supaya tumpukan di belakangnya terlihat rapi (1 = normal)
-    val front2Scale: Float get() = prop("debug.ioslock.front2scale").toFloatOrNull() ?: 1.04f // BARU
+    val front2Scale: Float get() = prop("debug.ioslock.front2scale").toFloatOrNull() ?: 1.04f
     // keadaan 2: semua kartu setelah kartu depan menumpuk di belakangnya PERSIS seperti tumpukan bawah ("dock") keadaan 3
     // (pakai dockScale / dockRefDp yang sama). 0 = kembali ke pita lama (maks bands2 pita, sisanya tersembunyi).
     val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") != "0"
@@ -251,7 +251,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.27 loaded into SystemUI")
+        log("v0.28 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -328,7 +328,7 @@ class MainHook : IXposedHookLoadPackage {
                 lastGearWritten = null
             }
             barState = s
-            if (s != 1) clearMask(stackRef?.get())   // BARU: keluar dari keyguard = fade dimatikan
+            if (s != 1) clearMask(stackRef?.get())   // keluar dari keyguard = fade dimatikan
             logT("barState", "state=$s", discrete = true)
             applyState()
         })
@@ -749,7 +749,7 @@ class MainHook : IXposedHookLoadPackage {
             val locked = ctx != null && isLocked(ctx)
             val onKeyguard = locked && onKeyguardState()
             if (!Config.gesture || !onKeyguard) {
-                clearMask(sv)                       // BARU
+                clearMask(sv)
                 if (applied) { reset(sv, ctx); applied = false }
                 if (!locked) { progress = 0f; scrollY = 0f }
                 return
@@ -1006,7 +1006,8 @@ class MainHook : IXposedHookLoadPackage {
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
-        sv.alpha = (a * 2.5f).coerceAtMost(1f)
+        // BARU: stack tetap opaque selama mengecil, baru memudar di ujung animasi
+        sv.alpha = (a * 8f).coerceAtMost(1f)
         // saat tersembunyi, stack tidak boleh menerima sentuhan
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
         sv.translationY = 0f
@@ -1383,7 +1384,7 @@ class MainHook : IXposedHookLoadPackage {
                 override fun beforeHookedMethod(p: MethodHookParam) {
                     try {
                         val view = p.thisObject as? View ?: return
-                        // BARU: mask hanya boleh digambar saat keyguard
+                        // mask hanya boleh digambar saat keyguard
                         if (!maskOn || barState != 1 || view !== stackRef?.get()) return
                         val canvas = p.args[0] as? Canvas ?: return
                         val loc = IntArray(2)
@@ -1428,7 +1429,7 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // BARU: matikan fade atas daftar. Dipanggil setiap keluar dari keyguard supaya notifikasi di home screen tidak ikut terpotong.
+    // matikan fade atas daftar. Dipanggil setiap keluar dari keyguard supaya notifikasi di home screen tidak ikut terpotong.
     private fun clearMask(sv: View?) {
         if (!maskOn && maskStrength == 0f && maskFade == 0f) return
         maskOn = false
