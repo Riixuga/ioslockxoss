@@ -1,15 +1,15 @@
 package com.miko.ioslock
 
-import android.animation.Animator
-import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
-import android.app.Notification
+import android.app.WallpaperManager
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
@@ -18,8 +18,11 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.graphics.RecordingCanvas
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.RenderEffect
+import android.graphics.RenderNode
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -29,27 +32,24 @@ import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
-import android.service.notification.StatusBarNotification
-import android.text.TextUtils
+import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.ViewTreeObserver
+import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
@@ -66,33 +66,12 @@ import kotlin.math.sin
 object Config {
     private val cache = ConcurrentHashMap<String, Pair<Long, String>>()
 
-    // Pengaturan dari aplikasi modul (XSharedPreferences) menang atas setprop.
-    private val prefs by lazy {
-        try { XSharedPreferences("com.miko.ioslock", "settings") } catch (_: Throwable) { null }
-    }
-
-    private fun prefValue(key: String): String? {
-        val p = prefs ?: return null
-        return try {
-            p.reload()
-            when (val v = p.all[key]) {
-                null -> null
-                is Boolean -> if (v) "1" else "0"
-                else -> v.toString()
-            }
-        } catch (_: Throwable) {
-            null
-        }
-    }
+    // baca system property (untuk log diagnosa)
+    fun sys(key: String): String = prop(key)
 
     private fun prop(key: String): String {
         val now = System.currentTimeMillis()
         cache[key]?.let { if (now - it.first < 400) return it.second }
-        val custom = prefValue(key)
-        if (custom != null) {
-            cache[key] = now to custom
-            return custom
-        }
         val v = try {
             XposedHelpers.callStaticMethod(
                 Class.forName("android.os.SystemProperties"), "get", key, ""
@@ -188,7 +167,8 @@ object Config {
     // Saat nyala, kartu keluar dari pil ini dan mengecil kembali ke pil: posisi tengah dan ukuran kartu
     // di awal animasi buka = posisi tengah dan ukuran pil.
     val pillOn: Boolean get() = prop("debug.ioslock.pill") != "0"
-    // radius blur (px) dan tint putih (alpha 0..255) pil
+    // radius blur (px) dan tint putih (alpha 0..255) pil. Blur platform memakai nilai ini apa adanya,
+    // blur wallpaper memakai setengahnya sebagai sigma.
     val pillBlurPx: Float get() = prop("debug.ioslock.pillblur").toFloatOrNull() ?: 60f
     val pillTintA: Int get() = prop("debug.ioslock.pilltint").toIntOrNull() ?: 56
     // jarak teks ke tepi pil: kiri-kanan dan atas-bawah (dp)
@@ -196,21 +176,25 @@ object Config {
     val pillPadVDp: Float get() = prop("debug.ioslock.pillpadv").toFloatOrNull() ?: 7f
     // radius sudut pil (dp). Negatif = bulat penuh (setengah tinggi pil)
     val pillRadiusDp: Float get() = prop("debug.ioslock.pillradius").toFloatOrNull() ?: -1f
-    // border kaca pil: lebar (dp) dan kekuatan kilau tepi (alpha 0..255)
-    val pillBorderDp: Float get() = prop("debug.ioslock.pillborder").toFloatOrNull() ?: 1f
-    val pillBorderA: Int get() = prop("debug.ioslock.pillbordera").toIntOrNull() ?: 110
-    // lebar pil saat halaman mini media player aktif (dp)
-    val pillMediaDp: Float get() = prop("debug.ioslock.pillmediaw").toFloatOrNull() ?: 208f
-    // faktor fling daftar keadaan 3 (0 = tanpa fling)
-    val flingFactor: Float get() = prop("debug.ioslock.fling").toFloatOrNull() ?: 0.22f
-    // skala pengecilan dan jarak turun pil saat masuk keadaan 2
-    val pillShrink: Float get() = prop("debug.ioslock.pillshrink").toFloatOrNull() ?: 0.2f
-    val pillDropDp: Float get() = prop("debug.ioslock.pilldrop").toFloatOrNull() ?: 10f
-    val pillGrowMs: Long get() = prop("debug.ioslock.pillgrow").toLongOrNull() ?: 360L
-    val snapMs: Long get() = prop("debug.ioslock.snapms").toLongOrNull() ?: 420L
-    // batas tebal tumpukan kecil di bawah kartu penuh keadaan 2 (dp). 0 = penuh sampai garis bawah,
-    // seperti susunan sebelum versi 0.40.
-    val dock2MaxDp: Float get() = prop("debug.ioslock.dock2max").toFloatOrNull() ?: 0f
+    // cara blur pil: 0 = otomatis (urutan: blur XOS -> blur wallpaper -> blur platform -> kaca biasa),
+    // 1 = blur platform saja (blur belakang-window lewat SurfaceFlinger, tidak ada hasilnya kalau ROM mematikannya),
+    // 2 = blur wallpaper saja, 3 = kaca putih transparan tanpa blur,
+    // 4 = blur XOS (DepthUtil) saja
+    val pillMode: Int get() = prop("debug.ioslock.pillmode").toIntOrNull() ?: 0
+    // kalibrasi blur wallpaper kalau isi pil tidak pas dengan wallpaper asli: zoom (1 = pas center-crop)
+    // dan geser horizontal / vertikal (px)
+    val pillWpZoom: Float get() = prop("debug.ioslock.pillwpzoom").toFloatOrNull() ?: 1f
+    val pillWpDx: Float get() = prop("debug.ioslock.pillwpdx").toFloatOrNull() ?: 0f
+    val pillWpDy: Float get() = prop("debug.ioslock.pillwpdy").toFloatOrNull() ?: 0f
+    // lama animasi pil muncul (ms): tumbuh dari kecil, melewati ukuran penuh sedikit, lalu menetap. 0 = tanpa animasi
+    val pillBounceMs: Long get() = prop("debug.ioslock.pillbounce").toLongOrNull() ?: 650L
+    // blur XOS: nama class (bisa diganti lewat setprop tanpa build ulang) dan argumen angka/boolean untuk
+    // DepthUtil.enableEffectRowBlur. Nilai default argumen belum tentu cocok, lihat log "xos:" untuk signature aslinya.
+    val xosDepthClass: String get() = prop("debug.ioslock.xosdepth").ifEmpty { "GANTI.DENGAN.PACKAGE.DepthUtil" }
+    val xosTranClass: String get() = prop("debug.ioslock.xostran").ifEmpty { "GANTI.DENGAN.PACKAGE.TranView" }
+    val pillXosBool: Boolean get() = prop("debug.ioslock.xosbool") != "0"
+    val pillXosInt: Int get() = prop("debug.ioslock.xosint").toIntOrNull() ?: 0
+    val pillXosFloat: Float get() = prop("debug.ioslock.xosfloat").toFloatOrNull() ?: 0f
     // 1 = catat background tiap bagian kartu notifikasi (untuk mencari tahu blur apa yang dipakai kartu)
     val cardBgDump: Boolean get() = prop("debug.ioslock.cardbgdump") != "0"
 
@@ -261,11 +245,7 @@ class MainHook : IXposedHookLoadPackage {
 
     // layar mati / layar PIN
     @Volatile private var screenOff = false
-    private var screenWatch: Runnable? = null
     @Volatile private var bouncerHook = false
-    @Volatile private var screenAlpha = 1f
-    private var pillFadeAnim: ValueAnimator? = null
-    private var pillFadeOutRunning = false
     private var bouncerScan = false
     private var lastBouncerScan = 0L
     private var receiverRegistered = false
@@ -281,48 +261,24 @@ class MainHook : IXposedHookLoadPackage {
     private var pillLastBlur = -1
     private var pillLastTint = -1
     private var pillLastRad = -1f
-    // blur notifikasi XOS (render effect cross-window yang sama dengan latar kartu notifikasi)
-    private var tranView: Any? = null
-    private var pillXosBlur: WeakReference<View>? = null
-    private var pillXosTries = 0
     // geometri pil terakhir dalam piksel layar: [left, top, lebar, tinggi]
     private var pillGeo = FloatArray(4)
+    // wallpaper kunci (sudah diperkecil) untuk blur pil
+    @Volatile private var wpBitmap: Bitmap? = null
+    @Volatile private var wpLoading = false
+    private var wpTries = 0
 
-    // AOD (always-on display)
-    @Volatile private var aod = false
+    // ClassLoader System UI (untuk mencari class XOS lewat refleksi)
+    private var sysCl: ClassLoader? = null
+    private val xosDepthName: String get() = Config.xosDepthClass
+    private val xosTranName: String get() = Config.xosTranClass
 
-    // halaman mini media player di pil (0 = jumlah notifikasi, 1 = media)
-    @Volatile private var pillMediaT = 0f
-    private var pillMediaAnim: ValueAnimator? = null
-    private var pillTouch = false
-    private var pillTaken = false
-    private var pillStartX = 0f
-    private var pillStartT = 0f
-    private var pillDownAt = 0L
-    private var pillMoved = false
-    private var pillCountW = 0f
-    private var pillMediaW = 0f
-    private var pillSlideSpan = 1f
-    @Volatile private var pillAnimScale = 1f
-    @Volatile private var pillAnimDrop = 0f
-    @Volatile private var pillAnimAlpha = 1f
-    private var panelRef: WeakReference<Any>? = null
-    private var mediaRowRef: WeakReference<View>? = null
-    private var mediaScanAt = 0L
-    private var mediaAvailable = false
-    private var mediaTitle = ""
-    private var mediaText = ""
-    private var mediaArt: Drawable? = null
-
-    // saat mini media ditekan: hanya kartu media yang dibuka
-    private var soloMedia = false
-    private var soloCardRef: WeakReference<View>? = null
-    @Volatile private var soloOpenT = 0f
-    private var soloAnim: ValueAnimator? = null
-
-    // fling scroll keadaan 3
-    private var scrollAnimator: ValueAnimator? = null
-    private var velocityTracker: VelocityTracker? = null
+    // animasi muncul pil
+    private var pillWasRest = false
+    private var pillLastBounce = 0L
+    private var pillBounceAnim: ValueAnimator? = null
+    @Volatile private var pillBounceS = 1f
+    @Volatile private var pillBounceA = 1f
 
     // state gestur. progress: 0..1 = kartu muncul (keadaan 1 -> 2), 1..2 = naik (keadaan 2 -> 3)
     @Volatile private var progress = 0f
@@ -378,7 +334,8 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.37 loaded into SystemUI")
+        sysCl = cl
+        log("v0.39 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -406,16 +363,6 @@ class MainHook : IXposedHookLoadPackage {
         // Layar menyala / mati: progres swipe lama tidak boleh tersisa
         hook(cl, clockHelper, "powerModeChanged", after = {
             animator?.cancel()
-            soloAnim?.cancel()
-            soloMedia = false
-            soloCardRef = null
-            soloOpenT = 0f
-            velocityTracker?.recycle()
-            velocityTracker = null
-            pillTouch = false
-            pillTaken = false
-            tracking = false
-            taken = false
             progress = 0f
             scrollY = 0f
             bouncerHook = false
@@ -423,60 +370,13 @@ class MainHook : IXposedHookLoadPackage {
             applyState()
         })
 
-        // AOD: saat always-on display aktif, pil dan label harus memudar keluar.
-        val aodService = "com.transsion.aod.DozeService"
-        hook(cl, aodService, "showAodUi", after = { setAod(true) })
-        hook(cl, aodService, "hideAodUi", after = { setAod(false) })
-        hook(cl, aodService, "onDreamingStarted", after = { setAod(true) })
-        hook(cl, aodService, "onDreamingStopped", after = { setAod(false) })
-        val aodAnim = "com.transsion.aod.TranAodAnimController"
-        hook(cl, aodAnim, "changeAodAnimState", after = { p ->
-            if (p.args.getOrNull(0) == true) setAod(true)
-        })
-        hook(cl, "com.transsion.aod.TranAodAnimController\$2", "onStartedGoingToSleep", after = { setAod(true) })
-        hook(cl, "com.transsion.aod.TranAodAnimController\$2", "onFinishedGoingToSleep", after = { setAod(true) })
-        hook(cl, panel, "showAodUi", after = { setAod(true) })
-        hook(cl, "com.android.systemui.shade.NotificationPanelViewController", "showAodUi", after = { setAod(true) })
-
-        // Layar mati/nyala langsung dari SystemUI, lebih andal daripada hanya broadcast.
-        val central = "com.android.systemui.statusbar.phone.TrCentralSurfacesImpl"
-        hook(cl, central, "notifyScreenTurningOff", after = { setScreenOff(true) })
-        hook(cl, central, "notifyScreenTurnedOff", after = { setScreenOff(true) })
-        hook(cl, central, "notifyScreenTurnedOn", after = { setScreenOff(false) })
-
         // Layar PIN (bouncer)
         hook(cl, bouncer, "show", after = { bouncerHook = true; logT("bouncerHook", "show", discrete = true); applyState() })
         hook(cl, bouncer, "onFullyShown", after = { bouncerHook = true; applyState() })
         hook(cl, bouncer, "hide", after = { bouncerHook = false; logT("bouncerHook", "hide", discrete = true); applyState() })
         hook(cl, bouncer, "onFullyHidden", after = { bouncerHook = false; applyState() })
 
-        hook(cl, panel, "positionClockAndNotifications", after = { p ->
-            panelRef = WeakReference(p.thisObject)
-            applyState()
-        })
-        hook(cl, panel, "updateExpandedHeight", after = { p ->
-            if (panelRef?.get() == null) panelRef = WeakReference(p.thisObject)
-        })
-        hook(cl, panel, "updatePanelExpanded", after = { p ->
-            if (panelRef?.get() == null) panelRef = WeakReference(p.thisObject)
-        })
-        // Base class: beberapa method panel di-override Tr, jadi hook base menangkap instance-nya lebih awal.
-        val panelBase = "com.android.systemui.shade.NotificationPanelViewController"
-        hook(cl, panelBase, "positionClockAndNotifications", after = { p ->
-            panelRef = WeakReference(p.thisObject)
-            applyState()
-        })
-        hook(cl, panelBase, "updatePanelExpanded", after = { p ->
-            if (panelRef?.get() == null) panelRef = WeakReference(p.thisObject)
-        })
-        try {
-            val pc = XposedHelpers.findClass(panelBase, cl)
-            XposedBridge.hookAllConstructors(pc, object : XC_MethodHook() {
-                override fun afterHookedMethod(p: XC_MethodHook.MethodHookParam) {
-                    panelRef = WeakReference(p.thisObject)
-                }
-            })
-        } catch (_: Throwable) { }
+        hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
 
         // Buka batas jumlah notifikasi yang ditampilkan sistem di lockscreen
         // (kalau tidak, kartu di luar batas disembunyikan sistem dan tidak ikut ditata)
@@ -504,8 +404,7 @@ class MainHook : IXposedHookLoadPackage {
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
         hook(cl, stateCtl, "setState", after = { p ->
             val s = p.args.getOrNull(0) as? Int ?: return@hook
-            val prev = barState
-            if (s == 1 && prev != 1) {
+            if (s == 1 && barState != 1) {
                 animator?.cancel()
                 progress = 0f
                 scrollY = 0f
@@ -515,8 +414,7 @@ class MainHook : IXposedHookLoadPackage {
             barState = s
             if (s != 1) clearMask(stackRef?.get())   // keluar dari keyguard = fade dimatikan
             logT("barState", "state=$s", discrete = true)
-            // Munculnya keyguard memudarkan pil masuk; keluarnya keyguard ditangani reset().
-            if (s == 1 && prev != 1 && !screenOff) fadePillIn() else applyState()
+            applyState()
         })
 
         // Ambil View stack notifikasi dari controller-nya (field mView)
@@ -547,155 +445,37 @@ class MainHook : IXposedHookLoadPackage {
             val f = IntentFilter()
             f.addAction(Intent.ACTION_SCREEN_OFF)
             f.addAction(Intent.ACTION_SCREEN_ON)
+            f.addAction(Intent.ACTION_WALLPAPER_CHANGED)
             ctx.registerReceiver(object : BroadcastReceiver() {
                 override fun onReceive(c: Context?, i: Intent?) {
                     try {
                         when (i?.action) {
-                            Intent.ACTION_SCREEN_OFF -> setScreenOff(true)
-                            Intent.ACTION_SCREEN_ON -> setScreenOff(false)
+                            Intent.ACTION_SCREEN_OFF -> {
+                                screenOff = true
+                                animator?.cancel()
+                                progress = 0f
+                                scrollY = 0f
+                                bouncerHook = false
+                                lastGearWritten = null
+                                hideDim()
+                                hideLabels()
+                            }
+                            Intent.ACTION_SCREEN_ON -> {
+                                screenOff = false
+                                applyState()
+                            }
+                            Intent.ACTION_WALLPAPER_CHANGED -> {
+                                // wallpaper berganti: baca ulang untuk blur pil
+                                wpBitmap = null
+                                wpTries = 0
+                            }
                         }
                     } catch (t: Throwable) { }
                 }
             }, f)
-            startScreenWatch(ctx)
         } catch (t: Throwable) {
             once("recvFail") { log("receiver gagal: $t") }
         }
-    }
-
-    // Cadangan: PowerManager.isInteractive dipantau berkala, supaya pil tetap hilang
-    // walau broadcast/AOD ROM ini tidak memanggil hook yang sama.
-    private fun startScreenWatch(ctx: Context) {
-        if (screenWatch != null) return
-        val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-        val h = Handler(Looper.getMainLooper())
-        val r = object : Runnable {
-            override fun run() {
-                try {
-                    if (!pm.isInteractive) setScreenOff(true)
-                    else if (screenOff) setScreenOff(false)
-                } catch (_: Throwable) { }
-                h.postDelayed(this, 300L)
-            }
-        }
-        screenWatch = r
-        h.postDelayed(r, 300L)
-    }
-
-    private fun setScreenOff(on: Boolean) {
-        if (screenOff == on) return
-        screenOff = on
-        if (!on && aod) aod = false
-        logT("screen", "off=$on", discrete = true)
-        animator?.cancel()
-        soloAnim?.cancel()
-        pillMediaAnim?.cancel()
-        scrollAnimator?.cancel()
-        velocityTracker?.recycle()
-        velocityTracker = null
-        tracking = false
-        taken = false
-        pillTouch = false
-        pillTaken = false
-        if (on) {
-            progress = 0f
-            scrollY = 0f
-            bouncerHook = false
-            lastGearWritten = null
-            soloMedia = false
-            soloCardRef = null
-            soloOpenT = 0f
-            fadePillOut()
-        } else if (barState == 1 || barState == -1) {
-            // Buka layar kunci: pil memudar masuk, bukan muncul mendadak.
-            fadePillIn()
-        } else {
-            applyState()
-        }
-    }
-
-    // Fade keluar saat power ditekan, AOD, layar mati, atau keyguard ditutup.
-    // Hanya alpha, tanpa scale, supaya tidak terlihat seperti pantulan.
-    private fun fadePillOut() {
-        if (pillFadeOutRunning) return
-        val pv = pill
-        val lc = labelCenter
-        val ln = labelCount
-        val pvVisible = pv != null && pv.visibility == View.VISIBLE
-        val lcVisible = lc != null && lc.visibility == View.VISIBLE
-        val lnVisible = ln != null && ln.visibility == View.VISIBLE
-        if (!pvVisible && !lcVisible && !lnVisible) return
-
-        // Set flag dulu: cancel() memicu listener animator fade-in, yang tidak boleh
-        // mengembalikan alpha saat fade-out mulai.
-        pillFadeOutRunning = true
-        pillFadeAnim?.cancel()
-        pillFadeAnim = null
-        pv?.animate()?.cancel()
-        val p0 = pv?.alpha ?: 0f
-        val c0 = lc?.alpha ?: 0f
-        val n0 = ln?.alpha ?: 0f
-        val bg0 = pv?.background?.alpha ?: 255
-        val an = ValueAnimator.ofFloat(1f, 0f)
-        an.duration = 180L
-        an.interpolator = LinearInterpolator()
-        an.addUpdateListener {
-            val f = it.animatedValue as Float
-            pv?.alpha = p0 * f
-            pv?.background?.alpha = (bg0 * f).toInt().coerceIn(0, 255)
-            lc?.alpha = c0 * f
-            ln?.alpha = n0 * f
-        }
-        an.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                if (!pillFadeOutRunning) return
-                pillFadeOutRunning = false
-                pillFadeAnim = null
-                screenAlpha = 1f
-                pv?.let { it.visibility = View.INVISIBLE; it.alpha = 0f }
-                lc?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
-                ln?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
-                hideSlider()
-                hideDim()
-            }
-        })
-        pillFadeAnim = an
-        an.start()
-    }
-
-    // Fade masuk saat layar kunci dibuka (power / keyguard muncul).
-    private fun fadePillIn() {
-        // Jangan memulai fade masuk saat layar masih mati/AOD atau PIN sedang tampil;
-        // fade keluar yang sedang berjalan jangan dilawan animasi lain.
-        if (screenOff || aod || bouncerHook) {
-            applyState()
-            return
-        }
-        // Matikan flag sebelum cancel agar end-listener fade-out tidak menyembunyikan view.
-        pillFadeOutRunning = false
-        pillFadeAnim?.cancel()
-        pillFadeAnim = null
-        screenAlpha = 0f
-        applyState()
-        // applyState bisa memulai fade-out (mis. PIN/bouncer); jangan menimpanya.
-        if (pillFadeOutRunning || screenOff || aod) return
-        val an = ValueAnimator.ofFloat(0f, 1f)
-        an.duration = 260L
-        an.interpolator = DecelerateInterpolator(2f)
-        an.addUpdateListener {
-            screenAlpha = it.animatedValue as Float
-            applyState()
-        }
-        an.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                if (pillFadeOutRunning || screenOff || aod) return
-                screenAlpha = 1f
-                pill?.let { if (it.visibility == View.VISIBLE) it.alpha = 1f }
-                applyState()
-            }
-        })
-        pillFadeAnim = an
-        an.start()
     }
 
     // ---- layar PIN ----
@@ -725,36 +505,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun labelsBlocked(root: View): Boolean {
         val pm = root.context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val interactive = pm?.isInteractive ?: true
-        return aod || screenOff || !interactive || bouncerHook || scanBouncer(root)
-    }
-
-    // AOD masuk/keluar: reset gestur dan sembunyikan pil dengan fade.
-    private fun setAod(on: Boolean) {
-        if (aod == on) return
-        aod = on
-        logT("aod", "aod=$on", discrete = true)
-        animator?.cancel()
-        soloAnim?.cancel()
-        pillMediaAnim?.cancel()
-        scrollAnimator?.cancel()
-        velocityTracker?.recycle()
-        velocityTracker = null
-        tracking = false
-        taken = false
-        pillTouch = false
-        pillTaken = false
-        if (on) {
-            progress = 0f
-            scrollY = 0f
-            soloMedia = false
-            soloCardRef = null
-            soloOpenT = 0f
-            fadePillOut()
-        } else if (barState == 1 && !screenOff) {
-            fadePillIn()
-        } else {
-            applyState()
-        }
+        return screenOff || !interactive || bouncerHook || scanBouncer(root)
     }
 
     // ---- setting gear ----
@@ -975,7 +726,7 @@ class MainHook : IXposedHookLoadPackage {
     // ---- tahap swipe: 0..1 kartu muncul, 1..2 naik ----
 
     private fun aOf(p: Float): Float = min(p, 1f)
-    private fun qOf(p: Float): Float = (p - 1f).coerceIn(0f, 1.015f)
+    private fun qOf(p: Float): Float = (p - 1f).coerceIn(0f, 1f)
 
     private fun progressToDist(p: Float): Float {
         val l1 = Config.rangeDp
@@ -996,16 +747,15 @@ class MainHook : IXposedHookLoadPackage {
         val root = p.thisObject as? View ?: return
         if (!Config.gesture) { if (applied) { progress = 0f; scrollY = 0f; applyState() }; return }
         val dm = root.resources.displayMetrics
-        val d = dm.density
         val a = ev.actionMasked
 
         // slider di tepi kanan (keadaan 3): seret untuk menggulir daftar
         if (a == MotionEvent.ACTION_DOWN) {
-            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 40f * d &&
-                ev.rawY >= sliderTrackTop - 16f * d && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * d
+            val dd = dm.density
+            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 40f * dd &&
+                ev.rawY >= sliderTrackTop - 16f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * dd
             if (sliderDrag) {
                 animator?.cancel()
-                scrollAnimator?.cancel()
                 tracking = false
                 taken = false
             }
@@ -1021,13 +771,7 @@ class MainHook : IXposedHookLoadPackage {
 
         if (a == MotionEvent.ACTION_DOWN) {
             animator?.cancel()
-            scrollAnimator?.cancel()
             taken = false
-            pillTouch = false
-            pillTaken = false
-            pillMoved = false
-            velocityTracker?.recycle()
-            velocityTracker = VelocityTracker.obtain()
             downX = ev.rawX
             downY = ev.rawY
             val locked = isLocked(root.context)
@@ -1041,63 +785,10 @@ class MainHook : IXposedHookLoadPackage {
             logT("touchSeen", "locked=$locked state=$barState stack=${stackRef?.get() != null} cards=${hasCards()}", discrete = true)
             // tanpa kartu sama sekali, atau saat layar PIN tampil: biarkan sentuhan asli
             tracking = locked && onKeyguardState() && hasCards() && !bouncerHook && !scanBouncer(root) &&
-                ev.rawY < dm.heightPixels - Config.bottomZoneDp * d
-            // mulai sentuhan di pil (hanya kalau ada media player)
-            if (tracking && Config.pillOn && !labelsBlocked(root) && progress < 0.04f) {
-                val pg = pillGeo
-                val m = 10f * d
-                if (ev.rawX >= pg[0] - m && ev.rawX <= pg[0] + pg[2] + m &&
-                    ev.rawY >= pg[1] - m && ev.rawY <= pg[1] + pg[3] + m) {
-                    pillTouch = true
-                    pillStartX = ev.rawX
-                    pillStartT = pillMediaT
-                    pillSlideSpan = max(pillMediaW - pillCountW, 1f)
-                    pillDownAt = SystemClock.uptimeMillis()
-                }
-            }
+                ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
             return
         }
         if (!tracking) return
-
-        if (a == MotionEvent.ACTION_MOVE) velocityTracker?.addMovement(ev)
-
-        // slide horizontal di pil: halaman jumlah <-> mini media player
-        if (pillTouch && !pillTaken && a == MotionEvent.ACTION_MOVE) {
-            val dx = ev.rawX - downX
-            val dy = ev.rawY - downY
-            val slop = ViewConfiguration.get(root.context).scaledTouchSlop
-            if (abs(dx) > slop && abs(dx) > abs(dy) * 1.1f) {
-                if (!mediaAvailable) {
-                    pillTouch = false
-                } else {
-                    cancelNativeTouch(p)
-                    pillTaken = true
-                    animator?.cancel()
-                    pillMediaAnim?.cancel()
-                    scrollAnimator?.cancel()
-                    log("pil: slide mini media")
-                }
-            } else if (abs(dy) > slop && abs(dy) > abs(dx) * 1.2f) {
-                pillTouch = false   // swipe vertikal: biarkan gestur notifikasi
-            }
-            if (abs(dx) > 3f * d || abs(dy) > 3f * d) pillMoved = true
-        }
-        if (pillTaken) {
-            when (a) {
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = ev.rawX - pillStartX
-                    pillMediaT = (pillStartT - dx / pillSlideSpan).coerceIn(0f, 1f)
-                    applyState()
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    pillTaken = false
-                    pillTouch = false
-                    snapPillMedia(if (pillMediaT >= 0.35f) 1f else 0f)
-                }
-            }
-            p.result = true
-            return
-        }
 
         if (!taken && a == MotionEvent.ACTION_MOVE) {
             val dy = downY - ev.rawY
@@ -1106,7 +797,12 @@ class MainHook : IXposedHookLoadPackage {
             val up = dy > slop
             val down = progress > 0f && -dy > slop
             if ((up || down) && abs(dy) > abs(dx) * 1.2f) {
-                cancelNativeTouch(p)
+                try {
+                    val c = MotionEvent.obtain(ev)
+                    c.action = MotionEvent.ACTION_CANCEL
+                    XposedBridge.invokeOriginalMethod(p.method, p.thisObject, arrayOf<Any?>(c))
+                    c.recycle()
+                } catch (t: Throwable) { log("cancel gagal: $t") }
                 taken = true
                 startY = ev.rawY
                 baseProgress = progress
@@ -1120,137 +816,33 @@ class MainHook : IXposedHookLoadPackage {
                 MotionEvent.ACTION_MOVE -> {
                     // swipe naik melewati keadaan 3 = menggulir daftar (kalau kartu tidak muat)
                     val l12 = Config.rangeDp + Config.stage2Dp
-                    val moved = (startY - ev.rawY) / d
-                    val dist = progressToDist(baseProgress) + baseScroll / d + moved
+                    val moved = (startY - ev.rawY) / dm.density
+                    val dist = progressToDist(baseProgress) + baseScroll / dm.density + moved
                     progress = distToProgress(min(dist, l12).coerceAtLeast(0f)).coerceIn(0f, 2f)
-                    // di mode media saja jangan naik ke keadaan 3; cukup tarik ke bawah untuk menutup
-                    if (soloMedia) progress = progress.coerceAtMost(1f)
-                    scrollY = ((dist - l12) * d).coerceIn(0f, scrollMaxPx)
+                    scrollY = ((dist - l12) * dm.density).coerceIn(0f, scrollMaxPx)
                     if (scrollMaxPx > 2f && progress >= 1.99f) sliderPoke = true
                     applyState()
                     logT("progress", "p=$progress")
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     taken = false
-                    val v = velocityTracker?.let {
-                        it.computeCurrentVelocity(1000)
-                        it.yVelocity
-                    } ?: 0f
-                    velocityTracker?.recycle()
-                    velocityTracker = null
                     // menempel ke keadaan terdekat: 1 (teks), 2 (kartu muncul), 3 (jam kecil)
-                    val target = if (soloMedia && progress < 0.97f) 0f
-                        else if (progress < 0.35f) 0f else round(progress).coerceIn(1f, 2f)
+                    val target = if (progress < 0.35f) 0f else round(progress).coerceIn(1f, 2f)
                     if (target != progress) snap(target)
-                    // keadaan 3: lanjut meluncur supaya daftar dan slider tidak terasa berat
-                    if (progress >= 1.97f && scrollMaxPx > 2f && abs(v) > 250f && Config.flingFactor > 0f) {
-                        flingScroll(-v * Config.flingFactor)
-                    }
                 }
             }
             p.result = true
-            return
         }
-
-        // tap pil: halaman media membuka kartu media; halaman jumlah membuka Notification Center
-        if (pillTouch && (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL)) {
-            val tap = a == MotionEvent.ACTION_UP && !pillMoved && SystemClock.uptimeMillis() - pillDownAt < 450L
-            val onMedia = pillMediaT >= 0.5f
-            pillTouch = false
-            velocityTracker?.recycle()
-            velocityTracker = null
-            if (tap) {
-                cancelNativeTouch(p)
-                if (onMedia && mediaAvailable) openSoloMedia() else openNotificationCenter()
-                p.result = true
-                return
-            }
-        }
-    }
-
-    private fun cancelNativeTouch(p: XC_MethodHook.MethodHookParam) {
-        try {
-            val c = MotionEvent.obtain(p.args[0] as MotionEvent)
-            c.action = MotionEvent.ACTION_CANCEL
-            XposedBridge.invokeOriginalMethod(p.method, p.thisObject, arrayOf<Any?>(c))
-            c.recycle()
-        } catch (t: Throwable) { log("cancel gagal: $t") }
-    }
-
-    // Kurva dari grafik: naik cepat lalu melambat, mencapai 1 tanpa pernah melewatinya.
-    // Tidak ada overshoot/spring, jadi tidak ada pantulan di kartu maupun pil.
-    private fun motionEase(t: Float): Float {
-        val u = 1f - t.coerceIn(0f, 1f)
-        return 1f - u * u * u * u * u
     }
 
     private fun snap(target: Float) {
         animator?.cancel()
-        pillMediaAnim?.cancel()
-        // mode media saja tetap aktif selama animasi tutup; kartu media mengecil ke pil
-        if (target <= 0.01f && soloMedia) soloAnim?.cancel()
-        if (target < 1.99f) scrollAnimator?.cancel()
-        if (target >= 1.99f && scrollMaxPx > 2f) sliderPoke = true
-        val start = progress
-        val an = ValueAnimator.ofFloat(0f, 1f)
-        val base = Config.snapMs.coerceIn(150L, 800L).toFloat()
-        an.duration = (base * (0.7f + 0.6f * abs(target - start))).toLong().coerceIn(120L, 900L)
-        an.interpolator = LinearInterpolator()
-        an.addUpdateListener {
-            val e = motionEase(it.animatedValue as Float)
-            progress = start + (target - start) * e
-            applyState()
-        }
-        an.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                progress = target
-                if (target <= 0.01f) {
-                    soloMedia = false
-                    soloCardRef = null
-                    soloOpenT = 0f
-                }
-                applyState()
-            }
-        })
+        val an = ValueAnimator.ofFloat(progress, target)
+        // jarak dekat = singkat; melambat di akhir supaya kartu "mendarat" halus
+        an.duration = (180f + 200f * abs(target - progress)).toLong()
+        an.interpolator = DecelerateInterpolator(1.6f)
+        an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
         animator = an
-        an.start()
-    }
-
-    private fun flingScroll(delta: Float) {
-        scrollAnimator?.cancel()
-        val start = scrollY
-        val end = (start + delta).coerceIn(0f, scrollMaxPx)
-        if (abs(end - start) < 1f) return
-        val an = ValueAnimator.ofFloat(start, end)
-        an.duration = (260f + 420f * (abs(end - start) / max(scrollMaxPx, 1f))).toLong().coerceAtMost(800L)
-        an.interpolator = DecelerateInterpolator(2.8f)
-        an.addUpdateListener {
-            scrollY = it.animatedValue as Float
-            sliderPoke = true
-            applyState()
-        }
-        scrollAnimator = an
-        an.start()
-    }
-
-    private fun snapPillMedia(target: Float) {
-        pillMediaAnim?.cancel()
-        val start = pillMediaT
-        val an = ValueAnimator.ofFloat(0f, 1f)
-        an.duration = (Config.snapMs * 0.8f).toLong().coerceIn(100L, 700L)
-        an.interpolator = LinearInterpolator()
-        an.addUpdateListener {
-            val e = motionEase(it.animatedValue as Float)
-            pillMediaT = (start + (target - start) * e).coerceIn(-0.03f, 1.03f)
-            applyState()
-        }
-        an.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                pillMediaT = target
-                applyState()
-            }
-        })
-        pillMediaAnim = an
         an.start()
     }
 
@@ -1274,9 +866,7 @@ class MainHook : IXposedHookLoadPackage {
                 ensureGear(ctx)
             }
             val p = progress
-            if (sv != null) {
-                if (soloMedia) applyStack(sv, min(soloOpenT, aOf(p)), 0f) else applyStack(sv, aOf(p), qOf(p))
-            }
+            if (sv != null) applyStack(sv, aOf(p), qOf(p))
         } catch (t: Throwable) { once("applyFail") { log("applyState gagal: $t") } }
     }
 
@@ -1403,7 +993,7 @@ class MainHook : IXposedHookLoadPackage {
     // Kalau ruangnya kurang dari minDock, tumpukan tetap setebal minDock supaya masih terlihat.
     private fun placeDock(
         out: StateLayout, from: Int, baseBottom: Float, baseScale: Float, hs: FloatArray, gap: Float,
-        limit: Float, minDock: Float, ref: Float, dScale: Float, maxDock: Float
+        limit: Float, minDock: Float, ref: Float, dScale: Float
     ) {
         val n = hs.size
         if (from >= n) return
@@ -1413,9 +1003,7 @@ class MainHook : IXposedHookLoadPackage {
             o += hs[i] + gap
             off[i] = o
         }
-        // maxDock <= 0 = tanpa batas, tumpukan mengalir sampai garis bawah seperti versi lama.
-        val dock = if (maxDock <= 0f) max(limit - baseBottom, minDock)
-        else min(max(limit - baseBottom, minDock), maxDock.coerceAtLeast(minDock))
+        val dock = max(limit - baseBottom, minDock)
         val c = dock * 1.3f
         val lastRaw = 1f - exp(-off[n - 1] / c)
         for (i in from until n) {
@@ -1435,8 +1023,7 @@ class MainHook : IXposedHookLoadPackage {
     // frontScale: skala kartu penuh terakhir (di depan tumpukan), hanya kalau memang ada kartu di belakangnya.
     private fun layoutDockStack(
         hs: FloatArray, top: Float, gap: Float, full: Int,
-        limit: Float, ref: Float, dScale: Float, frontScale: Float, minDock: Float, overlapMax: Float,
-        maxDock: Float
+        limit: Float, ref: Float, dScale: Float, frontScale: Float, minDock: Float, overlapMax: Float
     ): StateLayout {
         val n = hs.size
         val out = StateLayout(n)
@@ -1457,7 +1044,7 @@ class MainHook : IXposedHookLoadPackage {
             out.kind[i] = 0
             y += g
         }
-        placeDock(out, k, out.bottom[k - 1], 1f, hs, gap, limit, minDock, ref, dScale, maxDock)
+        placeDock(out, k, out.bottom[k - 1], 1f, hs, gap, limit, minDock, ref, dScale)
         return out
     }
 
@@ -1479,9 +1066,8 @@ class MainHook : IXposedHookLoadPackage {
     private fun openProgress(i: Int, n: Int, a: Float, lag: Float): Float {
         val l = if (n > 1) lag.coerceIn(0f, 0.8f) else 0f
         val start = if (n > 1) l * i / (n - 1) else 0f
-        // pakai kurva ease-out yang sama; tidak ada overshoot saat kartu keluar dari pil
         val t = ((a - start) / (1f - l)).coerceIn(0f, 1f)
-        return motionEase(t)
+        return t + (t * t * (3f - 2f * t) - t) * 0.5f
     }
 
     // Gabungkan keadaan 2 (la) dan keadaan 3 (lb) jadi posisi tiap kartu pada kemajuan (a, q).
@@ -1601,23 +1187,7 @@ class MainHook : IXposedHookLoadPackage {
             logT("children", dumpChildren(g), discrete = true)
         }
 
-        refreshMedia(g)
-        var cards = collectCards(g)
-        if (soloMedia) {
-            val s = soloCardRef?.get() as? View
-            if (s != null && s.parent === g && isLaidOut(s)) {
-                for (i in 0 until g.childCount) {
-                    val c = g.getChildAt(i)
-                    if (c !== s) c.visibility = View.INVISIBLE
-                }
-                s.visibility = View.VISIBLE
-                cards = ArrayList(cards.filter { it.first === s })
-                if (cards.isEmpty()) cards = arrayListOf(Pair(s, baseOfY(s)))
-            } else {
-                soloMedia = false
-                soloCardRef = null
-            }
-        }
+        val cards = collectCards(g)
         val n = cards.size
 
         val restTop = dm.heightPixels * Config.restFrac
@@ -1664,7 +1234,7 @@ class MainHook : IXposedHookLoadPackage {
                 while (full > 1 && !dockFits(hs, restTop, full, bottom2, minPeek, overlapPx)) full--
                 layoutDockStack(
                     hs, restTop, Config.gap2Dp * d, full, bottom2, refPx, dScale,
-                    Config.front2Scale.coerceIn(1f, 1.2f), minPeek, overlapPx, Config.dock2MaxDp * d
+                    Config.front2Scale.coerceIn(1f, 1.2f), minPeek, overlapPx
                 )
             }
             else -> layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
@@ -1683,20 +1253,12 @@ class MainHook : IXposedHookLoadPackage {
         // updateLabels juga menghitung ulang pillGeo (geometri pil), jadi harus dipanggil sebelum titik asal dihitung
         updateLabels(sv, a, targetTop, count)
 
-        // mode media saja: kartu diturunkan, tepi bawahnya memakai tepi atas pil sebagai base
-        if (soloMedia && n == 1) {
-            val pt = pillGeo[1]
-            if (pt > 0f) la.bottom[0] = pt.coerceAtMost(limit - 6f * d)
-        }
-
         // titik asal animasi buka. Pil nyala: tepi bawah pil (kartu diskala ke ukuran pil, jadi pusat kartu = pusat pil).
         // Pil mati: dasar tumpukan keadaan 2, minimal originFrac (garis merah).
         val pg = pillGeo
         val toPill = Config.pillOn && pg[2] > 1f && pg[3] > 1f
         var origin: Float
-        if (soloMedia) {
-            origin = pg[1]
-        } else if (toPill) {
+        if (toPill) {
             origin = pg[1] + pg[3]
         } else {
             origin = dm.heightPixels * Config.originFrac
@@ -1825,25 +1387,12 @@ class MainHook : IXposedHookLoadPackage {
         if (count == 1) "\u2022 1 Notification" else "\u2022 $count Notifications"
 
     private fun ensureLabels(root: ViewGroup) {
-        if (labelCenter?.parent === root && labelCount?.parent === root && pill?.parent === root) return
+        if (labelCenter?.parent === root && labelCount?.parent === root) return
         (labelCenter?.parent as? ViewGroup)?.removeView(labelCenter)
         (labelCount?.parent as? ViewGroup)?.removeView(labelCount)
-        (pill?.parent as? ViewGroup)?.removeView(pill)
         val ctx = root.context
 
-        // pil dipasang lebih dulu dari kedua teks, jadi teks selalu tergambar di atas pil
-        val pv = PillView(ctx)
-        pv.visibility = View.INVISIBLE
-        root.addView(pv, ViewGroup.LayoutParams(2, 2))
-        pill = pv
-        pillBlur = null
-        pillBlurTries = 0
-        pillLastBlur = -1
-        pillLastTint = -1
-        pillLastRad = -1f
-        pillXosBlur = null
-        pillXosTries = 0
-
+        // pil tidak dibuat di sini: dipasang oleh ensurePillHost tepat di belakang stack kartu
         val lc = makeLabel(ctx, Config.labelSp, true, Gravity.START)
         lc.text = "Notification Center"
         val ln = makeLabel(ctx, 14f, false, Gravity.CENTER_HORIZONTAL)
@@ -1859,20 +1408,12 @@ class MainHook : IXposedHookLoadPackage {
         val lc = labelCenter ?: return
         val ln = labelCount ?: return
 
-        // deteksi media player + metadatanya (dipakai halaman mini media di pil)
-        val sg = sv as? ViewGroup
-        if (!labelsBlocked(root) && sg != null) refreshMedia(sg)
-        if (!mediaAvailable && pillMediaT > 0.01f) {
-            pillMediaAnim?.cancel()
-            pillMediaT = 0f
-        }
-
         // geometri pil dihitung selalu (juga saat label disembunyikan): animasi kartu memakainya sebagai titik asal
         pillGeo = pillRect(root, count)
 
-        // layar mati / AOD / layar PIN: kedua teks dan pil memudar keluar
+        // layar mati atau layar PIN: kedua teks dan pil disembunyikan
         if (labelsBlocked(root)) {
-            fadePillOut()
+            hideLabels()
             return
         }
 
@@ -1881,44 +1422,45 @@ class MainHook : IXposedHookLoadPackage {
         val rl = IntArray(2)
         root.getLocationOnScreen(rl)
 
-        // "Notification Center": rata kiri, muncul di atas daftar; disembunyikan di mode media saja
+        // "Notification Center": rata kiri, muncul di atas daftar
         val a1 = ((a - 0.3f) / 0.5f).coerceIn(0f, 1f)
-        lc.visibility = if (!soloMedia && a1 > 0.01f) View.VISIBLE else View.INVISIBLE
-        lc.alpha = if (soloMedia) 0f else a1 * screenAlpha
+        lc.visibility = if (a1 > 0.01f) View.VISIBLE else View.INVISIBLE
+        lc.alpha = a1
         lc.setTextSize(TypedValue.COMPLEX_UNIT_SP, Config.labelSp)
         lc.setPadding((Config.labelLeftDp * d).toInt(), 0, 0, 0)
         val hc = if (lc.height > 0) lc.height.toFloat() else 26f * d
         lc.translationY = targetTop - rl[1] - hc - 6f * d
 
-        // "N Notification(s)": selalu mengikuti pil, bukan memudar lebih dulu
-        val mt = pillMediaT.coerceIn(0f, 1f)
-        ln.translationX = -pillGeo[2] * 0.45f * mt
+        // "N Notification(s)": saat kartu belum dimunculkan (atau selalu, jika countalways 1)
+        val a2 = if (count > 0) {
+            if (Config.countAlways) 1f else (1f - a * 3f).coerceIn(0f, 1f)
+        } else 0f
+
+        // animasi muncul pil: harus dipanggil SEBELUM teks diberi alpha, supaya teks tidak sempat
+        // terlihat satu frame penuh sebelum animasi mulai
+        tickPillBounce(a, pillAlpha(a, count))
+
+        ln.visibility = if (a2 * pillBounceA > 0.01f) View.VISIBLE else View.INVISIBLE
+        ln.alpha = a2 * pillBounceA
+        if (abs(ln.scaleX - pillBounceS) > 0.0005f) {
+            ln.scaleX = pillBounceS
+            ln.scaleY = pillBounceS
+        }
         if (count > 0) {
             val t = countText(count)
             if (ln.text.toString() != t) ln.text = t
         }
         val hn = if (ln.height > 0) ln.height.toFloat() else 24f * d
-        val countBaseY = dm.heightPixels * Config.countFrac - rl[1] - hn / 2f
-        ln.translationY = countBaseY
+        ln.translationY = dm.heightPixels * Config.countFrac - rl[1] - hn / 2f
 
-        updatePill(root, a, count, rl)
-
-        // teks ikut persis dengan skala/turun/fade pil, termasuk grow-in
-        val followA = if (Config.countAlways) screenAlpha else pillAnimAlpha
-        val followScale = if (a <= 0.02f) pill?.scaleX ?: pillAnimScale else pillAnimScale
-        val followAlpha = if (a <= 0.02f) pill?.alpha ?: followA else followA
-        ln.scaleX = followScale
-        ln.scaleY = followScale
-        ln.translationY = countBaseY + pillAnimDrop
-        ln.translationZ = if (followScale < 0.995f) -1f else 0f
-        ln.alpha = followAlpha * (1f - mt)
-        ln.visibility = if (count > 0 && mt < 0.985f && ln.alpha > 0.01f) View.VISIBLE else View.INVISIBLE
+        ensurePillHost(sv, root)
+        updatePill(root, a, count)
     }
 
-    private fun hideLabels(fadePill: Boolean = false) {
+    private fun hideLabels() {
         labelCenter?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
         labelCount?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
-        hidePill(fadePill)
+        hidePill()
         hideSlider()
     }
 
@@ -1932,240 +1474,78 @@ class MainHook : IXposedHookLoadPackage {
         val ln = labelCount
         val tw = ln?.paint?.measureText(countText(max(count, 1))) ?: (140f * d)
         val th = if (ln != null && ln.height > 0) ln.height.toFloat() else 24f * d
-        val countW = tw + 2f * Config.pillPadHDp * d
-        val maxW = (dm.widthPixels - 28f * d).coerceAtLeast(countW)
-        val mediaW = (Config.pillMediaDp * d).coerceIn(countW, maxW)
-        pillCountW = countW
-        pillMediaW = mediaW
-        val w = countW + (mediaW - countW) * pillMediaT.coerceIn(0f, 1f)
+        val w = tw + 2f * Config.pillPadHDp * d
         val h = th + 2f * Config.pillPadVDp * d
         val cx = dm.widthPixels / 2f
         val cy = dm.heightPixels * Config.countFrac
         return floatArrayOf(cx - w / 2f, cy - h / 2f, w, h)
     }
 
-    // ---- deteksi kartu media player untuk halaman mini di pil ----
+    // Blur pil punya tiga cara (dipilih lewat pillmode):
+    //  - blur wallpaper (default): wallpaper kunci dibaca lewat WallpaperManager, digambar ulang di dalam pil
+    //    pada posisi center-crop seperti wallpaper asli, lalu diburamkan dengan RenderEffect. Berjalan sendiri di
+    //    dalam proses System UI, jadi tidak bergantung pada dukungan blur di SurfaceFlinger.
+    //  - blur platform: ViewRootImpl.createBackgroundBlurDrawable (blur belakang-window lewat SurfaceFlinger).
+    //    Tidak ada hasilnya kalau ROM mematikan cross-window blur, atau kalau yang di belakang pil bukan window lain.
+    //  - kaca putih transparan tanpa blur (cadangan terakhir).
 
-    private fun findChild(root: View, depth: Int, pred: (View) -> Boolean): View? {
-        if (depth < 0) return null
-        if (pred(root)) return root
-        if (root is ViewGroup) {
-            for (i in 0 until root.childCount) {
-                val f = findChild(root.getChildAt(i), depth - 1, pred)
-                if (f != null) return f
-            }
-        }
-        return null
-    }
-
-    private fun isMediaCard(row: View): Boolean {
-        if (row.javaClass.name.contains("ExpandableNotificationRow")) {
+    // Baca wallpaper kunci (kalau tidak ada, wallpaper sistem) di thread terpisah, diperkecil secukupnya
+    // (tidak perlu lebih tajam dari separuh layar karena toh diburamkan).
+    private fun loadWallpaperAsync(ctx: Context, dm: DisplayMetrics) {
+        if (wpLoading || wpTries >= 3) return
+        wpLoading = true
+        wpTries++
+        val app = ctx.applicationContext ?: ctx
+        val sw = dm.widthPixels
+        val sh = dm.heightPixels
+        val pv = pill
+        Thread {
             try {
-                if (XposedHelpers.callMethod(row, "isMediaRow") == true) return true
-            } catch (_: Throwable) { }
-        }
-        if (row.javaClass.name.contains("MediaContainer")) return true
-        return findChild(row, 6) {
-            it.javaClass.name.contains("MediaContainer") ||
-                it.javaClass.name.contains("MediaCarousel") ||
-                it.javaClass.name == "com.android.systemui.statusbar.notification.row.MediaControlPanel"
-        } != null
-    }
-
-    private fun sbnOf(row: View): StatusBarNotification? = try {
-        val entry = XposedHelpers.getObjectField(row, "mEntry")
-        XposedHelpers.getObjectField(entry, "mSbn") as? StatusBarNotification
-    } catch (_: Throwable) {
-        null
-    }
-
-    private fun metaOf(row: View): Array<String> {
-        val out = arrayOf("", "", "")
-        val n = sbnOf(row)
-        if (n != null) {
-            val ex = n.notification.extras
-            out[0] = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-            out[1] = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-            out[2] = ex.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty()
-            if (out[0].isNotBlank()) return out
-        }
-        // cadangan: ambil teks terbesar yang terlihat di kartu media
-        val title = findChild(row, 9) {
-            it is TextView && it.visibility == View.VISIBLE && !it.text.isNullOrBlank()
-        } as? TextView
-        if (title != null) {
-            out[0] = title.text.toString()
-            val sub = findChild(row, 9) {
-                it is TextView && it.visibility == View.VISIBLE && it !== title && !it.text.isNullOrBlank()
-            } as? TextView
-            if (sub != null) out[1] = sub.text.toString()
-        }
-        return out
-    }
-
-    private fun largestImage(root: View, depth: Int): ImageView? {
-        if (depth < 0) return null
-        var best: ImageView? = null
-        var bestArea = 0
-        if (root is ImageView && root.visibility == View.VISIBLE && root.drawable != null) {
-            val area = root.width * root.height
-            if (area > bestArea) {
-                best = root
-                bestArea = area
-            }
-        }
-        if (root is ViewGroup) {
-            for (i in 0 until root.childCount) {
-                val c = largestImage(root.getChildAt(i), depth - 1) ?: continue
-                val area = c.width * c.height
-                if (area > bestArea) {
-                    best = c
-                    bestArea = area
+                val wm = WallpaperManager.getInstance(app)
+                var src = "lock"
+                var got = try { wm.getWallpaperFile(WallpaperManager.FLAG_LOCK) } catch (t: Throwable) { null }
+                if (got == null) {
+                    src = "system"
+                    got = try { wm.getWallpaperFile(WallpaperManager.FLAG_SYSTEM) } catch (t: Throwable) { null }
                 }
-            }
-        }
-        return best
-    }
-
-    private fun artOf(row: View): Drawable? {
-        // album art di kartu media biasanya gambar terbesar
-        largestImage(row, 9)?.drawable?.let { return it }
-        val n = sbnOf(row)
-        val icon = n?.notification?.largeIcon ?: n?.notification?.smallIcon
-        if (icon != null) {
-            try { return XposedHelpers.callMethod(icon, "loadDrawable", row.context) as? Drawable } catch (_: Throwable) { }
-        }
-        return null
-    }
-
-    private fun refreshMedia(g: ViewGroup): View? {
-        // cegah pindai yang memunculkan lagi kartu lain selama mode media saja
-        if (soloMedia) {
-            val s = soloCardRef?.get() as? View
-            if (s != null && isLaidOut(s)) {
-                mediaRowRef = WeakReference(s)
-                mediaAvailable = true
-                return s
-            }
-        }
-        val now = SystemClock.uptimeMillis()
-        val cached = mediaRowRef?.get() as? View
-        if (cached != null && isLaidOut(cached) && isMediaCard(cached) && now - mediaScanAt < 300L) {
-            mediaAvailable = true
-            return cached
-        }
-        mediaScanAt = now
-        val old = cached
-        var row: View? = null
-        for (c in collectCards(g)) {
-            if (isMediaCard(c.first)) { row = c.first; break }
-        }
-        if (row == null && old != null && isLaidOut(old) && isMediaCard(old)) row = old
-        if (row == null) {
-            if (mediaAvailable) log("pil: media player hilang")
-            mediaAvailable = false
-            mediaRowRef = null
-            mediaTitle = ""
-            mediaText = ""
-            mediaArt = null
-            return null
-        }
-        if (row !== old) {
-            mediaTitle = ""
-            mediaText = ""
-            mediaArt = null
-        }
-        val meta = metaOf(row)
-        if (meta[0].isNotBlank()) mediaTitle = meta[0]
-        if (meta[1].isNotBlank()) mediaText = meta[1] else if (meta[2].isNotBlank()) mediaText = meta[2]
-        if (mediaArt == null || row !== old) artOf(row)?.let { mediaArt = it }
-        mediaRowRef = WeakReference(row)
-        mediaAvailable = true
-        return row
-    }
-
-    private fun openNotificationCenter() {
-        val p = panelRef?.get()
-        if (p == null) {
-            log("pil: panel belum siap")
-            return
-        }
-        try {
-            XposedHelpers.callMethod(p, "expandToNotifications")
-            log("pil: buka Notification Center")
-            return
-        } catch (_: Throwable) { }
-        try {
-            XposedHelpers.callMethod(p, "expand", true)
-            log("pil: buka Notification Center (expand)")
-        } catch (t: Throwable) {
-            log("pil: gagal buka Notification Center: $t")
-        }
-    }
-
-    // buka hanya kartu media player, dengan animasi tumbuh dari pil
-    private fun openSoloMedia() {
-        val row = mediaRowRef?.get() as? View
-        if (row == null || !isMediaCard(row) || !isLaidOut(row)) {
-            log("pil: kartu media belum siap")
-            return
-        }
-        animator?.cancel()
-        scrollAnimator?.cancel()
-        soloMedia = true
-        soloCardRef = WeakReference(row)
-        pillMediaAnim?.cancel()
-        pillMediaT = 1f
-        progress = 1f
-        soloOpenT = 0f
-        soloAnim?.cancel()
-        val an = ValueAnimator.ofFloat(0f, 1f)
-        an.duration = Config.snapMs.coerceIn(150L, 800L)
-        an.interpolator = LinearInterpolator()
-        an.addUpdateListener {
-            soloOpenT = motionEase(it.animatedValue as Float)
-            applyState()
-        }
-        an.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                soloOpenT = 1f
-                applyState()
-            }
-        })
-        soloAnim = an
-        log("pil: buka media player saja")
-        applyState()
-        an.start()
-    }
-
-    // Blur pil memakai blur notifikasi XOS yang sudah ada: DepthUtil.enableEffectRowBlur memasang render effect
-    // cross-window blur pada view, mekanisme yang sama dengan latar kartu notifikasi (TrNotificationBackgroundView).
-    // View harus sudah menempel di window. Kalau tidak tersedia, pakai drawable blur platform, lalu tint biasa.
-    private fun ensurePillBlur(pv: PillView) {
-        if (!pv.isAttachedToWindow || pillXosBlur?.get() === pv) return
-
-        // 1) blur notifikasi XOS (DepthUtil + TranView)
-        if (pillXosTries < 6) {
-            pillXosTries++
-            try {
-                val cl = pv.context.classLoader
-                val depth = XposedHelpers.findClass("com.transsion.systemui.blur.DepthUtil", cl)
-                val tranCls = XposedHelpers.findClass("com.transsion.hubsdk.api.view.TranView", cl)
-                val tv = tranView ?: XposedHelpers.newInstance(tranCls).also { tranView = it }
-                XposedHelpers.callStaticMethod(depth, "enableEffectRowBlur", pv, tv)
-                pillXosBlur = WeakReference(pv)
-                pillBlur = null
-                pv.background = null
-                pv.useFallback = true   // tint pil tetap digambar di atas blur
-                log("pil: blur notifikasi XOS aktif (DepthUtil.enableEffectRowBlur)")
+                val file = got
+                if (file == null) {
+                    log("pil: file wallpaper tidak tersedia")
+                    return@Thread
+                }
+                file.use { f ->
+                    val o = BitmapFactory.Options()
+                    o.inJustDecodeBounds = true
+                    BitmapFactory.decodeFileDescriptor(f.fileDescriptor, null, o)
+                    if (o.outWidth <= 0 || o.outHeight <= 0) {
+                        log("pil: wallpaper $src tidak bisa dibaca")
+                        return@use
+                    }
+                    var sample = 1
+                    while (o.outWidth / (sample * 2) >= sw / 2 && o.outHeight / (sample * 2) >= sh / 2) sample *= 2
+                    val o2 = BitmapFactory.Options()
+                    o2.inSampleSize = sample
+                    val bmp = BitmapFactory.decodeFileDescriptor(f.fileDescriptor, null, o2)
+                    if (bmp != null) {
+                        wpBitmap = bmp
+                        log("pil: wallpaper $src ${o.outWidth}x${o.outHeight} -> ${bmp.width}x${bmp.height}")
+                        pv?.let { v -> v.post { v.invalidate() } }
+                    } else {
+                        log("pil: decode wallpaper $src gagal")
+                    }
+                }
             } catch (t: Throwable) {
-                once("pillXosFail") { log("pil: blur notifikasi XOS gagal: $t") }
+                log("pil: baca wallpaper gagal: $t")
+            } finally {
+                wpLoading = false
             }
-            if (pillXosBlur?.get() === pv) return
-        }
+        }.start()
+    }
 
-        // 2) cadangan: drawable blur belakang-window platform
-        if (pillBlur != null || pillBlurTries >= 6) return
+    // Buat drawable blur belakang-window milik platform (ViewRootImpl.createBackgroundBlurDrawable). View harus
+    // sudah menempel di window. Kalau gagal (ROM beda), dicoba lagi beberapa kali.
+    private fun ensurePillBlur(pv: PillView) {
+        if (pillBlur != null || pillBlurTries >= 6 || !pv.isAttachedToWindow) return
         pillBlurTries++
         val bd = try {
             val vri = XposedHelpers.callMethod(pv, "getViewRootImpl")
@@ -2176,37 +1556,284 @@ class MainHook : IXposedHookLoadPackage {
         }
         if (bd != null) {
             pillBlur = bd
-            pv.background = bd
-            pv.useFallback = false
             pillLastBlur = -1
             pillLastTint = -1
             pillLastRad = -1f
-            log("pil: blur drawable ${bd.javaClass.name}")
+            // diagnosa: kalau crossWindowBlur=false atau sfSupport=0, blur platform memang tidak akan terlihat
+            val en = try {
+                (pv.context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.isCrossWindowBlurEnabled
+            } catch (t: Throwable) { null }
+            log("pil: blur platform ${bd.javaClass.name} crossWindowBlur=$en " +
+                "sfSupport=${Config.sys("ro.surface_flinger.supports_background_blur")} " +
+                "disableBlurs=${Config.sys("persist.sys.sf.disable_blurs")}")
         } else if (pillBlurTries >= 6) {
-            log("pil: blur platform tidak tersedia, pakai kaca transparan biasa")
+            log("pil: blur platform tidak tersedia")
         }
     }
 
-    // Pil terlihat bersama teks "N Notifications", tapi memudar sedikit lebih lambat dari teks supaya kartu
-    // yang keluar dari pil terlihat muncul dari kaca. Alpha lewat radius blur + alpha tint (bukan View.alpha,
-    // karena View.alpha tidak ikut memudarkan blur belakang-window).
-    private fun updatePill(root: ViewGroup, a: Float, count: Int, rl: IntArray) {
-        val pv = pill ?: return
-        val pr = pillGeo
-        val pa = when {
-            !Config.pillOn || count <= 0 -> 0f
-            Config.countAlways -> 1f
-            // biarkan pil terlihat lebih lama supaya sempat mengecil dan masuk ke belakang kartu
-            else -> (1f - (a - 0.55f) * 2.2f).coerceIn(0f, 1f)
+    // ---- animasi muncul pil (grow in + bounce) ----
+
+    // alpha pil terhadap kemajuan a: terlihat bersama teks "N Notifications", tapi memudar sedikit lebih lambat
+    // dari teks supaya kartu yang keluar dari pil terlihat muncul dari kaca
+    private fun pillAlpha(a: Float, count: Int): Float = when {
+        !Config.pillOn || count <= 0 -> 0f
+        Config.countAlways -> 1f
+        else -> (1f - (a - 0.1f) * 2.5f).coerceIn(0f, 1f)
+    }
+
+    // Pil "muncul" kalau sudah terlihat dalam keadaan diam (a ~ 0): saat layar menyala, saat jumlah notifikasi
+    // dari 0 jadi ada, dan saat kartu selesai mengecil kembali ke pil. Dipanggil sebelum teks diberi alpha,
+    // supaya teks tidak sempat terlihat satu frame penuh sebelum animasi mulai.
+    private fun tickPillBounce(a: Float, pa: Float) {
+        if (a >= 0.02f || pa < 0.01f) {
+            pillWasRest = false
+            return
         }
-        if (pa < 0.02f || pr[2] < 2f) {
-            pillAnimAlpha = 0f
-            pillAnimScale = 1f
-            pillAnimDrop = 0f
+        if (!pillWasRest) {
+            pillWasRest = true
+            startPillBounce()
+        }
+    }
+
+    // kurva pegas teredam: naik dari 0, melewati 1 (sekitar 20%), turun sedikit di bawah 1, lalu menetap di 1
+    private fun bounceCurve(t: Float): Float {
+        if (t >= 1f) return 1f
+        return max(0f, 1f - exp(-4.8f * t) * cos(2f * Math.PI.toFloat() * 1.5f * t))
+    }
+
+    private fun startPillBounce() {
+        val ms = Config.pillBounceMs
+        if (ms <= 0L) return
+        val now = SystemClock.uptimeMillis()
+        if (now - pillLastBounce < 350L) return
+        pillLastBounce = now
+        pillBounceAnim?.cancel()
+        pillBounceS = 0.0001f
+        pillBounceA = 0f
+        val an = ValueAnimator.ofFloat(0f, 1f)
+        an.duration = ms
+        an.interpolator = LinearInterpolator()
+        an.addUpdateListener {
+            val t = it.animatedFraction
+            pillBounceS = bounceCurve(t)
+            pillBounceA = if (t >= 1f) 1f else min(1f, t * 4f)
+            applyState()
+        }
+        pillBounceAnim = an
+        an.start()
+    }
+
+    // ---- tempat pil ----
+
+    // Pil dipasang di view induk stack notifikasi, tepat SEBELUM stack, jadi tergambar di belakang kartu
+    // notifikasi tapi di atas wallpaper. Teks "N Notifications" ada di root, jadi tetap di atas pil.
+    // Dicek tiap frame (sistem bisa mengubah urutan anak); kalau induk stack tidak bisa dipasangi, pakai root.
+    private fun ensurePillHost(sv: View, root: ViewGroup) {
+        var host = (sv.parent as? ViewGroup) ?: root
+        var pv = pill
+        if (pv == null) {
+            pv = PillView(host.context)
+            pv.visibility = View.INVISIBLE
+            pill = pv
+        }
+        val before = host.indexOfChild(sv)
+        if (pv.parent === host && (before < 0 || host.indexOfChild(pv) == before - 1)) return
+
+        (pv.parent as? ViewGroup)?.removeView(pv)
+        // pil baru dipasang: semua state blur dihitung ulang
+        pillBlur = null
+        pillBlurTries = 0
+        pillLastBlur = -1
+        pillLastTint = -1
+        pillLastRad = -1f
+        pv.mode = -1
+        pv.xosState = 0
+        pv.background = null
+
+        val lp = ViewGroup.LayoutParams(max(2, pillGeo[2].toInt()), max(2, pillGeo[3].toInt()))
+        try {
+            val idx = host.indexOfChild(sv)
+            host.addView(pv, if (idx >= 0) idx else host.childCount, lp)
+        } catch (t: Throwable) {
+            once("pillHostFail") { log("pil: induk stack ${host.javaClass.name} menolak anak baru, pakai root: $t") }
+            host = root
+            (pv.parent as? ViewGroup)?.removeView(pv)
+            root.addView(pv, root.childCount, lp)
+        }
+        log("pil: dipasang di ${host.javaClass.simpleName} index ${host.indexOfChild(pv)} (stack di ${host.indexOfChild(sv)})")
+    }
+
+    // ---- blur XOS (DepthUtil) ----
+
+    private class XosTarget(val m: java.lang.reflect.Method, val inst: Any?)
+
+    private fun sigOf(m: java.lang.reflect.Method): String =
+        m.declaringClass.simpleName + "." + m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")" +
+            (if (java.lang.reflect.Modifier.isStatic(m.modifiers)) " static" else "")
+
+    // Catat method DepthUtil dan TranView yang berhubungan dengan blur (sekali saja), supaya kelihatan
+    // signature aslinya di ROM ini: logcat | grep IOSLock | grep xos
+    private fun dumpXos(cl: ClassLoader, depth: Class<*>) {
+        try {
+            val re = Regex("blur|effect|row|depth", RegexOption.IGNORE_CASE)
+            val sb = StringBuilder()
+            var n = 0
+            for (m in depth.declaredMethods) {
+                if (n >= 40) break
+                if (re.containsMatchIn(m.name)) { sb.append("\n  ").append(sigOf(m)); n++ }
+            }
+            val hasInst = try { XposedHelpers.getStaticObjectField(depth, "INSTANCE") != null } catch (t: Throwable) { false }
+            val hasComp = try { XposedHelpers.getStaticObjectField(depth, "Companion") != null } catch (t: Throwable) { false }
+            log("xos: DepthUtil INSTANCE=$hasInst Companion=$hasComp methods:$sb")
+            val tran = XposedHelpers.findClassIfExists(xosTranName, cl)
+            if (tran == null) {
+                log("xos: TranView tidak ada")
+            } else {
+                val sb2 = StringBuilder()
+                var k = 0
+                for (m in tran.declaredMethods) {
+                    if (k >= 30) break
+                    if (m.name.contains("lur", true) || m.name.contains("ffect", true)) { sb2.append("\n  ").append(sigOf(m)); k++ }
+                }
+                log("xos: TranView methods:$sb2")
+            }
+        } catch (t: Throwable) {
+            log("xos: dump gagal: $t")
+        }
+    }
+
+    // Isi argumen dari tipenya. Parameter View pertama = pil (parameter View berikutnya = induk pil), Context =
+    // context pil, angka dan boolean dari Config (debug.ioslock.xosint / xosfloat / xosbool). Kalau tidak ada
+    // parameter yang menerima View, method itu dilewati.
+    private fun buildXosArgs(types: Array<Class<*>>, pv: PillView): Array<Any?>? {
+        var gotView = false
+        val parent = pv.parent
+        val out = arrayOfNulls<Any?>(types.size)
+        for (i in types.indices) {
+            val p = types[i]
+            out[i] = when {
+                p == Boolean::class.javaPrimitiveType || p == Boolean::class.javaObjectType -> Config.pillXosBool
+                p == Int::class.javaPrimitiveType || p == Int::class.javaObjectType -> Config.pillXosInt
+                p == Float::class.javaPrimitiveType || p == Float::class.javaObjectType -> Config.pillXosFloat
+                p == Long::class.javaPrimitiveType || p == Long::class.javaObjectType -> 0L
+                p == Double::class.javaPrimitiveType || p == Double::class.javaObjectType -> 0.0
+                p == String::class.java -> ""
+                p == Context::class.java -> pv.context
+                p != Any::class.java && p.isAssignableFrom(pv.javaClass) -> {
+                    if (gotView && parent != null && p.isAssignableFrom(parent.javaClass)) parent
+                    else { gotView = true; pv }
+                }
+                parent != null && p != Any::class.java && p.isAssignableFrom(parent.javaClass) -> parent
+                else -> null
+            }
+        }
+        return if (gotView) out else null
+    }
+
+    // Panggil DepthUtil.enableEffectRowBlur(pil, ...) lewat refleksi: blur yang sama dengan latar kartu
+    // notifikasi XOS. Method dicari di class (static), lewat INSTANCE (Kotlin object), atau lewat Companion.
+    // Overload dengan parameter paling sedikit dicoba lebih dulu.
+    private fun applyXosBlur(pv: PillView): Boolean {
+        val cl = sysCl ?: return false
+        val depth = XposedHelpers.findClassIfExists(xosDepthName, cl)
+        if (depth == null) {
+            once("xosMiss") { log("xos: class $xosDepthName tidak ada di ROM ini") }
+            return false
+        }
+        once("xosDump") { dumpXos(cl, depth) }
+
+        val targets = ArrayList<XosTarget>()
+        fun collect(c: Class<*>, inst: Any?) {
+            for (m in c.declaredMethods) {
+                if (m.name == "enableEffectRowBlur" && !m.isSynthetic) targets.add(XosTarget(m, inst))
+            }
+        }
+        val instObj = try { XposedHelpers.getStaticObjectField(depth, "INSTANCE") } catch (t: Throwable) { null }
+        collect(depth, instObj)
+        val comp = try { XposedHelpers.getStaticObjectField(depth, "Companion") } catch (t: Throwable) { null }
+        if (comp != null) collect(comp.javaClass, comp)
+        if (targets.isEmpty()) {
+            once("xosNoMethod") { log("xos: enableEffectRowBlur tidak ditemukan di DepthUtil") }
+            return false
+        }
+        targets.sortBy { it.m.parameterTypes.size }
+
+        for (t in targets) {
+            val args = buildXosArgs(t.m.parameterTypes, pv)
+            if (args == null) {
+                log("xos: lewati ${sigOf(t.m)} (tidak ada parameter View)")
+                continue
+            }
+            try {
+                t.m.isAccessible = true
+                val recv: Any? = if (java.lang.reflect.Modifier.isStatic(t.m.modifiers)) null else t.inst
+                if (recv == null && !java.lang.reflect.Modifier.isStatic(t.m.modifiers)) {
+                    log("xos: lewati ${sigOf(t.m)} (tidak ada instance)")
+                    continue
+                }
+                t.m.invoke(recv, *args)
+                log("xos: dipanggil ${sigOf(t.m)} args=${args.joinToString { it?.javaClass?.simpleName ?: "null" }}")
+                return true
+            } catch (e: Throwable) {
+                log("xos: ${sigOf(t.m)} gagal: ${e.cause ?: e}")
+            }
+        }
+        return false
+    }
+
+    // Blur XOS dipasang sekali per pil, setelah pil menempel di window dan punya ukuran.
+    private fun xosReady(pv: PillView): Boolean {
+        if (pv.xosState == 1) return true
+        if (pv.xosState == 2) return false
+        if (!pv.isAttachedToWindow || pv.width <= 0 || pv.height <= 0) return false
+        val ok = try { applyXosBlur(pv) } catch (t: Throwable) {
+            log("xos: error tak terduga: $t")
+            false
+        }
+        pv.xosState = if (ok) 1 else 2
+        return ok
+    }
+
+    // ---- memilih cara blur ----
+
+    // Urutan percobaan (pillmode 0 = otomatis): 3 = blur XOS (DepthUtil), 2 = blur wallpaper, 1 = blur platform,
+    // 0 = kaca putih transparan. Yang belum siap (misal wallpaper masih dimuat) dilewati sementara.
+    private fun resolvePillMode(pv: PillView, root: ViewGroup, dm: DisplayMetrics): Int {
+        val order = when (Config.pillMode) {
+            1 -> intArrayOf(1, 0)
+            2 -> intArrayOf(2, 1, 0)
+            3 -> intArrayOf(0)
+            4 -> intArrayOf(3, 0)
+            else -> intArrayOf(3, 2, 1, 0)
+        }
+        for (m in order) {
+            when (m) {
+                3 -> if (xosReady(pv)) return 3
+                2 -> {
+                    if (wpBitmap != null) return 2
+                    loadWallpaperAsync(root.context, dm)
+                }
+                1 -> {
+                    ensurePillBlur(pv)
+                    if (pillBlur != null) return 1
+                }
+                else -> return 0
+            }
+        }
+        return 0
+    }
+
+    private fun updatePill(root: ViewGroup, a: Float, count: Int) {
+        val pv = pill ?: return
+        val host = pv.parent as? ViewGroup ?: return
+        val pr = pillGeo
+        val pa = pillAlpha(a, count)
+        if (pa < 0.01f || pr[2] < 2f) {
             hidePill()
             return
         }
-        val d = root.resources.displayMetrics.density
+        val dm = root.resources.displayMetrics
+        val d = dm.density
         val w = pr[2].toInt()
         val h = pr[3].toInt()
         val lp = pv.layoutParams
@@ -2215,306 +1842,214 @@ class MainHook : IXposedHookLoadPackage {
             lp.height = h
             pv.requestLayout()
         }
-        val baseY = pr[1] - rl[1]
-        pv.translationX = pr[0] - rl[0]
-        pv.translationY = baseY
-        if (pv.visibility != View.VISIBLE) {
-            if (a < 0.02f && screenAlpha >= 0.999f) pv.showBouncy() else pv.showNow()
-        } else if (a > 0.02f) {
-            // pengguna sudah mulai menggeser: hentikan grow-in, skala diatur animasi masuk keadaan 2
-            pv.animate().cancel()
-        }
-        // ikut memudar/muncul saat pil masuk/keluar dari belakang kartu (jangan ganggu grow-in di keadaan 1).
-        // screenAlpha dipakai untuk fade saat layar kunci dibuka.
-        if (a > 0.02f || screenAlpha < 0.999f) pv.alpha = pa * screenAlpha
-
-        // masuk keadaan 2: pil mengecil ke bawah dengan kurva ease-out, lalu pindah ke belakang kartu
-        pillAnimAlpha = pa * screenAlpha
-        val shrink = Config.pillShrink.coerceIn(0.05f, 0.6f)
-        val drop = Config.pillDropDp.coerceIn(0f, 40f) * d
-        if (a > 0.001f) {
-            val bt = motionEase((a / 0.85f).coerceIn(0f, 1f))
-            val s = 1f - shrink * bt
-            pillAnimScale = s
-            pillAnimDrop = drop * bt
-            pv.scaleX = s
-            pv.scaleY = s
-            pv.translationY = baseY + drop * bt
-            pv.translationZ = -1f
-        } else {
-            pillAnimScale = 1f
-            pillAnimDrop = 0f
-            pv.translationZ = 0f
-        }
+        // pil bukan anak root: posisi layar yang diinginkan dikurangi posisi layar bawaan pil di induknya
+        val hl = IntArray(2)
+        host.getLocationOnScreen(hl)
+        pv.translationX = pr[0] - (hl[0] + pv.left)
+        pv.translationY = pr[1] - (hl[1] + pv.top)
+        if (pv.visibility != View.VISIBLE) pv.visibility = View.VISIBLE
 
         val radius = if (Config.pillRadiusDp >= 0f) Config.pillRadiusDp * d else pr[3] / 2f
-        val blurR = (Config.pillBlurPx * pa * screenAlpha).toInt()
-        val tintA = (Config.pillTintA * pa * screenAlpha).toInt().coerceIn(0, 255)
-        pv.setMedia(pillMediaT, mediaTitle, mediaText, mediaArt)
-        if (pillMediaT > 0.01f) pv.invalidate()
+        val blurR = (Config.pillBlurPx * pa).toInt()
+        val tintA = (Config.pillTintA * pa).toInt().coerceIn(0, 255)
 
-        ensurePillBlur(pv)
-        val bd = pillBlur
-        if (bd != null) {
-            try {
-                bd.alpha = (255 * screenAlpha).toInt().coerceIn(0, 255)
-                if (blurR != pillLastBlur) {
-                    XposedHelpers.callMethod(bd, "setBlurRadius", blurR)
-                    pillLastBlur = blurR
+        val mode = resolvePillMode(pv, root, dm)
+        val prev = pv.mode
+        if (prev != mode) {
+            pv.mode = mode
+            // mode 3: background dipasang oleh blur XOS sendiri, jangan disentuh
+            if (mode == 1) pv.background = pillBlur else if (prev == 1) pv.background = null
+            pv.invalidate()
+            logT("pilMode", "mode=$mode (3 xos, 2 wallpaper, 1 platform, 0 kaca)", discrete = true)
+        }
+
+        // animasi muncul: skala dan alpha dari pillBounceS / pillBounceA (1 kalau tidak sedang beranimasi)
+        if (abs(pv.scaleX - pillBounceS) > 0.0005f) {
+            pv.scaleX = pillBounceS
+            pv.scaleY = pillBounceS
+        }
+        val va = pillBounceA * (if (mode == 3) pa else 1f)
+        if (abs(pv.alpha - va) > 0.004f) pv.alpha = va
+
+        when (mode) {
+            2 -> {
+                val bmp = wpBitmap
+                if (bmp != null) {
+                    // wallpaper digambar center-crop ke layar penuh: skala = sisi terbesar yang menutup layar
+                    val sw = dm.widthPixels.toFloat()
+                    val sh = dm.heightPixels.toFloat()
+                    val zoom = Config.pillWpZoom.coerceIn(0.5f, 3f)
+                    val s0 = max(sw / bmp.width, sh / bmp.height) * zoom
+                    val dx = (sw - bmp.width * s0) / 2f + Config.pillWpDx
+                    val dy = (sh - bmp.height * s0) / 2f + Config.pillWpDy
+                    pv.setWallpaper(bmp, s0, dx, dy, pr[0], pr[1])
+                    logT("pilWp", "bmp=${bmp.width}x${bmp.height} s=${"%.3f".format(s0)} dx=${dx.toInt()} dy=${dy.toInt()}", discrete = true)
                 }
-                if (tintA != pillLastTint) {
-                    XposedHelpers.callMethod(bd, "setColor", Color.argb(tintA, 255, 255, 255))
-                    pillLastTint = tintA
-                }
-                if (abs(radius - pillLastRad) > 0.5f) {
-                    XposedHelpers.callMethod(bd, "setCornerRadius", radius)
-                    pillLastRad = radius
-                }
-            } catch (t: Throwable) {
-                once("pillBlurSet") { log("pil: atur blur gagal, pakai kaca transparan biasa: $t") }
-                pillBlur = null
-                pillBlurTries = 99
-                pv.background = null
-                pv.useFallback = true
-                pv.invalidate()
+                pv.setLook(radius, tintA, Config.pillBlurPx * 0.5f * pa, pa)
             }
+            1 -> {
+                pv.setLook(radius, 0, 0f, pa)
+                val bd = pillBlur
+                if (bd != null) {
+                    try {
+                        if (blurR != pillLastBlur) {
+                            XposedHelpers.callMethod(bd, "setBlurRadius", blurR)
+                            pillLastBlur = blurR
+                        }
+                        if (tintA != pillLastTint) {
+                            XposedHelpers.callMethod(bd, "setColor", Color.argb(tintA, 255, 255, 255))
+                            pillLastTint = tintA
+                        }
+                        if (abs(radius - pillLastRad) > 0.5f) {
+                            XposedHelpers.callMethod(bd, "setCornerRadius", radius)
+                            pillLastRad = radius
+                        }
+                    } catch (t: Throwable) {
+                        once("pillBlurSet") { log("pil: atur blur platform gagal, pakai kaca biasa: $t") }
+                        pillBlur = null
+                        pillBlurTries = 99
+                        pv.mode = 0
+                        pv.background = null
+                        pv.invalidate()
+                    }
+                }
+            }
+            // 3 (XOS) dan 0 (kaca): hanya tint putih transparan di atas blur XOS / tanpa blur
+            else -> pv.setLook(radius, tintA, 0f, pa)
         }
-        // bentuk (outline) pil selalu diperbarui; tint hanya digambar kalau bukan blur drawable platform
-        pv.setFallback(radius, if (pv.useFallback) tintA else 0)
     }
 
-    private fun hidePill(fade: Boolean = false) {
+    private fun hidePill() {
+        pillWasRest = false
+        pillBounceAnim?.cancel()
+        pillBounceAnim = null
+        pillBounceS = 1f
+        pillBounceA = 1f
+        val ln = labelCount
+        if (ln != null && ln.scaleX != 1f) {
+            ln.scaleX = 1f
+            ln.scaleY = 1f
+        }
         val pv = pill ?: return
-        if (fade) {
-            pv.hideBouncy()
-        } else {
-            pv.cancelAnimations()
-            if (pv.visibility != View.INVISIBLE) pv.visibility = View.INVISIBLE
+        if (pv.scaleX != 1f) {
+            pv.scaleX = 1f
+            pv.scaleY = 1f
         }
+        if (pv.alpha != 1f) pv.alpha = 1f
+        if (pv.visibility != View.INVISIBLE) pv.visibility = View.INVISIBLE
     }
 
-    // pil: latar dari drawable blur platform (dipasang sebagai background) atau render effect XOS.
-    // onDraw menggambar tint kaca, border, dan halaman mini media player di atas blur.
+    // pil. mode 1: latar dari drawable blur platform (dipasang sebagai background, tint digambar drawable itu).
+    // mode 2: onDraw menggambar wallpaper (posisi layar sebenarnya) ke RenderNode ber-RenderEffect blur, dipotong
+    // sebesar pil, lalu tint putih di atasnya. mode 3: blur XOS dipasang dari luar (DepthUtil), onDraw hanya
+    // menambah tint. mode 0: hanya tint putih transparan.
+    // Bentuk bulat dipotong lewat outline (clipToOutline), supaya blur yang dipasang sistem ikut terpotong.
     private class PillView(ctx: Context) : View(ctx) {
-        private val d = ctx.resources.displayMetrics.density
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val border = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-        private val gloss = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-        private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 13.5f, ctx.resources.displayMetrics)
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        private val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(190, 255, 255, 255)
-            textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 11f, ctx.resources.displayMetrics)
-        }
-        private val eqPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+        private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
         private val box = RectF()
-        private val inner = RectF()
-        private val artBox = RectF()
-        private val artPath = Path()
-        private var mediaT = 0f
-        private var mediaTitle = ""
-        private var mediaText = ""
-        private var mediaArt: Drawable? = null
-        private var shown = false
-        private var hiding = false
-        var useFallback = true
+        private val clipPath = Path()
+        private val node = RenderNode("ioslock_pill_blur")
+        private var effectSigma = -1f
+
+        // 0 = kaca putih transparan, 1 = blur platform, 2 = blur wallpaper, 3 = blur XOS (-1 = belum dipilih)
+        var mode = -1
+        // blur XOS: 0 = belum dicoba, 1 = terpasang, 2 = gagal
+        var xosState = 0
         private var radius = 0f
         private var fillA = 0
+        private var sigma = 0f
+        private var alphaK = 1f
+        private var wp: Bitmap? = null
+        private var wpS = 1f
+        private var wpDx = 0f
+        private var wpDy = 0f
+        private var posX = 0f
+        private var posY = 0f
 
         init {
-            // blur notifikasi XOS digambar di belakang view, jadi potong mengikuti bentuk pil
+            clipToOutline = true
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
-                    val r = radius.coerceIn(0f, min(view.width, view.height) / 2f)
-                    outline.setRoundRect(0, 0, view.width, view.height, r)
+                    outline.setRoundRect(0, 0, view.width, view.height, radius)
                 }
             }
-            clipToOutline = true
         }
 
-        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            super.onSizeChanged(w, h, oldw, oldh)
-            invalidateOutline()
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            // dipasang ulang ke window: efek XOS harus dipasang lagi
+            xosState = 0
         }
 
-        fun setFallback(r: Float, a: Int) {
-            if (r != radius || a != fillA) {
-                if (r != radius) {
-                    radius = r
-                    invalidateOutline()
-                }
+        fun setLook(r: Float, a: Int, sg: Float, k: Float) {
+            if (abs(r - radius) > 0.5f) {
+                radius = r
+                invalidateOutline()
+            }
+            if (a != fillA || abs(sg - sigma) > 0.4f || abs(k - alphaK) > 0.01f) {
                 fillA = a
+                sigma = sg
+                alphaK = k
                 invalidate()
             }
         }
 
-        fun setMedia(t: Float, title: String, text: String, art: Drawable?) {
-            val changed = t != mediaT
-            mediaT = t
-            mediaTitle = title
-            mediaText = text
-            mediaArt = art
-            if (changed || t > 0.01f) invalidate()
+        // b digambar dengan skala s dan geser (dx, dy) di koordinat layar; (px, py) = posisi pil di layar
+        fun setWallpaper(b: Bitmap, s: Float, dx: Float, dy: Float, px: Float, py: Float) {
+            if (b !== wp || abs(s - wpS) > 0.0005f || abs(dx - wpDx) > 0.5f || abs(dy - wpDy) > 0.5f ||
+                abs(px - posX) > 0.5f || abs(py - posY) > 0.5f
+            ) {
+                wp = b
+                wpS = s
+                wpDx = dx
+                wpDy = dy
+                posX = px
+                posY = py
+                invalidate()
+            }
         }
 
-        // muncul dengan grow-in ease-out, tanpa memantul
-        fun showBouncy() {
-            if (shown && visibility == View.VISIBLE) return
-            shown = true
-            hiding = false
-            animate().cancel()
-            alpha = 0f
-            scaleX = 0.55f
-            scaleY = 0.55f
-            visibility = View.VISIBLE
-            animate().alpha(1f).scaleX(1f).scaleY(1f)
-                .setDuration(Config.pillGrowMs.coerceIn(100L, 800L))
-                .setInterpolator(DecelerateInterpolator(2.2f))
-                .start()
-        }
-
-        fun showNow() {
-            animate().cancel()
-            shown = true
-            hiding = false
-            alpha = 1f
-            visibility = View.VISIBLE
-        }
-
-        // fade keluar (AOD / layar mati)
-        fun hideBouncy() {
-            if ((!shown && visibility != View.VISIBLE) || hiding) return
-            shown = false
-            hiding = true
-            animate().cancel()
-            animate().alpha(0f).scaleX(0.72f).scaleY(0.72f)
-                .setDuration(200L)
-                .setInterpolator(DecelerateInterpolator(2f))
-                .withEndAction {
-                    if (hiding) {
-                        visibility = View.INVISIBLE
-                        alpha = 1f
-                        scaleX = 1f
-                        scaleY = 1f
-                        hiding = false
-                    }
-                }.start()
-        }
-
-        fun cancelAnimations() {
-            animate().cancel()
-            shown = false
-            hiding = false
-            alpha = 1f
-            scaleX = 1f
-            scaleY = 1f
+        private fun drawBlurred(canvas: Canvas, w: Int, h: Int) {
+            val b = wp ?: return
+            if (b.isRecycled) return
+            val rc = canvas as? RecordingCanvas ?: return
+            val sg = sigma.coerceAtLeast(1f)
+            if (abs(sg - effectSigma) > 0.4f) {
+                node.setRenderEffect(RenderEffect.createBlurEffect(sg, sg, Shader.TileMode.CLAMP))
+                effectSigma = sg
+            }
+            // node dibuat lebih besar dari pil supaya tepi pil ikut memakai piksel di sekitarnya (bukan tepi yang di-clamp)
+            val m = (sg * 3f).toInt() + 2
+            node.setPosition(-m, -m, w + m, h + m)
+            node.setAlpha(alphaK)
+            val rec = node.beginRecording(w + 2 * m, h + 2 * m)
+            try {
+                rec.translate(m - posX, m - posY)
+                rec.translate(wpDx, wpDy)
+                rec.scale(wpS, wpS)
+                rec.drawBitmap(b, 0f, 0f, bmpPaint)
+            } finally {
+                node.endRecording()
+            }
+            clipPath.reset()
+            clipPath.addRoundRect(0f, 0f, w.toFloat(), h.toFloat(), radius, radius, Path.Direction.CW)
+            val save = canvas.save()
+            canvas.clipPath(clipPath)
+            rc.drawRenderNode(node)
+            canvas.restoreToCount(save)
         }
 
         override fun onDraw(canvas: Canvas) {
-            val w = width.toFloat()
-            val h = height.toFloat()
-            if (w < 1f || h < 1f) return
-            val r = radius.coerceIn(0f, min(w, h) / 2f)
-            box.set(0f, 0f, w, h)
-            if (useFallback && fillA > 0) {
-                paint.color = Color.argb(fillA, 255, 255, 255)
-                canvas.drawRoundRect(box, r, r, paint)
-            }
-            val mt = mediaT.coerceIn(0f, 1f)
-            if (mt > 0.01f) drawMedia(canvas, w, h, mt)
-            drawGlass(canvas, w, h, r)
-        }
-
-        // halaman mini media player: art + judul/artis + equalizer
-        private fun drawMedia(canvas: Canvas, w: Float, h: Float, t: Float) {
-            val layer = canvas.saveLayerAlpha(0f, 0f, w, h, (255f * t).toInt().coerceIn(0, 255))
-            canvas.translate((1f - t) * w, 0f)
-            val inset = 4f * d
-            val artW = (h - inset * 2f).coerceAtLeast(1f)
-            artBox.set(inset, inset, inset + artW, h - inset)
-            canvas.save()
-            artPath.reset()
-            artPath.addRoundRect(artBox, 7f * d, 7f * d, Path.Direction.CW)
-            canvas.clipPath(artPath)
-            val art = mediaArt
-            if (art != null) {
-                art.setBounds(artBox.left.toInt(), artBox.top.toInt(), artBox.right.toInt(), artBox.bottom.toInt())
-                art.draw(canvas)
-            } else {
-                paint.color = Color.argb(70, 255, 255, 255)
-                canvas.drawRect(artBox, paint)
-                paint.color = Color.WHITE
-                val cx = artBox.centerX()
-                val cy = artBox.centerY()
-                canvas.drawCircle(cx + artW * 0.12f, cy - artW * 0.1f, artW * 0.09f, paint)
-                canvas.drawRect(cx - artW * 0.14f, cy - artW * 0.1f, cx - artW * 0.07f, cy + artW * 0.18f, paint)
-            }
-            canvas.restore()
-
-            val textL = artBox.right + 9f * d
-            val eqR = w - 13f * d
-            val maxW = (eqR - 10f * d - textL).coerceAtLeast(10f * d)
-            val title = cut(if (mediaTitle.isBlank()) "Media player" else mediaTitle, titlePaint, maxW)
-            val sub = cut(if (mediaText.isBlank()) "Sedang diputar" else mediaText, subPaint, maxW)
-            val ty = h / 2f - 5f * d - (titlePaint.ascent() + titlePaint.descent()) / 2f
-            canvas.drawText(title, textL, ty, titlePaint)
-            canvas.drawText(sub, textL, ty + 15f * d, subPaint)
-
-            val now = SystemClock.uptimeMillis()
-            val bw = 2.4f * d
-            val gapw = 2.2f * d
-            val midY = h / 2f
-            for (i in 0..2) {
-                val phase = (now % 900L) / 900f + i * 0.22f
-                val frac = 0.35f + 0.65f * abs(sin(phase * 2.0 * Math.PI).toFloat())
-                val bh = (h * 0.26f) * frac
-                val x = eqR - (2 - i) * (bw + gapw)
-                canvas.drawRoundRect(x, midY - bh / 2f, x + bw, midY + bh / 2f, bw / 2f, bw / 2f, eqPaint)
-            }
-            canvas.restoreToCount(layer)
-        }
-
-        // border kaca: tepi atas terang memudar ke bawah + kilau tipis di dalam
-        private fun drawGlass(canvas: Canvas, w: Float, h: Float, r: Float) {
-            val sw = Config.pillBorderDp * d
-            val ba = Config.pillBorderA.coerceIn(0, 255)
-            if (sw <= 0f || ba <= 0) return
-            border.strokeWidth = sw
-            border.shader = LinearGradient(
-                0f, sw / 2f, 0f, h - sw / 2f,
-                intArrayOf(
-                    Color.argb(ba, 255, 255, 255),
-                    Color.argb((ba * 0.34f).toInt(), 255, 255, 255),
-                    Color.argb((ba * 0.14f).toInt(), 255, 255, 255)
-                ),
-                floatArrayOf(0f, 0.45f, 1f), Shader.TileMode.CLAMP
-            )
-            val ir = (r - sw / 2f).coerceAtLeast(0f)
-            inner.set(sw / 2f, sw / 2f, w - sw / 2f, h - sw / 2f)
-            canvas.drawRoundRect(inner, ir, ir, border)
-
-            gloss.strokeWidth = 1f * d
-            gloss.shader = LinearGradient(
-                0f, 0f, 0f, h * 0.6f,
-                Color.argb((ba * 0.5f).toInt(), 255, 255, 255), Color.TRANSPARENT, Shader.TileMode.CLAMP
-            )
-            inner.set(sw * 1.7f, sw * 1.7f, w - sw * 1.7f, h - sw * 1.7f)
-            val ir2 = (r - sw * 1.7f).coerceAtLeast(0f)
-            canvas.drawRoundRect(inner, ir2, ir2, gloss)
-        }
-
-        private fun cut(s: String, p: Paint, w: Float): String {
-            if (s.isEmpty() || p.measureText(s) <= w) return s
-            var lo = 0
-            var hi = s.length
-            while (lo < hi) {
-                val mid = (lo + hi + 1) / 2
-                if (p.measureText(s.substring(0, mid) + "…") <= w) lo = mid else hi = mid - 1
-            }
-            return if (lo <= 0) "…" else s.substring(0, lo) + "…"
+            val w = width
+            val h = height
+            if (w <= 0 || h <= 0) return
+            if (mode == 2) drawBlurred(canvas, w, h)
+            // mode 1: tint sudah digambar drawable blur platform
+            if (mode == 1 || fillA <= 0) return
+            paint.color = Color.argb(fillA, 255, 255, 255)
+            box.set(0f, 0f, w.toFloat(), h.toFloat())
+            canvas.drawRoundRect(box, radius, radius, paint)
         }
     }
 
@@ -2557,7 +2092,6 @@ class MainHook : IXposedHookLoadPackage {
 
     // sembunyikan seketika (keluar dari keadaan 3, layar mati, dll)
     private fun hideSlider() {
-        scrollAnimator?.cancel()
         val s = slider
         sliderOn = false
         if (s == null) return
@@ -2798,18 +2332,8 @@ class MainHook : IXposedHookLoadPackage {
     private fun reset(sv: View?, ctx: Context?) {
         restoreGear(ctx)
         scrollY = 0f
-        scrollAnimator?.cancel()
-        velocityTracker?.recycle()
-        velocityTracker = null
-        pillMediaAnim?.cancel()
-        soloAnim?.cancel()
-        soloAnim = null
-        pillMediaT = 0f
-        soloMedia = false
-        soloCardRef = null
-        soloOpenT = 0f
         hideDim()
-        if (screenOff || aod) hideLabels(fadePill = false) else fadePillOut()
+        hideLabels()
         restoreClip()
         if (sv == null) return
         sv.alpha = 1f
