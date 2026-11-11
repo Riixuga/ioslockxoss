@@ -89,10 +89,20 @@ object Config {
     // animasi buka tumpukan (keadaan 1 -> 2): semua kartu keluar dari satu titik di dasar tumpukan
     // (di atas teks "N Notifications"), kartu depan lebih dulu, kartu terakhir tetap di tempatnya.
     // originFrac = tepi bawah titik asal itu (0..1 tinggi layar). openStagger = seberapa bergantian (0 = serentak, maks 0.8)
+    // (originFrac dan openScale hanya dipakai kalau pil mati: setprop debug.ioslock.pill 0)
     val originFrac: Float get() = prop("debug.ioslock.originfrac").toFloatOrNull() ?: 0.855f
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // skala awal kartu saat tumpukan dibuka (kecil, di garis asal), lalu membesar ke ukuran keadaan 2
     val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.55f
+    // pil blur di belakang teks "N Notifications" (keadaan 1). Pilnya adalah kartu notifikasi asli (jadi blur
+    // bawaannya ikut) yang dikecilkan ke ukuran pil. Animasi buka tumpukan keluar dari pil ini dan animasi tutup
+    // (kartu mengecil) masuk ke pil ini: ukuran dan posisinya mengarah ke pil. Tap pil = buka tumpukan.
+    // Matikan: setprop debug.ioslock.pill 0 (kembali ke animasi lama dari titik asal)
+    val pill: Boolean get() = prop("debug.ioslock.pill") != "0"
+    // tinggi pil (dp), tambahan lebar kiri dan kanan teks (dp), dan geser vertikal (dp, positif = turun)
+    val pillHDp: Float get() = prop("debug.ioslock.pillh").toFloatOrNull() ?: 34f
+    val pillPadDp: Float get() = prop("debug.ioslock.pillpad").toFloatOrNull() ?: 18f
+    val pillDyDp: Float get() = prop("debug.ioslock.pilldy").toFloatOrNull() ?: 0f
     // keadaan 2 -> 3: kartu ke-4 dan seterusnya tetap di posisi awal sampai kartu di depannya
     // mencapai lockAt (0..1 dari gerakan kartu itu). Makin kecil = makin cepat kartu berikutnya ikut bergerak.
     val lockAt: Float get() = prop("debug.ioslock.lockat").toFloatOrNull() ?: 0.5f
@@ -202,6 +212,14 @@ class MainHook : IXposedHookLoadPackage {
     private var labelCenter: TextView? = null
     private var labelCount: TextView? = null
 
+    // pil blur keadaan 1: area pil (koordinat layar, sudah diperlebar sedikit) untuk sentuhan,
+    // kartu yang translationX-nya sedang dipakai menuju pil, dan alpha asli anak kartu yang sedang dipudarkan
+    private val pillRect = RectF()
+    @Volatile private var pillActive = false
+    private var pillDown = false
+    private val rowXSet = WeakHashMap<View, Boolean>()
+    private val childAlphaOrig = WeakHashMap<View, Float>()
+
     // state gestur. progress: 0..1 = kartu muncul (keadaan 1 -> 2), 1..2 = naik (keadaan 2 -> 3)
     @Volatile private var progress = 0f
     private var downX = 0f
@@ -256,7 +274,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.36 loaded into SystemUI")
+        log("v0.37 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -657,6 +675,7 @@ class MainHook : IXposedHookLoadPackage {
                 animator?.cancel()
                 tracking = false
                 taken = false
+                pillDown = false
             }
         }
         if (sliderDrag) {
@@ -671,6 +690,7 @@ class MainHook : IXposedHookLoadPackage {
         if (a == MotionEvent.ACTION_DOWN) {
             animator?.cancel()
             taken = false
+            pillDown = false
             downX = ev.rawX
             downY = ev.rawY
             val locked = isLocked(root.context)
@@ -683,8 +703,15 @@ class MainHook : IXposedHookLoadPackage {
             }
             logT("touchSeen", "locked=$locked state=$barState stack=${stackRef?.get() != null} cards=${hasCards()}", discrete = true)
             // tanpa kartu sama sekali, atau saat layar PIN tampil: biarkan sentuhan asli
-            tracking = locked && onKeyguardState() && hasCards() && !bouncerHook && !scanBouncer(root) &&
-                ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
+            val canTrack = locked && onKeyguardState() && hasCards() && !bouncerHook && !scanBouncer(root)
+            tracking = canTrack && ev.rawY < dm.heightPixels - Config.bottomZoneDp * dm.density
+            // sentuhan di pil (keadaan 1): kartu pil tidak boleh terbuka sebagai notifikasi, jadi sentuhannya
+            // dipegang di sini. Tap = buka tumpukan, swipe naik = ikut tahap swipe seperti biasa.
+            pillDown = canTrack && pillActive && progress < 0.02f && pillRect.contains(ev.rawX, ev.rawY)
+            if (pillDown) {
+                tracking = true
+                p.result = true
+            }
             return
         }
         if (!tracking) return
@@ -696,12 +723,15 @@ class MainHook : IXposedHookLoadPackage {
             val up = dy > slop
             val down = progress > 0f && -dy > slop
             if ((up || down) && abs(dy) > abs(dx) * 1.2f) {
-                try {
-                    val c = MotionEvent.obtain(ev)
-                    c.action = MotionEvent.ACTION_CANCEL
-                    XposedBridge.invokeOriginalMethod(p.method, p.thisObject, arrayOf<Any?>(c))
-                    c.recycle()
-                } catch (t: Throwable) { log("cancel gagal: $t") }
+                // sentuhan yang dimulai di pil tidak pernah sampai ke view asli, jadi tidak perlu dibatalkan
+                if (!pillDown) {
+                    try {
+                        val c = MotionEvent.obtain(ev)
+                        c.action = MotionEvent.ACTION_CANCEL
+                        XposedBridge.invokeOriginalMethod(p.method, p.thisObject, arrayOf<Any?>(c))
+                        c.recycle()
+                    } catch (t: Throwable) { log("cancel gagal: $t") }
+                }
                 taken = true
                 startY = ev.rawY
                 baseProgress = progress
@@ -731,6 +761,16 @@ class MainHook : IXposedHookLoadPackage {
                 }
             }
             p.result = true
+        } else if (pillDown) {
+            // sentuhan di pil yang belum jadi swipe: tetap dipegang di sini
+            p.result = true
+            if (a == MotionEvent.ACTION_UP) {
+                val slop2 = ViewConfiguration.get(root.context).scaledTouchSlop * 2
+                if (abs(ev.rawX - downX) < slop2 && abs(ev.rawY - downY) < slop2) snap(1f)
+                pillDown = false
+            } else if (a == MotionEvent.ACTION_CANCEL) {
+                pillDown = false
+            }
         }
     }
 
@@ -960,8 +1000,9 @@ class MainHook : IXposedHookLoadPackage {
         return if (k > 1) (avail - sum) / (k - 1) >= -overlapMax else sum <= avail
     }
 
-    // Seberapa jauh kartu ke-i sudah keluar dari titik asal pada kemajuan a (0..1) animasi buka tumpukan:
+    // Seberapa jauh kartu ke-i sudah keluar dari titik asal (atau pil) pada kemajuan a (0..1) animasi buka tumpukan:
     // kartu depan keluar lebih dulu, kartu di belakangnya menyusul, kartu terakhir paling akhir.
+    // Dibaca terbalik saat tumpukan menutup: kartu terakhir masuk lebih dulu, kartu depan paling akhir.
     private fun openProgress(i: Int, n: Int, a: Float, lag: Float): Float {
         val l = if (n > 1) lag.coerceIn(0f, 0.8f) else 0f
         val start = if (n > 1) l * i / (n - 1) else 0f
@@ -973,8 +1014,9 @@ class MainHook : IXposedHookLoadPackage {
     // Kartu ke-1..3 (index 0..2) bergerak bertahap dan tetap berurutan.
     // Kartu ke-4 dan seterusnya TERKUNCI di posisi keadaan 2 (la) sampai kartu di depannya mencapai
     // lockAt dari geraknya; lalu mulai bergerak sendiri ke posisi keadaan 3 (lb).
-    // Saat a < 1 (animasi buka tumpukan, keadaan 1 -> 2) semua kartu berangkat dari satu titik asal
+    // Saat a < 1 (animasi buka tumpukan, keadaan 1 -> 2) dan pil mati, semua kartu berangkat dari satu titik asal
     // (origin = tepi bawah dasar tumpukan) lalu keluar bergantian ke posisinya di keadaan 2.
+    // Saat pil nyala, applyStack memanggil ini dengan a = 1 dan mengurus gerak dari/ke pil sendiri.
     private fun composeStack(
         la: StateLayout, lb: StateLayout, a: Float, q: Float, stagger: Float,
         openStagger: Float, origin: Float, outBottom: FloatArray, outScale: FloatArray
@@ -1050,8 +1092,54 @@ class MainHook : IXposedHookLoadPackage {
         })
     }
 
-    // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari titik asal (garis bawah) sambil
-    //    membesar dari kecil (openScale) ke ukuran keadaan 2
+    // ---- pil blur (keadaan 1) ----
+
+    private fun smooth(t: Float): Float = t * t * (3f - 2f * t)
+
+    // anak kartu yang menggambar latar (blur bawaan, bayangan): tidak dipudarkan bersama isi kartu
+    private fun isBgName(n: String): Boolean =
+        n.contains("Background", true) || n.contains("Blur", true) || n.contains("Shadow", true)
+
+    // kartu yang punya latar sendiri (baris notifikasi biasa); kartu seperti media player tidak
+    private fun hasBgChild(card: View): Boolean {
+        val g = card as? ViewGroup ?: return false
+        for (i in 0 until g.childCount) {
+            val n = g.getChildAt(i).javaClass.simpleName
+            if (n.contains("Background", true) || n.contains("Blur", true)) return true
+        }
+        return false
+    }
+
+    // Pudarkan isi kartu (ikon, judul, teks) dan latarnya secara terpisah, tanpa menyentuh alpha kartu itu sendiri
+    // (alpha kartu dipakai isReal untuk menyaring view hantu). Alpha asli anak disimpan dan dipulihkan.
+    private fun fadeCard(card: View, bgA: Float, contentA: Float) {
+        val g = card as? ViewGroup ?: return
+        for (i in 0 until g.childCount) {
+            val ch = g.getChildAt(i)
+            setChildFade(ch, if (isBgName(ch.javaClass.simpleName)) bgA else contentA)
+        }
+    }
+
+    private fun setChildFade(ch: View, f: Float) {
+        val orig = childAlphaOrig[ch]
+        if (f >= 0.999f) {
+            if (orig != null) {
+                ch.alpha = orig
+                childAlphaOrig.remove(ch)
+            }
+            return
+        }
+        val base = orig ?: ch.alpha.also { childAlphaOrig[ch] = it }
+        ch.alpha = base * f
+    }
+
+    private fun countText(count: Int): String =
+        if (count == 1) "\u2022 1 Notification" else "\u2022 $count Notifications"
+
+    // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari pil di belakang teks "N Notifications"
+    //    (atau, kalau pil mati, dari titik asal di garis bawah) sambil membesar ke ukuran keadaan 2.
+    //    Saat tumpukan menutup, gerak yang sama berjalan terbalik: kartu mengecil dan ukuran serta posisinya
+    //    mengarah ke pil, isinya memudar, sampai tinggal satu kartu sebagai pil.
     // q: 0..1 jam mengecil dan daftar naik
     // Keadaan 2 (q=0): kartu penuh sebanyak full2, sisanya menumpuk di belakang kartu penuh terakhir
     // seperti dock keadaan 3 (dockStack2). Kalau dockStack2 mati, kartu di belakang jadi pita (layoutState).
@@ -1065,10 +1153,18 @@ class MainHook : IXposedHookLoadPackage {
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
-        // stack tetap opaque selama mengecil, baru memudar di ujung animasi
-        sv.alpha = (a * 8f).coerceAtMost(1f)
-        // saat tersembunyi, stack tidak boleh menerima sentuhan
-        sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
+        val pillMode = Config.pill
+        if (pillMode) {
+            // keadaan 1: stack tetap tampil supaya kartu pil kelihatan; hanya disembunyikan saat layar PIN / layar mati
+            val hide = a < 0.02f && labelsBlocked(sv.rootView)
+            sv.alpha = if (hide) 0f else 1f
+            sv.visibility = if (hide) View.INVISIBLE else View.VISIBLE
+        } else {
+            // stack tetap opaque selama mengecil, baru memudar di ujung animasi
+            sv.alpha = (a * 8f).coerceAtMost(1f)
+            // saat tersembunyi, stack tidak boleh menerima sentuhan
+            sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
+        }
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
@@ -1093,6 +1189,7 @@ class MainHook : IXposedHookLoadPackage {
         val count = notifCount(g)
 
         if (n == 0) {
+            pillActive = false
             scrollMaxPx = 0f
             scrollY = 0f
             updateLabels(sv, a, targetTop, count)
@@ -1147,13 +1244,52 @@ class MainHook : IXposedHookLoadPackage {
 
         updateLabels(sv, a, targetTop, count)
 
-        // titik asal animasi buka: dasar tumpukan keadaan 2, minimal originFrac (garis merah)
+        // pil blur (keadaan 1): kartu TERAKHIR yang punya latar blur (paling belakang, keluar paling akhir dan masuk
+        // paling dulu) jadi pil di belakang teks "N Notifications". Lebar pil = lebar teks + pillPadDp di kiri dan kanan.
+        var repIdx = -1
+        var pillW = 0f
+        var pillH = 0f
+        var pillCx = 0f
+        var pillCy = 0f
+        if (pillMode) {
+            for (i in n - 1 downTo 0) {
+                if (hasBgChild(cards[i].first)) { repIdx = i; break }
+            }
+            val pr = sv.rootView as? ViewGroup
+            if (pr != null) {
+                val rl = IntArray(2)
+                pr.getLocationOnScreen(rl)
+                pillCx = rl[0] + pr.width / 2f
+                val tw = labelCount?.paint?.measureText(countText(count)) ?: (110f * d)
+                pillW = tw + 2f * Config.pillPadDp * d
+                pillH = Config.pillHDp * d
+                pillCy = dm.heightPixels * Config.countFrac + Config.pillDyDp * d
+            }
+        }
+        val usePill = pillMode && repIdx >= 0 && pillW > 0f
+        pillActive = usePill && a < 0.05f
+        if (pillActive) {
+            val m = 10f * d
+            pillRect.set(pillCx - pillW / 2f - m, pillCy - pillH / 2f - m, pillCx + pillW / 2f + m, pillCy + pillH / 2f + m)
+        }
+        if (usePill) {
+            once("pillKids") {
+                val rg = cards[repIdx].first
+                log("pil: kartu ${rg.javaClass.simpleName}, anak: " + ((rg as? ViewGroup)?.let { v ->
+                    (0 until v.childCount).joinToString { v.getChildAt(it).javaClass.simpleName }
+                } ?: "-"))
+            }
+            logT("pill", "rep=$repIdx/$n w=${pillW.toInt()} h=${pillH.toInt()} cx=${pillCx.toInt()} cy=${pillCy.toInt()}", discrete = true)
+        }
+
+        // titik asal animasi buka (hanya kalau pil mati): dasar tumpukan keadaan 2, minimal originFrac (garis merah)
         var origin = dm.heightPixels * Config.originFrac
         for (i in 0 until n) origin = max(origin, la.bottom[i])
 
         val bottoms = FloatArray(n)
         val scales = FloatArray(n)
-        composeStack(la, lb, a, q, Config.stagger, Config.openStagger, origin, bottoms, scales)
+        // saat pil nyala, gerak dari/ke pil dihitung di loop bawah, jadi composeStack cukup memberi keadaan 2/3
+        composeStack(la, lb, if (usePill) 1f else a, q, Config.stagger, Config.openStagger, origin, bottoms, scales)
 
         // gulir + "dock": kartu yang melewati batas bawah tetap kecil dan menumpuk setebal dock.
         // Makin dekat ujung gulir, dock makin tipis, sehingga di ujung kartu terakhir tampil penuh di batas bawah.
@@ -1191,9 +1327,27 @@ class MainHook : IXposedHookLoadPackage {
 
             val kind = if (q < 0.5f) la.kind[i] else lb.kind[i]
             val s = scales[i]
-            val center = bottoms[i] - h * s / 2f
+            val center2 = bottoms[i] - h * s / 2f
             sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind)
                 .append(" h=").append(card.height).append("/").append(h.toInt()).append("]")
+
+            // dari/ke pil: ea = 1 kartu sudah di ukuran dan posisi keadaan 2, ea = 0 kartu persis di pil.
+            // Ukuran (lebar dan tinggi terpisah), posisi X dan Y, dan isi kartu ikut bergerak menuju pil.
+            val ea = if (usePill) openProgress(i, n, a, Config.openStagger) else 1f
+            var sx = s
+            var sy = s
+            var center = center2
+            var dx = 0f
+            if (ea < 0.999f) {
+                // kartu tanpa latar sendiri (mis. media player) tidak bisa jadi pil: mengecil ke titik di tengah pil
+                val hasBg = hasBgChild(card)
+                val tSx = if (hasBg) pillW / card.width else 0.001f
+                val tSy = if (hasBg) pillH / h else 0.001f
+                sx = tSx + (s - tSx) * ea
+                sy = tSy + (s - tSy) * ea
+                center = pillCy + (center2 - pillCy) * ea
+                dx = (pillCx - (loc[0] + card.left + card.width / 2f)) * (1f - ea)
+            }
 
             val wy = baseY + (center + slide - naturalCenter)
             // kartu yang lebih atas selalu di depan
@@ -1202,9 +1356,20 @@ class MainHook : IXposedHookLoadPackage {
             card.pivotX = card.width / 2f
             card.pivotY = h / 2f
             card.translationY = wy
+            // translationX hanya disentuh selama kartu masih menuju/dari pil (supaya swipe-dismiss bawaan tidak terganggu)
+            if (usePill && (ea < 0.999f || rowXSet.containsKey(card))) {
+                card.translationX = dx
+                if (ea < 0.999f) rowXSet[card] = true else rowXSet.remove(card)
+            }
             card.translationZ = wz
-            card.scaleX = s
-            card.scaleY = s
+            card.scaleX = sx
+            card.scaleY = sy
+            if (usePill) {
+                // isi kartu memudar mendekati pil; latar kartu lain ikut memudar, latar kartu pil tetap penuh
+                val contentA = smooth(((ea - 0.25f) / 0.5f).coerceIn(0f, 1f))
+                val bgA = if (i == repIdx) 1f else smooth((ea / 0.35f).coerceIn(0f, 1f))
+                fadeCard(card, bgA, contentA)
+            }
             // potong bagian atas kartu yang ter-scroll melewati garis atas daftar; fade-nya digambar oleh mask
             val csy = center + slide
             val iy0 = (h / 2f + (smallTop - csy) / s).toInt()
@@ -1290,7 +1455,7 @@ class MainHook : IXposedHookLoadPackage {
         ln.visibility = if (a2 > 0.01f) View.VISIBLE else View.INVISIBLE
         ln.alpha = a2
         if (count > 0) {
-            val t = if (count == 1) "\u2022 1 Notification" else "\u2022 $count Notifications"
+            val t = countText(count)
             if (ln.text.toString() != t) ln.text = t
         }
         val hn = if (ln.height > 0) ln.height.toFloat() else 24f * d
@@ -1582,9 +1747,17 @@ class MainHook : IXposedHookLoadPackage {
     private fun reset(sv: View?, ctx: Context?) {
         restoreGear(ctx)
         scrollY = 0f
+        pillActive = false
+        pillDown = false
         hideDim()
         hideLabels()
         restoreClip()
+        // pulihkan alpha anak kartu yang dipudarkan untuk pil
+        for (e in childAlphaOrig.entries.toList()) {
+            val v = e.key ?: continue
+            v.alpha = e.value
+        }
+        childAlphaOrig.clear()
         if (sv == null) return
         sv.alpha = 1f
         sv.visibility = View.VISIBLE
@@ -1596,6 +1769,7 @@ class MainHook : IXposedHookLoadPackage {
             if (st != null) {
                 if (abs(c.translationY - st[1]) < 0.01f) c.translationY = st[0]
                 if (abs(c.translationZ - st[3]) < 0.01f) c.translationZ = st[2]
+                if (rowXSet.remove(c) != null) c.translationX = 0f
                 c.scaleX = 1f
                 c.scaleY = 1f
                 c.clipBounds = null
