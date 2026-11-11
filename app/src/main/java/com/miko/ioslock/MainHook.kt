@@ -94,13 +94,15 @@ object Config {
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // skala awal kartu saat tumpukan dibuka (kecil, di garis asal), lalu membesar ke ukuran keadaan 2
     val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.55f
-    // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
-    val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
+    // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang kartu penuh terakhir)
+    val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 2 // BARU: default 2
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
-    // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan (semua kartu tampil penuh, jarak gap2Dp)
-    val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 3
+    // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan. 0 = selalu menumpuk (BARU: default 0)
+    val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 0
     val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
+    // keadaan 2: kartu penuh terakhir (di depan tumpukan) diperbesar sedikit supaya tumpukan di belakangnya terlihat rapi (1 = normal)
+    val front2Scale: Float get() = prop("debug.ioslock.front2scale").toFloatOrNull() ?: 1.04f // BARU
     // keadaan 2: semua kartu setelah kartu depan menumpuk di belakangnya PERSIS seperti tumpukan bawah ("dock") keadaan 3
     // (pakai dockScale / dockRefDp yang sama). 0 = kembali ke pita lama (maks bands2 pita, sisanya tersembunyi).
     val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") != "0"
@@ -125,11 +127,6 @@ object Config {
     // (0 = potong datar). Wallpaper digelapkan sebesar dimAlpha (0..1) saat masuk keadaan 3 (0 = mati).
     val topFadeDp: Float get() = prop("debug.ioslock.topfade").toFloatOrNull() ?: 44f
     val dimAlpha: Float get() = prop("debug.ioslock.dim").toFloatOrNull() ?: 0.28f
-    // home screen / shade (di luar lockscreen, setelah kunci dibuka): garis potong atas (0..1 tinggi layar,
-    // tepat di bawah jam/tanggal; 0 = tanpa mask sama sekali) dan tebal fade (dp). Dibuat jauh lebih sempit
-    // daripada topFadeDp / smallFrac milik lockscreen supaya notifikasi di home tidak ikut terpotong lebar.
-    val shadeLineFrac: Float get() = prop("debug.ioslock.shadeline").toFloatOrNull() ?: 0.165f
-    val shadeFadeDp: Float get() = prop("debug.ioslock.shadefade").toFloatOrNull() ?: 14f
     // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
     // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
     val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
@@ -331,6 +328,7 @@ class MainHook : IXposedHookLoadPackage {
                 lastGearWritten = null
             }
             barState = s
+            if (s != 1) clearMask(stackRef?.get())   // BARU: keluar dari keyguard = fade dimatikan
             logT("barState", "state=$s", discrete = true)
             applyState()
         })
@@ -751,10 +749,9 @@ class MainHook : IXposedHookLoadPackage {
             val locked = ctx != null && isLocked(ctx)
             val onKeyguard = locked && onKeyguardState()
             if (!Config.gesture || !onKeyguard) {
+                clearMask(sv)                       // BARU
                 if (applied) { reset(sv, ctx); applied = false }
                 if (!locked) { progress = 0f; scrollY = 0f }
-                // di luar lockscreen (home / shade): mask keadaan 3 yang tertinggal diganti dengan mask home yang sempit
-                if (sv != null) applyShadeMask(sv)
                 return
             }
             applied = true
@@ -893,9 +890,10 @@ class MainHook : IXposedHookLoadPackage {
     // tepi bawah = dasar kartu depan + dock * (1 - exp(-o / (1.3 * dock))), skala = 1 - dScale * min(1, o / ref),
     // o = jarak kartu itu dari dasar kartu depan kalau daftar dibentangkan. Makin dalam makin tipis dan makin kecil,
     // jadi berapa pun jumlah kartunya semuanya ikut menumpuk. dock dibatasi supaya dasar tumpukan <= limit.
+    // frontScale: skala kartu penuh terakhir (di depan tumpukan); tepi bawahnya tetap di tempat.
     private fun layoutDockStack(
         hs: FloatArray, top: Float, gap: Float, full: Int,
-        dock0: Float, limit: Float, ref: Float, dScale: Float
+        dock0: Float, limit: Float, ref: Float, dScale: Float, frontScale: Float
     ): StateLayout {
         val n = hs.size
         val out = StateLayout(n)
@@ -912,7 +910,8 @@ class MainHook : IXposedHookLoadPackage {
         for (i in 0 until n) {
             if (i < k) {
                 out.bottom[i] = spread[i]
-                out.scale[i] = 1f
+                // kartu penuh terakhir (di depan tumpukan) sedikit diperbesar; tepi bawahnya tetap
+                out.scale[i] = if (i == k - 1) frontScale else 1f
                 out.kind[i] = 0
             } else {
                 val o = spread[i] - fullBottom
@@ -1063,7 +1062,8 @@ class MainHook : IXposedHookLoadPackage {
             Config.dockStack2 -> layoutDockStack(
                 hs, restTop, Config.gap2Dp * d, Config.full2,
                 (if (Config.dock2Dp > 0f) Config.dock2Dp else Config.dockDp) * d, bottom2,
-                (Config.dockRefDp * d).coerceAtLeast(1f), Config.dockScale.coerceIn(0f, 0.3f)
+                (Config.dockRefDp * d).coerceAtLeast(1f), Config.dockScale.coerceIn(0f, 0.3f),
+                Config.front2Scale.coerceIn(1f, 1.2f)
             )
             else -> layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
                 minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
@@ -1383,7 +1383,8 @@ class MainHook : IXposedHookLoadPackage {
                 override fun beforeHookedMethod(p: MethodHookParam) {
                     try {
                         val view = p.thisObject as? View ?: return
-                        if (!maskOn || view !== stackRef?.get()) return
+                        // BARU: mask hanya boleh digambar saat keyguard
+                        if (!maskOn || barState != 1 || view !== stackRef?.get()) return
                         val canvas = p.args[0] as? Canvas ?: return
                         val loc = IntArray(2)
                         view.getLocationOnScreen(loc)
@@ -1427,35 +1428,22 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
+    // BARU: matikan fade atas daftar. Dipanggil setiap keluar dari keyguard supaya notifikasi di home screen tidak ikut terpotong.
+    private fun clearMask(sv: View?) {
+        if (!maskOn && maskStrength == 0f && maskFade == 0f) return
+        maskOn = false
+        maskStrength = 0f
+        maskFade = 0f
+        sv?.invalidate()
+    }
+
     // on = ada kartu yang ter-scroll melewati garis atas. Kekuatan fade naik bertahap seiring jarak gulir.
     private fun updateMask(sv: View, on: Boolean, scroll: Float, line: Float, d: Float) {
         ensureMaskHook(sv)
         val fade = Config.topFadeDp * d
         val st = if (on && fade > 1f) (scroll / (fade * 0.8f)).coerceIn(0f, 1f) else 0f
-        setMask(sv, on && maskReady, line, fade, st)
-    }
-
-    // Mask di luar lockscreen (home screen / shade): garis potong di bawah jam dan fade tipis (shadeLineFrac,
-    // shadeFadeDp). Dipanggil dari applyState setiap kali bukan keadaan lockscreen, jadi sekaligus menimpa mask
-    // keadaan 3 (garis smallFrac, fade topFadeDp) yang tadinya tertinggal saat kunci dibuka.
-    private fun applyShadeMask(sv: View) {
-        val dm = sv.resources.displayMetrics
-        val line = dm.heightPixels * Config.shadeLineFrac
-        if (!Config.gesture || line < 1f) {
-            if (maskOn) setMask(sv, false, maskLine, maskFade, 0f)
-            return
-        }
-        ensureMaskHook(sv)
-        val fade = Config.shadeFadeDp * dm.density
-        setMask(sv, maskReady, line, fade, 1f)
-        logT("shadeMask", "line=${line.toInt()} fade=${fade.toInt()} on=$maskReady state=$barState", discrete = true)
-    }
-
-    // Tulis parameter mask; view digambar ulang kalau ada yang berubah (termasuk garis dan tebal fade,
-    // supaya perpindahan lockscreen -> home langsung terlihat).
-    private fun setMask(sv: View, active: Boolean, line: Float, fade: Float, st: Float) {
-        val changed = active != maskOn || abs(st - maskStrength) > 0.01f ||
-            abs(line - maskLine) > 0.5f || abs(fade - maskFade) > 0.5f
+        val active = on && maskReady
+        val changed = active != maskOn || abs(st - maskStrength) > 0.01f
         maskOn = active
         maskLine = line
         maskFade = fade
