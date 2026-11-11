@@ -97,19 +97,19 @@ object Config {
     // keadaan 2 -> 3: kartu ke-4 dan seterusnya tetap di posisi awal sampai kartu di depannya
     // mencapai lockAt (0..1 dari gerakan kartu itu). Makin kecil = makin cepat kartu berikutnya ikut bergerak.
     val lockAt: Float get() = prop("debug.ioslock.lockat").toFloatOrNull() ?: 0.5f
-    // keadaan 2: jumlah kartu penuh (kartu depan). Sisanya tampil sebagai pita di belakang kartu depan.
-    // Default 1: satu kartu penuh, lalu bands2 pita di belakangnya, sisanya menumpuk tepat di belakang pita terakhir.
+    // keadaan 2: batas maksimum kartu penuh (kartu depan). Jumlah yang benar-benar tampil ditentukan
+    // fitFull2 berdasarkan tinggi layar sampai bottom2Frac. Sisanya menumpuk seperti dock keadaan 3.
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
-    // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir (2 = 3 kartu terlihat)
+    // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir (dipakai kalau dockstack2 0)
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
     // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan. 0 = selalu menumpuk
     val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 0
     val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
     // keadaan 2: skala kartu depan pada mode dock (1 = normal). Hanya berlaku kalau ada kartu di belakangnya.
     val front2Scale: Float get() = prop("debug.ioslock.front2scale").toFloatOrNull() ?: 1f
-    // keadaan 2: mode dock (semua kartu di belakang kartu depan menumpuk seperti stage 3).
-    // Default mati; nyalakan dengan: setprop debug.ioslock.dockstack2 1
-    val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") == "1"
+    // keadaan 2: mode dock (kartu di belakang kartu penuh menumpuk seperti stage 3). Default nyala.
+    // Matikan dengan: setprop debug.ioslock.dockstack2 0
+    val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") != "0"
     // tebal tumpukan keadaan 2 pada mode dock (dp); 0 = sama dengan dockDp. Dibatasi supaya dasar tumpukan tidak melewati bottom2Frac.
     val dock2Dp: Float get() = prop("debug.ioslock.dock2dp").toFloatOrNull() ?: 0f
     // keadaan 3: semua kartu tampil penuh dengan jarak kecil gap3Dp; bagian atas dipotong dengan fade.
@@ -255,7 +255,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.30 loaded into SystemUI")
+        log("v0.31 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -927,6 +927,21 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
+    // Berapa kartu penuh yang muat di keadaan 2 sampai batas bawah (bottom2). Kartu pertama selalu penuh.
+    // Kartu berikutnya ikut penuh selama dasarnya masih di dalam limit. Sisanya menumpuk seperti dock stage 3.
+    private fun fitFull2(hs: FloatArray, top: Float, gap: Float, maxFull: Int, limit: Float): Int {
+        val n = hs.size
+        var y = top
+        var k = 1
+        for (i in 0 until min(maxFull.coerceAtLeast(1), n)) {
+            val bottom = y + hs[i]
+            if (i > 0 && bottom > limit) break
+            k = i + 1
+            y = bottom + gap
+        }
+        return k
+    }
+
     // Seberapa jauh kartu ke-i sudah keluar dari titik asal pada kemajuan a (0..1) animasi buka tumpukan:
     // kartu depan keluar lebih dulu, kartu di belakangnya menyusul, kartu terakhir paling akhir.
     private fun openProgress(i: Int, n: Int, a: Float, lag: Float): Float {
@@ -1020,8 +1035,8 @@ class MainHook : IXposedHookLoadPackage {
     // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari titik asal (garis bawah) sambil
     //    membesar dari kecil (openScale) ke ukuran keadaan 2
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): kartu depan penuh, kartu lain menumpuk di belakangnya sebagai pita (layoutState),
-    // atau seperti dock keadaan 3 kalau dockStack2 aktif. Dasar tumpukan tidak melewati bottom2Frac.
+    // Keadaan 2 (q=0): kartu penuh sebanyak yang muat sampai bottom2Frac, sisanya menumpuk di belakang
+    // seperti dock keadaan 3 (dockStack2). Kalau dockStack2 mati, kartu di belakang jadi pita (layoutState).
     // Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
     // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil; atas dipotong di garis dengan fade. Kartu yang melewati batas bawah
     // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
@@ -1082,13 +1097,17 @@ class MainHook : IXposedHookLoadPackage {
         } else null
         val la = when {
             list2 != null -> list2
-            // keadaan 2 gaya dock: kartu depan penuh, SEMUA kartu lain menumpuk di belakangnya seperti dock keadaan 3
-            Config.dockStack2 -> layoutDockStack(
-                hs, restTop, Config.gap2Dp * d, Config.full2,
-                (if (Config.dock2Dp > 0f) Config.dock2Dp else Config.dockDp) * d, bottom2,
-                (Config.dockRefDp * d).coerceAtLeast(1f), Config.dockScale.coerceIn(0f, 0.3f),
-                Config.front2Scale.coerceIn(1f, 1.2f)
-            )
+            // keadaan 2 gaya dock: kartu penuh sebanyak yang muat, sisanya menumpuk di belakangnya seperti dock keadaan 3
+            Config.dockStack2 -> {
+                val dockPx = (if (Config.dock2Dp > 0f) Config.dock2Dp else Config.dockDp) * d
+                val k2 = fitFull2(hs, restTop, Config.gap2Dp * d, Config.full2, bottom2)
+                layoutDockStack(
+                    hs, restTop, Config.gap2Dp * d, k2,
+                    dockPx, bottom2,
+                    (Config.dockRefDp * d).coerceAtLeast(1f), Config.dockScale.coerceIn(0f, 0.3f),
+                    Config.front2Scale.coerceIn(1f, 1.2f)
+                )
+            }
             else -> layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
                 minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
         }
@@ -1477,21 +1496,46 @@ class MainHook : IXposedHookLoadPackage {
 
     // ---- dim wallpaper (keadaan 3) ----
 
-    // View hitam transparan di posisi paling bawah window shade: hanya menggelapkan yang ada di belakang
-    // (wallpaper), kartu dan teks tetap di atasnya.
+    // Jam yang ditemukan di root (dipakai untuk meletakkan overlay gelap tepat di bawahnya)
+    private fun findClockView(root: ViewGroup): View? {
+        val found = ArrayList<View>()
+        findViews(root, 0, found) { v ->
+            v.javaClass.name.contains("Clock") && v.isShown && v.height > 0
+        }
+        val c = found.firstOrNull()
+        if (c != null) once("clockFound") {
+            log("jam: ${c.javaClass.name} di ${(c.parent as? View)?.javaClass?.name}")
+        }
+        return c
+    }
+
+    // Overlay gelap untuk wallpaper di keadaan 3. Diletakkan TEPAT DI BAWAH jam, supaya jam tidak ikut gelap.
+    // Kalau jam tidak ditemukan di root yang sama, overlay tetap di paling bawah (perilaku lama).
     private fun ensureDim(root: ViewGroup): View {
-        val cur = dimView
-        if (cur != null && cur.parent === root) return cur
-        (cur?.parent as? ViewGroup)?.removeView(cur)
-        val v = View(root.context)
-        v.setBackgroundColor(Color.BLACK)
-        v.alpha = 0f
-        v.visibility = View.INVISIBLE
-        v.isClickable = false
-        v.isFocusable = false
-        root.addView(v, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        dimView = v
-        return v
+        val clock = findClockView(root)
+        val host = (clock?.parent as? ViewGroup) ?: root
+        val sameHost = clock != null && clock.parent === host
+
+        val cur = dimView ?: View(root.context).also {
+            it.setBackgroundColor(Color.BLACK)
+            it.alpha = 0f
+            it.visibility = View.INVISIBLE
+            it.isClickable = false
+            it.isFocusable = false
+            dimView = it
+        }
+
+        val placed = cur.parent === host && (
+            if (sameHost) host.indexOfChild(cur) == host.indexOfChild(clock) - 1
+            else host.indexOfChild(cur) == 0
+        )
+        if (!placed) {
+            (cur.parent as? ViewGroup)?.removeView(cur)
+            val idx = if (sameHost) host.indexOfChild(clock) else 0
+            host.addView(cur, idx, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        return cur
     }
 
     private fun updateDim(sv: View, q: Float) {
