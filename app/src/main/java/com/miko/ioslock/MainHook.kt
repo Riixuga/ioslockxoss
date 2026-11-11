@@ -3,22 +3,25 @@ package com.miko.ioslock
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
-import android.graphics.Path
-import android.graphics.RectF
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.TypedValue
@@ -29,6 +32,8 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
+import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -39,10 +44,12 @@ import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
+import kotlin.math.sin
 
 object Config {
     private val cache = ConcurrentHashMap<String, Pair<Long, String>>()
@@ -131,12 +138,22 @@ object Config {
     val rangeDp: Float get() = prop("debug.ioslock.rangedp").toFloatOrNull() ?: 220f
     val stage2Dp: Float get() = prop("debug.ioslock.stage2dp").toFloatOrNull() ?: 100f
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
+
+    // tombol "Reset UI" di menu power (matikan: setprop debug.ioslock.powerbtn 0)
+    val powerBtn: Boolean get() = prop("debug.ioslock.powerbtn") != "0"
+    // 1 = catat semua teks di tiap window baru (untuk mencari tahu menu power ada di mana)
+    val pwrDump: Boolean get() = prop("debug.ioslock.pwrdump") == "1"
+    // kalau jalur root tidak mematikan System UI dalam sekian ms, System UI mematikan dirinya sendiri (0 = tanpa cadangan)
+    val restartFallbackMs: Long get() = prop("debug.ioslock.restartfallback").toLongOrNull() ?: 2000L
 }
 
 class MainHook : IXposedHookLoadPackage {
 
     companion object {
         const val GEAR_KEY = "key_switch_gear_to_small"
+        const val MODULE_PKG = "com.miko.ioslock"
+        const val RESTART_ACTION = "com.miko.ioslock.RESTART_SYSTEMUI"
+        const val RESET_UI_LABEL = "Reset UI"
     }
 
     private val tag = "[IOSLock]"
@@ -215,10 +232,19 @@ class MainHook : IXposedHookLoadPackage {
     // dim wallpaper di keadaan 3
     private var dimView: View? = null
 
+    // batas jumlah notifikasi: field int di stack yang ikut diangkat (jaring pengaman selain hook setter)
+    private var limitFieldsCls: Class<*>? = null
+    private var limitFields: List<java.lang.reflect.Field> = emptyList()
+    private var lastChildDump = 0L
+
+    // tombol Reset UI di menu power
+    private val pwrTag = "ioslock_reset_ui"
+    private var powerWordsCache: Pair<Set<String>, Set<String>>? = null
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.24 loaded into SystemUI")
+        log("v0.25 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -309,6 +335,13 @@ class MainHook : IXposedHookLoadPackage {
 
         // Tangkap sentuhan di window shade
         hook(cl, shadeWindow, "dispatchTouchEvent", before = { p -> handleTouch(p) })
+
+        // Menu power: setiap window baru di System UI dipindai; kalau isinya "Power Off" + "Restart"
+        // maka tombol "Reset UI" ditambahkan di bawahnya (lihat bagian tombol Reset UI)
+        hook(cl, "android.view.WindowManagerGlobal", "addView", after = { p ->
+            val v = p.args.getOrNull(0) as? View ?: return@hook
+            if (Config.powerBtn) schedulePowerScan(v)
+        })
     }
 
     // ---- layar mati ----
@@ -444,8 +477,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun hasCards(): Boolean {
         val g = stackRef?.get() as? ViewGroup ?: return false
         for (i in 0 until g.childCount) {
-            val c = g.getChildAt(i)
-            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0 && isReal(c)) return true
+            if (isLaidOut(g.getChildAt(i))) return true
         }
         return false
     }
@@ -479,12 +511,18 @@ class MainHook : IXposedHookLoadPackage {
         return c.alpha > 0.05f
     }
 
+    // kartu yang ikut dihitung dan ikut ditata. INVISIBLE sengaja ikut: kartu di luar batas jumlah
+    // notifikasi lockscreen disembunyikan sistem dengan INVISIBLE (bukan GONE), dan harus dimunculkan lagi
+    // di applyStack. Hanya GONE yang berarti kartu itu benar-benar dibuang sistem.
+    private fun isLaidOut(c: View): Boolean =
+        c.visibility != View.GONE && c.width > 0 && c.height > 0 && isReal(c)
+
     // jumlah notifikasi: semua kartu (termasuk kartu musik dan senter); grup dihitung per anak
     private fun notifCount(g: ViewGroup): Int {
         var n = 0
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
-            if (c.height > 0 && c.width > 0 && c.visibility != View.GONE && isReal(c)) {
+            if (isLaidOut(c)) {
                 var k = 0
                 if (c.javaClass.name.contains("ExpandableNotificationRow")) {
                     try {
@@ -495,6 +533,80 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
         return n
+    }
+
+    // Kumpulkan kartu yang ikut ditata, urut dari atas. Kartu yang disembunyikan sistem (INVISIBLE) ikut
+    // diambil dan dimunculkan lagi. Posisi aslinya tidak bisa dipercaya, jadi dipasang di bawah kartu
+    // terakhir yang terlihat, sesuai urutan anak di stack.
+    private fun collectCards(g: ViewGroup): ArrayList<Pair<View, Float>> {
+        val shown = ArrayList<Pair<View, Float>>()
+        val hidden = ArrayList<View>()
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            if (!isLaidOut(c)) continue
+            if (c.visibility == View.VISIBLE) shown.add(Pair(c, baseOfY(c))) else hidden.add(c)
+        }
+        shown.sortBy { it.second }
+        if (hidden.isNotEmpty()) {
+            val d = g.resources.displayMetrics.density
+            var y = if (shown.isEmpty()) 0f else shown.last().second + visH(shown.last().first) + 8f * d
+            for (c in hidden) {
+                c.visibility = View.VISIBLE
+                shown.add(Pair(c, y))
+                y += visH(c) + 8f * d
+            }
+        }
+        return shown
+    }
+
+    // Jaring pengaman: kalau hook setter batas tidak kena (nama method beda di ROM ini), field int batasnya
+    // di stack diangkat langsung ke 99. -1 (tanpa batas) dibiarkan.
+    private fun liftLimit(sv: View) {
+        if (!shouldUnlimit()) return
+        try {
+            if (limitFieldsCls !== sv.javaClass) {
+                val list = ArrayList<java.lang.reflect.Field>()
+                var c: Class<*>? = sv.javaClass
+                while (c != null && c != ViewGroup::class.java) {
+                    for (f in c.declaredFields) {
+                        if (f.type == Int::class.javaPrimitiveType &&
+                            !java.lang.reflect.Modifier.isStatic(f.modifiers) &&
+                            (f.name.contains("MaxDisplayedNotifications", true) ||
+                                f.name.contains("MaxKeyguardNotifications", true))
+                        ) {
+                            f.isAccessible = true
+                            list.add(f)
+                        }
+                    }
+                    c = c.superclass
+                }
+                limitFields = list
+                limitFieldsCls = sv.javaClass
+                log("limit fields: " + list.joinToString { it.declaringClass.simpleName + "." + it.name })
+            }
+            for (f in limitFields) {
+                val cur = f.getInt(sv)
+                if (cur in 0..98) {
+                    f.setInt(sv, 99)
+                    logT("liftLimit", "${f.name} $cur -> 99", discrete = true)
+                }
+            }
+        } catch (t: Throwable) {
+            once("liftFail") { log("liftLimit gagal: $t") }
+        }
+    }
+
+    // daftar semua anak stack untuk debug (logcat | grep IOSLock | grep children)
+    private fun dumpChildren(g: ViewGroup): String {
+        val sb = StringBuilder()
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            sb.append(" #").append(i).append(' ').append(c.javaClass.simpleName.take(18))
+                .append(when (c.visibility) { View.VISIBLE -> " V "; View.INVISIBLE -> " I "; else -> " G " })
+                .append(c.width).append('x').append(c.height).append('/').append(visH(c).toInt())
+                .append(if (isLaidOut(c)) " ok" else " skip")
+        }
+        return sb.toString()
     }
 
     // ---- tahap swipe: 0..1 kartu muncul, 1..2 naik ----
@@ -854,17 +966,18 @@ class MainHook : IXposedHookLoadPackage {
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
         ensureDrawHook(sv)
+        liftLimit(sv)
         val loc = IntArray(2)
         sv.getLocationOnScreen(loc)
 
-        val cards = ArrayList<Pair<View, Float>>()
-        for (i in 0 until g.childCount) {
-            val c = g.getChildAt(i)
-            if (c.visibility == View.VISIBLE && c.width > 0 && c.height > 0 && isReal(c)) {
-                cards.add(Pair(c, baseOfY(c)))
-            }
+        // debug: kondisi semua anak stack (sebelum kartu tersembunyi dimunculkan lagi)
+        val nowMs = SystemClock.uptimeMillis()
+        if (nowMs - lastChildDump > 500) {
+            lastChildDump = nowMs
+            logT("children", dumpChildren(g), discrete = true)
         }
-        cards.sortBy { it.second }
+
+        val cards = collectCards(g)
         val n = cards.size
 
         val restTop = dm.heightPixels * Config.restFrac
@@ -1329,6 +1442,275 @@ class MainHook : IXposedHookLoadPackage {
                 c.clipBounds = null
                 rowState.remove(c)
             }
+        }
+    }
+
+    // ---- tombol "Reset UI" di menu power ----
+
+    // Tiap window baru dipindai beberapa kali (isi menu bisa baru terpasang setelah addView).
+    // Kalau berisi teks "Power Off" dan "Restart", tombol Reset UI ditempel di bawah deretan tombol.
+    private fun schedulePowerScan(v: View) {
+        val n = v.javaClass.name
+        if (n.contains("NotificationShadeWindowView") || n.contains("NavigationBar") ||
+            n.contains("StatusBarWindowView") || n.contains("ScreenDecor")) return
+        for (delay in longArrayOf(0L, 150L, 400L, 900L)) {
+            v.postDelayed({ tryInjectPowerButton(v) }, delay)
+        }
+        if (Config.pwrDump) v.postDelayed({ dumpTexts(v) }, 600L)
+    }
+
+    private fun dumpTexts(v: View) {
+        val sb = StringBuilder()
+        fun walk(x: View, depth: Int) {
+            if (depth > 20 || sb.length > 1500) return
+            if (x is TextView && x.text.isNotEmpty()) sb.append(" [").append(x.text).append("]")
+            if (x is ViewGroup) for (i in 0 until x.childCount) walk(x.getChildAt(i), depth + 1)
+        }
+        walk(v, 0)
+        if (sb.isNotEmpty()) log("window ${v.javaClass.simpleName}:$sb")
+    }
+
+    // kata label "power off" dan "restart" (huruf kecil), termasuk terjemahan dari resource sistem
+    private fun powerWords(ctx: Context): Pair<Set<String>, Set<String>> {
+        powerWordsCache?.let { return it }
+        val off = HashSet(listOf("power off", "shut down", "matikan", "matikan daya"))
+        val rst = HashSet(listOf("restart", "reboot", "mulai ulang", "mulai ulang perangkat"))
+        fun add(set: MutableSet<String>, name: String) {
+            for (pkg in arrayOf("com.android.systemui", "android")) {
+                try {
+                    val id = ctx.resources.getIdentifier(name, "string", pkg)
+                    if (id != 0) set.add(ctx.getString(id).trim().lowercase())
+                } catch (t: Throwable) { }
+            }
+        }
+        add(off, "global_action_power_off")
+        add(rst, "global_action_restart")
+        val r = Pair<Set<String>, Set<String>>(off, rst)
+        powerWordsCache = r
+        return r
+    }
+
+    private fun findLabel(v: View, depth: Int, words: Set<String>): TextView? {
+        if (depth > 20) return null
+        if (v is TextView && v.isShown) {
+            val t = v.text?.toString()?.trim()?.lowercase()
+            if (t != null && t in words) return v
+        }
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) {
+                val r = findLabel(v.getChildAt(i), depth + 1, words)
+                if (r != null) return r
+            }
+        }
+        return null
+    }
+
+    // cari view bulat (ikon tombol) di dalam satu item, untuk meniru ukurannya
+    private fun findRound(v: ViewGroup, depth: Int, d: Float): View? {
+        for (i in 0 until v.childCount) {
+            val c = v.getChildAt(i)
+            if (c !is TextView && c.width >= 40f * d && c.width <= 130f * d && abs(c.width - c.height) <= 4f * d) return c
+            if (c is ViewGroup && depth < 3) findRound(c, depth + 1, d)?.let { return it }
+        }
+        return null
+    }
+
+    private fun tryInjectPowerButton(root: View) {
+        try {
+            if (!Config.powerBtn || !root.isAttachedToWindow) return
+            val g = root as? ViewGroup ?: return
+            if (g.findViewWithTag<View>(pwrTag) != null) return
+            val (offWords, rstWords) = powerWords(root.context)
+            val ref = findLabel(g, 0, rstWords) ?: return
+            if (findLabel(g, 0, offWords) == null) return
+            if (ref.width == 0 || ref.height == 0) return
+            injectResetButton(g, ref)
+        } catch (t: Throwable) {
+            once("pwrFail") { log("tombol power gagal: $t") }
+        }
+    }
+
+    private fun injectResetButton(g: ViewGroup, ref: TextView) {
+        val host = g as? FrameLayout
+        if (host == null) {
+            once("pwrNoFrame") { log("tombol power: root ${g.javaClass.name} bukan FrameLayout, dilewati") }
+            return
+        }
+        val ctx = g.context
+        val d = ctx.resources.displayMetrics.density
+        val dmW = ctx.resources.displayMetrics.widthPixels
+        val rl = IntArray(2)
+        ref.getLocationOnScreen(rl)
+
+        // satu item (ikon + teks) = induk terdekat label yang lebih tinggi dari label dan bukan selebar layar
+        var item: ViewGroup? = null
+        var up = ref.parent as? View
+        var steps = 0
+        while (up != null && up !== g && steps < 3) {
+            if (up is ViewGroup && up.height >= ref.height * 1.8f && up.width < dmW * 0.7f) { item = up; break }
+            up = up.parent as? View
+            steps++
+        }
+        var circle = (68f * d).toInt()
+        var gap = (12f * d).toInt()
+        val iconView = item?.let { findRound(it, 0, d) }
+        if (iconView != null) {
+            circle = iconView.width
+            val cl = IntArray(2)
+            iconView.getLocationOnScreen(cl)
+            gap = (rl[1] - (cl[1] + iconView.height)).coerceIn((4f * d).toInt(), (40f * d).toInt())
+        }
+        val rowGap = 30f * d
+
+        val box = LinearLayout(ctx)
+        box.orientation = LinearLayout.VERTICAL
+        box.gravity = Gravity.CENTER_HORIZONTAL
+        box.tag = pwrTag
+        box.isClickable = true
+        box.addView(ResetUiIconView(ctx), LinearLayout.LayoutParams(circle, circle))
+
+        val lbl = TextView(ctx)
+        lbl.text = RESET_UI_LABEL
+        lbl.setTextSize(TypedValue.COMPLEX_UNIT_PX, ref.textSize)
+        lbl.typeface = ref.typeface
+        lbl.setTextColor(ref.textColors)
+        lbl.gravity = Gravity.CENTER
+        lbl.includeFontPadding = ref.includeFontPadding
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.topMargin = gap
+        box.addView(lbl, lp)
+
+        box.setOnClickListener { requestRestartUi(ctx) }
+        box.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(90).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+            }
+            false
+        }
+
+        host.addView(box, ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        box.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        placeResetButton(host, box, ref, rowGap)
+
+        // ikuti label Restart tiap frame (posisi, fade-in, animasi masuk menu)
+        val vto = host.viewTreeObserver
+        vto.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                try {
+                    if (!box.isAttachedToWindow || !ref.isAttachedToWindow) {
+                        val o = host.viewTreeObserver
+                        if (o.isAlive) o.removeOnPreDrawListener(this)
+                        return true
+                    }
+                    placeResetButton(host, box, ref, rowGap)
+                } catch (t: Throwable) { }
+                return true
+            }
+        })
+        log("tombol Reset UI dipasang di ${host.javaClass.simpleName} (circle=${circle}px gap=${gap}px)")
+    }
+
+    // letakkan tombol: rata tengah layar, tepat di bawah label Restart
+    private fun placeResetButton(host: ViewGroup, box: View, ref: View, rowGap: Float) {
+        val rl = IntArray(2)
+        ref.getLocationOnScreen(rl)
+        val hl = IntArray(2)
+        host.getLocationOnScreen(hl)
+        val w = if (box.width > 0) box.width else box.measuredWidth
+        box.translationX = (host.width - w) / 2f - host.paddingLeft
+        box.translationY = rl[1] + ref.height + rowGap - hl[1] - host.paddingTop
+        var a = 1f
+        var v: View? = ref
+        while (v != null && v !== host) { a *= v.alpha; v = v.parent as? View }
+        box.alpha = a
+        box.visibility = if (ref.isShown) View.VISIBLE else View.INVISIBLE
+    }
+
+    // Reset System UI: jalur utama lewat root (broadcast ke aplikasi modul, yang menjalankan su -c killall).
+    // Cadangan: kalau root tidak ada / ditolak, System UI mematikan dirinya sendiri dan langsung dibangkitkan
+    // lagi oleh sistem (proses persistent).
+    private fun requestRestartUi(ctx: Context) {
+        log("reset System UI diminta dari menu power")
+        try {
+            val i = Intent(RESTART_ACTION)
+            i.component = ComponentName(MODULE_PKG, "$MODULE_PKG.RestartUiReceiver")
+            i.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+            ctx.sendBroadcast(i)
+        } catch (t: Throwable) {
+            log("broadcast reset gagal: $t")
+        }
+        val fb = Config.restartFallbackMs
+        if (fb > 0) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                log("jalur root tidak menjawab, System UI mematikan dirinya sendiri")
+                Process.killProcess(Process.myPid())
+            }, fb)
+        }
+    }
+
+    // ikon tombol: lingkaran kaca + bingkai layar dengan panah putar di dalamnya
+    private class ResetUiIconView(ctx: Context) : View(ctx) {
+        private val d = ctx.resources.displayMetrics.density
+        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.argb(46, 255, 255, 255)
+        }
+        private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 1.2f * d
+            color = Color.argb(96, 255, 255, 255)
+        }
+        private val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.2f * d
+            color = Color.WHITE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val head = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.WHITE
+        }
+        private val box = RectF()
+        private val tri = Path()
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val cx = w / 2f
+            val cy = h / 2f
+            val r = min(w, h) / 2f - ring.strokeWidth
+            canvas.drawCircle(cx, cy, r, fill)
+            canvas.drawCircle(cx, cy, r, ring)
+
+            // bingkai "layar"
+            val half = r * 0.52f
+            box.set(cx - half, cy - half, cx + half, cy + half)
+            canvas.drawRoundRect(box, r * 0.16f, r * 0.16f, ink)
+
+            // panah putar di dalam bingkai (busur 290 derajat, ujungnya di 230 derajat)
+            val ar = half * 0.52f
+            box.set(cx - ar, cy - ar, cx + ar, cy + ar)
+            canvas.drawArc(box, -60f, 290f, false, ink)
+            val th = Math.toRadians(230.0)
+            val ex = cx + ar * cos(th).toFloat()
+            val ey = cy + ar * sin(th).toFloat()
+            val tx = (-sin(th)).toFloat()   // arah gerak (searah jarum jam)
+            val ty = cos(th).toFloat()
+            val nx = cos(th).toFloat()      // arah keluar dari pusat
+            val ny = sin(th).toFloat()
+            val hl = 4.6f * d
+            val hw = 3.4f * d
+            tri.reset()
+            tri.moveTo(ex + tx * hl, ey + ty * hl)
+            tri.lineTo(ex + nx * hw, ey + ny * hw)
+            tri.lineTo(ex - nx * hw, ey - ny * hw)
+            tri.close()
+            canvas.drawPath(tri, head)
         }
     }
 
