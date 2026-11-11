@@ -9,8 +9,8 @@ android {
         applicationId = "com.miko.ioslock"
         minSdk = 28
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.40-settings"
+        versionCode = 4
+        versionName = "0.41-ease"
     }
     buildTypes { release { isMinifyEnabled = false } }
     compileOptions {

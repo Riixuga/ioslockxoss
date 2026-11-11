@@ -42,7 +42,6 @@ import android.view.ViewOutlineProvider
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
-import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -208,11 +207,10 @@ object Config {
     val pillShrink: Float get() = prop("debug.ioslock.pillshrink").toFloatOrNull() ?: 0.2f
     val pillDropDp: Float get() = prop("debug.ioslock.pilldrop").toFloatOrNull() ?: 10f
     val pillGrowMs: Long get() = prop("debug.ioslock.pillgrow").toLongOrNull() ?: 360L
-    // kelenturan spring buka/tutup (0 = halus, 1 = memantul) dan durasinya
-    val animBounce: Float get() = prop("debug.ioslock.snapbounce").toFloatOrNull() ?: 0.35f
     val snapMs: Long get() = prop("debug.ioslock.snapms").toLongOrNull() ?: 420L
-    // batas tebal tumpukan kecil di bawah kartu penuh keadaan 2 (dp)
-    val dock2MaxDp: Float get() = prop("debug.ioslock.dock2max").toFloatOrNull() ?: 14f
+    // batas tebal tumpukan kecil di bawah kartu penuh keadaan 2 (dp). 0 = penuh sampai garis bawah,
+    // seperti susunan sebelum versi 0.40.
+    val dock2MaxDp: Float get() = prop("debug.ioslock.dock2max").toFloatOrNull() ?: 0f
     // 1 = catat background tiap bagian kartu notifikasi (untuk mencari tahu blur apa yang dipakai kartu)
     val cardBgDump: Boolean get() = prop("debug.ioslock.cardbgdump") != "0"
 
@@ -265,6 +263,9 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var screenOff = false
     private var screenWatch: Runnable? = null
     @Volatile private var bouncerHook = false
+    @Volatile private var screenAlpha = 1f
+    private var pillFadeAnim: ValueAnimator? = null
+    private var pillFadeOutRunning = false
     private var bouncerScan = false
     private var lastBouncerScan = 0L
     private var receiverRegistered = false
@@ -503,7 +504,8 @@ class MainHook : IXposedHookLoadPackage {
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
         hook(cl, stateCtl, "setState", after = { p ->
             val s = p.args.getOrNull(0) as? Int ?: return@hook
-            if (s == 1 && barState != 1) {
+            val prev = barState
+            if (s == 1 && prev != 1) {
                 animator?.cancel()
                 progress = 0f
                 scrollY = 0f
@@ -513,7 +515,8 @@ class MainHook : IXposedHookLoadPackage {
             barState = s
             if (s != 1) clearMask(stackRef?.get())   // keluar dari keyguard = fade dimatikan
             logT("barState", "state=$s", discrete = true)
-            applyState()
+            // Munculnya keyguard memudarkan pil masuk; keluarnya keyguard ditangani reset().
+            if (s == 1 && prev != 1 && !screenOff) fadePillIn() else applyState()
         })
 
         // Ambil View stack notifikasi dari controller-nya (field mView)
@@ -602,12 +605,97 @@ class MainHook : IXposedHookLoadPackage {
             soloMedia = false
             soloCardRef = null
             soloOpenT = 0f
-            hideDim()
-            hideLabels(fadePill = false)
-            pill?.let { it.animate().cancel(); it.visibility = View.INVISIBLE }
+            fadePillOut()
+        } else if (barState == 1 || barState == -1) {
+            // Buka layar kunci: pil memudar masuk, bukan muncul mendadak.
+            fadePillIn()
         } else {
             applyState()
         }
+    }
+
+    // Fade keluar saat power ditekan, AOD, layar mati, atau keyguard ditutup.
+    // Hanya alpha, tanpa scale, supaya tidak terlihat seperti pantulan.
+    private fun fadePillOut() {
+        if (pillFadeOutRunning) return
+        val pv = pill
+        val lc = labelCenter
+        val ln = labelCount
+        val pvVisible = pv != null && pv.visibility == View.VISIBLE
+        val lcVisible = lc != null && lc.visibility == View.VISIBLE
+        val lnVisible = ln != null && ln.visibility == View.VISIBLE
+        if (!pvVisible && !lcVisible && !lnVisible) return
+
+        // Set flag dulu: cancel() memicu listener animator fade-in, yang tidak boleh
+        // mengembalikan alpha saat fade-out mulai.
+        pillFadeOutRunning = true
+        pillFadeAnim?.cancel()
+        pillFadeAnim = null
+        pv?.animate()?.cancel()
+        val p0 = pv?.alpha ?: 0f
+        val c0 = lc?.alpha ?: 0f
+        val n0 = ln?.alpha ?: 0f
+        val bg0 = pv?.background?.alpha ?: 255
+        val an = ValueAnimator.ofFloat(1f, 0f)
+        an.duration = 180L
+        an.interpolator = LinearInterpolator()
+        an.addUpdateListener {
+            val f = it.animatedValue as Float
+            pv?.alpha = p0 * f
+            pv?.background?.alpha = (bg0 * f).toInt().coerceIn(0, 255)
+            lc?.alpha = c0 * f
+            ln?.alpha = n0 * f
+        }
+        an.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                if (!pillFadeOutRunning) return
+                pillFadeOutRunning = false
+                pillFadeAnim = null
+                screenAlpha = 1f
+                pv?.let { it.visibility = View.INVISIBLE; it.alpha = 0f }
+                lc?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
+                ln?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
+                hideSlider()
+                hideDim()
+            }
+        })
+        pillFadeAnim = an
+        an.start()
+    }
+
+    // Fade masuk saat layar kunci dibuka (power / keyguard muncul).
+    private fun fadePillIn() {
+        // Jangan memulai fade masuk saat layar masih mati/AOD atau PIN sedang tampil;
+        // fade keluar yang sedang berjalan jangan dilawan animasi lain.
+        if (screenOff || aod || bouncerHook) {
+            applyState()
+            return
+        }
+        // Matikan flag sebelum cancel agar end-listener fade-out tidak menyembunyikan view.
+        pillFadeOutRunning = false
+        pillFadeAnim?.cancel()
+        pillFadeAnim = null
+        screenAlpha = 0f
+        applyState()
+        // applyState bisa memulai fade-out (mis. PIN/bouncer); jangan menimpanya.
+        if (pillFadeOutRunning || screenOff || aod) return
+        val an = ValueAnimator.ofFloat(0f, 1f)
+        an.duration = 260L
+        an.interpolator = DecelerateInterpolator(2f)
+        an.addUpdateListener {
+            screenAlpha = it.animatedValue as Float
+            applyState()
+        }
+        an.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                if (pillFadeOutRunning || screenOff || aod) return
+                screenAlpha = 1f
+                pill?.let { if (it.visibility == View.VISIBLE) it.alpha = 1f }
+                applyState()
+            }
+        })
+        pillFadeAnim = an
+        an.start()
     }
 
     // ---- layar PIN ----
@@ -661,9 +749,9 @@ class MainHook : IXposedHookLoadPackage {
             soloMedia = false
             soloCardRef = null
             soloOpenT = 0f
-            hideDim()
-            hideLabels(fadePill = false)
-            pill?.let { it.animate().cancel(); it.visibility = View.INVISIBLE }
+            fadePillOut()
+        } else if (barState == 1 && !screenOff) {
+            fadePillIn()
         } else {
             applyState()
         }
@@ -1089,13 +1177,11 @@ class MainHook : IXposedHookLoadPackage {
         } catch (t: Throwable) { log("cancel gagal: $t") }
     }
 
-    // kurva spring: mulai 0, sedikit melewati 1, lalu diam (grow/snap terasa hidup)
-    private fun springEase(t: Float): Float {
-        val x = t.coerceIn(0f, 1f)
-        val b = Config.animBounce.coerceIn(0f, 1f)
-        val damp = 7.4f - 2.0f * b
-        val freq = 6.6f + 2.2f * b
-        return 1f - exp(-damp * x) * cos(freq * x)
+    // Kurva dari grafik: naik cepat lalu melambat, mencapai 1 tanpa pernah melewatinya.
+    // Tidak ada overshoot/spring, jadi tidak ada pantulan di kartu maupun pil.
+    private fun motionEase(t: Float): Float {
+        val u = 1f - t.coerceIn(0f, 1f)
+        return 1f - u * u * u * u * u
     }
 
     private fun snap(target: Float) {
@@ -1111,7 +1197,7 @@ class MainHook : IXposedHookLoadPackage {
         an.duration = (base * (0.7f + 0.6f * abs(target - start))).toLong().coerceIn(120L, 900L)
         an.interpolator = LinearInterpolator()
         an.addUpdateListener {
-            val e = springEase(it.animatedValue as Float)
+            val e = motionEase(it.animatedValue as Float)
             progress = start + (target - start) * e
             applyState()
         }
@@ -1154,7 +1240,7 @@ class MainHook : IXposedHookLoadPackage {
         an.duration = (Config.snapMs * 0.8f).toLong().coerceIn(100L, 700L)
         an.interpolator = LinearInterpolator()
         an.addUpdateListener {
-            val e = springEase(it.animatedValue as Float)
+            val e = motionEase(it.animatedValue as Float)
             pillMediaT = (start + (target - start) * e).coerceIn(-0.03f, 1.03f)
             applyState()
         }
@@ -1327,7 +1413,9 @@ class MainHook : IXposedHookLoadPackage {
             o += hs[i] + gap
             off[i] = o
         }
-        val dock = min(max(limit - baseBottom, minDock), maxDock.coerceAtLeast(minDock))
+        // maxDock <= 0 = tanpa batas, tumpukan mengalir sampai garis bawah seperti versi lama.
+        val dock = if (maxDock <= 0f) max(limit - baseBottom, minDock)
+        else min(max(limit - baseBottom, minDock), maxDock.coerceAtLeast(minDock))
         val c = dock * 1.3f
         val lastRaw = 1f - exp(-off[n - 1] / c)
         for (i in from until n) {
@@ -1391,9 +1479,9 @@ class MainHook : IXposedHookLoadPackage {
     private fun openProgress(i: Int, n: Int, a: Float, lag: Float): Float {
         val l = if (n > 1) lag.coerceIn(0f, 0.8f) else 0f
         val start = if (n > 1) l * i / (n - 1) else 0f
-        // sengaja tanpa batas atas: overshoot spring membuat kartu sedikit memantul saat terbuka
-        val t = ((a - start) / (1f - l)).coerceAtLeast(0f)
-        return t + (t * t * (3f - 2f * t) - t) * 0.5f
+        // pakai kurva ease-out yang sama; tidak ada overshoot saat kartu keluar dari pil
+        val t = ((a - start) / (1f - l)).coerceIn(0f, 1f)
+        return motionEase(t)
     }
 
     // Gabungkan keadaan 2 (la) dan keadaan 3 (lb) jadi posisi tiap kartu pada kemajuan (a, q).
@@ -1782,9 +1870,9 @@ class MainHook : IXposedHookLoadPackage {
         // geometri pil dihitung selalu (juga saat label disembunyikan): animasi kartu memakainya sebagai titik asal
         pillGeo = pillRect(root, count)
 
-        // layar mati / AOD / layar PIN: kedua teks dan pil disembunyikan (pil dengan fade)
+        // layar mati / AOD / layar PIN: kedua teks dan pil memudar keluar
         if (labelsBlocked(root)) {
-            hideLabels(fadePill = true)
+            fadePillOut()
             return
         }
 
@@ -1796,7 +1884,7 @@ class MainHook : IXposedHookLoadPackage {
         // "Notification Center": rata kiri, muncul di atas daftar; disembunyikan di mode media saja
         val a1 = ((a - 0.3f) / 0.5f).coerceIn(0f, 1f)
         lc.visibility = if (!soloMedia && a1 > 0.01f) View.VISIBLE else View.INVISIBLE
-        lc.alpha = if (soloMedia) 0f else a1
+        lc.alpha = if (soloMedia) 0f else a1 * screenAlpha
         lc.setTextSize(TypedValue.COMPLEX_UNIT_SP, Config.labelSp)
         lc.setPadding((Config.labelLeftDp * d).toInt(), 0, 0, 0)
         val hc = if (lc.height > 0) lc.height.toFloat() else 26f * d
@@ -1815,8 +1903,8 @@ class MainHook : IXposedHookLoadPackage {
 
         updatePill(root, a, count, rl)
 
-        // teks ikut persis dengan skala/turun/fade pil, termasuk grow-in bouncy
-        val followA = if (Config.countAlways) 1f else pillAnimAlpha
+        // teks ikut persis dengan skala/turun/fade pil, termasuk grow-in
+        val followA = if (Config.countAlways) screenAlpha else pillAnimAlpha
         val followScale = if (a <= 0.02f) pill?.scaleX ?: pillAnimScale else pillAnimScale
         val followAlpha = if (a <= 0.02f) pill?.alpha ?: followA else followA
         ln.scaleX = followScale
@@ -2035,7 +2123,7 @@ class MainHook : IXposedHookLoadPackage {
         an.duration = Config.snapMs.coerceIn(150L, 800L)
         an.interpolator = LinearInterpolator()
         an.addUpdateListener {
-            soloOpenT = springEase(it.animatedValue as Float)
+            soloOpenT = motionEase(it.animatedValue as Float)
             applyState()
         }
         an.addListener(object : AnimatorListenerAdapter() {
@@ -2131,20 +2219,21 @@ class MainHook : IXposedHookLoadPackage {
         pv.translationX = pr[0] - rl[0]
         pv.translationY = baseY
         if (pv.visibility != View.VISIBLE) {
-            if (a < 0.02f) pv.showBouncy() else pv.showNow()
+            if (a < 0.02f && screenAlpha >= 0.999f) pv.showBouncy() else pv.showNow()
         } else if (a > 0.02f) {
             // pengguna sudah mulai menggeser: hentikan grow-in, skala diatur animasi masuk keadaan 2
             pv.animate().cancel()
         }
-        // ikut memudar/muncul saat pil masuk/keluar dari belakang kartu (jangan ganggu grow-in di keadaan 1)
-        if (a > 0.02f) pv.alpha = pa
+        // ikut memudar/muncul saat pil masuk/keluar dari belakang kartu (jangan ganggu grow-in di keadaan 1).
+        // screenAlpha dipakai untuk fade saat layar kunci dibuka.
+        if (a > 0.02f || screenAlpha < 0.999f) pv.alpha = pa * screenAlpha
 
-        // masuk keadaan 2: pil mengecil ke bawah dengan kurva spring, lalu pindah ke belakang kartu
-        pillAnimAlpha = pa
+        // masuk keadaan 2: pil mengecil ke bawah dengan kurva ease-out, lalu pindah ke belakang kartu
+        pillAnimAlpha = pa * screenAlpha
         val shrink = Config.pillShrink.coerceIn(0.05f, 0.6f)
         val drop = Config.pillDropDp.coerceIn(0f, 40f) * d
         if (a > 0.001f) {
-            val bt = springEase((a / 0.85f).coerceIn(0f, 1f))
+            val bt = motionEase((a / 0.85f).coerceIn(0f, 1f))
             val s = 1f - shrink * bt
             pillAnimScale = s
             pillAnimDrop = drop * bt
@@ -2159,8 +2248,8 @@ class MainHook : IXposedHookLoadPackage {
         }
 
         val radius = if (Config.pillRadiusDp >= 0f) Config.pillRadiusDp * d else pr[3] / 2f
-        val blurR = (Config.pillBlurPx * pa).toInt()
-        val tintA = (Config.pillTintA * pa).toInt().coerceIn(0, 255)
+        val blurR = (Config.pillBlurPx * pa * screenAlpha).toInt()
+        val tintA = (Config.pillTintA * pa * screenAlpha).toInt().coerceIn(0, 255)
         pv.setMedia(pillMediaT, mediaTitle, mediaText, mediaArt)
         if (pillMediaT > 0.01f) pv.invalidate()
 
@@ -2168,6 +2257,7 @@ class MainHook : IXposedHookLoadPackage {
         val bd = pillBlur
         if (bd != null) {
             try {
+                bd.alpha = (255 * screenAlpha).toInt().coerceIn(0, 255)
                 if (blurR != pillLastBlur) {
                     XposedHelpers.callMethod(bd, "setBlurRadius", blurR)
                     pillLastBlur = blurR
@@ -2270,7 +2360,7 @@ class MainHook : IXposedHookLoadPackage {
             if (changed || t > 0.01f) invalidate()
         }
 
-        // muncul dengan grow-in yang memantul
+        // muncul dengan grow-in ease-out, tanpa memantul
         fun showBouncy() {
             if (shown && visibility == View.VISIBLE) return
             shown = true
@@ -2282,7 +2372,7 @@ class MainHook : IXposedHookLoadPackage {
             visibility = View.VISIBLE
             animate().alpha(1f).scaleX(1f).scaleY(1f)
                 .setDuration(Config.pillGrowMs.coerceIn(100L, 800L))
-                .setInterpolator(OvershootInterpolator(2.4f))
+                .setInterpolator(DecelerateInterpolator(2.2f))
                 .start()
         }
 
@@ -2719,7 +2809,7 @@ class MainHook : IXposedHookLoadPackage {
         soloCardRef = null
         soloOpenT = 0f
         hideDim()
-        hideLabels()
+        if (screenOff || aod) hideLabels(fadePill = false) else fadePillOut()
         restoreClip()
         if (sv == null) return
         sv.alpha = 1f

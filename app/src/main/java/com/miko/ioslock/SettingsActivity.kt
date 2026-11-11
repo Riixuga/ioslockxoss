@@ -31,7 +31,6 @@ class SettingsActivity : Activity() {
         Spec("debug.ioslock.pillshrink", "Pengecilan pil saat masuk state 2", 0.05f, 0.6f, 0.2f, "x"),
         Spec("debug.ioslock.pilldrop", "Jarak turun pil", 0f, 40f, 10f, "dp"),
         Spec("debug.ioslock.pillgrow", "Durasi grow-in pil", 100f, 800f, 360f, "ms", true),
-        Spec("debug.ioslock.snapbounce", "Kelenturan buka/tutup", 0f, 1f, 0.35f, ""),
         Spec("debug.ioslock.snapms", "Durasi buka/tutup", 150f, 800f, 420f, "ms", true),
         Spec("debug.ioslock.pillmediaw", "Lebar mini media player", 150f, 330f, 208f, "dp"),
         Spec("debug.ioslock.pillborder", "Tebal border kaca", 0f, 4f, 1f, "dp"),
@@ -39,7 +38,7 @@ class SettingsActivity : Activity() {
         Spec("debug.ioslock.pilltint", "Tint kaca", 0f, 120f, 56f, ""),
         Spec("debug.ioslock.pillblur", "Radius blur pil", 0f, 120f, 60f, "px"),
         Spec("debug.ioslock.full2", "Kartu penuh di state 2", 1f, 8f, 3f, "", true),
-        Spec("debug.ioslock.dock2max", "Tebal peek stack state 2", 0f, 80f, 14f, "dp"),
+        Spec("debug.ioslock.dock2max", "Batas peek stack state 2 (0 = penuh)", 0f, 80f, 0f, "dp"),
         Spec("debug.ioslock.openscale", "Skala awal kartu", 0.2f, 1f, 0.55f, ""),
         Spec("debug.ioslock.openstagger", "Stagger buka kartu", 0f, 0.8f, 0.35f, ""),
         Spec("debug.ioslock.fling", "Faktor fling state 3", 0f, 0.6f, 0.22f, "")
