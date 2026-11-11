@@ -64,12 +64,12 @@ object Config {
     val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0.575f
     val smallFrac: Float get() = prop("debug.ioslock.smallfrac").toFloatOrNull() ?: 0.345f
     // batas bawah daftar kartu keadaan 3 (di atas fingerprint dan teks bawah)
-    val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.83f
+    val listBottomFrac: Float get() = prop("debug.ioslock.listbottom").toFloatOrNull() ?: 0.865f
     // keadaan 2: posisi tepi bawah pita tumpukan TERAKHIR (0..1 tinggi layar) = garis merah.
     // Ketebalan pita dihitung otomatis supaya dasar tumpukan tepat di sini.
-    val bottom2Frac: Float get() = prop("debug.ioslock.bottom2").toFloatOrNull() ?: 0.807f
+    val bottom2Frac: Float get() = prop("debug.ioslock.bottom2").toFloatOrNull() ?: 0.855f
     // pita tidak boleh lebih tebal dari sekian kali tinggi kartu (supaya tetap menumpuk di belakang kartu depan, tanpa celah)
-    val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.95f
+    val peekMaxFrac: Float get() = prop("debug.ioslock.peekmaxfrac").toFloatOrNull() ?: 0.9f
     // ketebalan minimal sebuah kartu yang menumpuk (dp)
     val minPeekDp: Float get() = prop("debug.ioslock.minpeekdp").toFloatOrNull() ?: 12f
     // meluncur tambahan saat kartu muncul; 0 = kartu keluar dari dasar tumpukan saja (lihat originFrac)
@@ -78,22 +78,33 @@ object Config {
     // (di atas teks "N Notifications"), kartu depan lebih dulu, kartu terakhir tetap di tempatnya.
     // originFrac = tepi bawah titik asal itu (0..1 tinggi layar; dipakai kalau dasar tumpukan keadaan 2
     // lebih tinggi dari ini, misalnya hanya 1-2 notifikasi). openStagger = seberapa bergantian (0 = serentak, maks 0.8)
-    val originFrac: Float get() = prop("debug.ioslock.originfrac").toFloatOrNull() ?: 0.80f
+    val originFrac: Float get() = prop("debug.ioslock.originfrac").toFloatOrNull() ?: 0.855f
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang)
     val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
     // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
-    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
+    val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 4
+    // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan (semua kartu tampil penuh, jarak gap2Dp)
+    val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 3
+    val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
     // keadaan 3: tumpukan bertingkat tanpa celah dengan jarak SERAGAM antar kartu.
     // Jarak kartu 1 -> kartu 2 (A ke B) dipakai untuk semua kartu berikutnya.
     // cascadeMax = jumlah kartu yang terlihat (sisanya bersembunyi di belakang yang terakhir)
     // cascadeCap = jarak A ke B sebagai bagian dari tinggi kartu ke-2 (1 = penuh). Kalau tumpukan tidak muat
-    //   sampai batas bawah (listBottomFrac), semua jarak dikecilkan sama rata.
+    //   sampai batas bawah (listBottomFrac), daftar bisa digulir (swipe naik atau seret slider di kanan).
     // scale3Step = pengecilan skala tiap tingkat, overlapDp = tumpang tindih minimal antar kartu (tidak pernah ada celah)
-    val cascadeMax: Int get() = prop("debug.ioslock.cascademax").toIntOrNull() ?: 30
-    val cascadeCap: Float get() = prop("debug.ioslock.cascadecap").toFloatOrNull() ?: 0.86f
+    val cascadeMax: Int get() = prop("debug.ioslock.cascademax").toIntOrNull() ?: 99
+    val cascadeCap: Float get() = prop("debug.ioslock.cascadecap").toFloatOrNull() ?: 0.6f
     val scale3Step: Float get() = prop("debug.ioslock.scale3step").toFloatOrNull() ?: 0.03f
     val overlapDp: Float get() = prop("debug.ioslock.overlapdp").toFloatOrNull() ?: 8f
+    // keadaan 3: kalau jumlah kartu <= noStack3, tumpukan dihilangkan (semua kartu tampil penuh, jarak gap3Dp)
+    val noStack3: Int get() = prop("debug.ioslock.nostack3").toIntOrNull() ?: 5
+    val gap3Dp: Float get() = prop("debug.ioslock.gap3dp").toFloatOrNull() ?: 8f
+    // buka batas jumlah notifikasi yang ditampilkan sistem di lockscreen (matikan: setprop debug.ioslock.unlimit 0)
+    val unlimit: Boolean get() = prop("debug.ioslock.unlimit") != "0"
+    // slider scroll di tepi kanan keadaan 3: lebar dan jarak dari tepi kanan (dp)
+    val sliderDp: Float get() = prop("debug.ioslock.sliderdp").toFloatOrNull() ?: 4f
+    val sliderRightDp: Float get() = prop("debug.ioslock.sliderrightdp").toFloatOrNull() ?: 10f
     // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
     // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
     val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
@@ -165,10 +176,21 @@ class MainHook : IXposedHookLoadPackage {
     private var applied = false
     private var animator: ValueAnimator? = null
 
+    // scroll daftar di keadaan 3 (px) dan slider di tepi kanan
+    @Volatile private var scrollY = 0f
+    @Volatile private var scrollMaxPx = 0f
+    private var baseScroll = 0f
+    private var slider: SliderView? = null
+    private var sliderShown = false
+    private var sliderDrag = false
+    private var sliderTrackTop = 0f
+    private var sliderTrackH = 0f
+    private var sliderThumbH = 0f
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.21 loaded into SystemUI")
+        log("v0.22 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -197,6 +219,7 @@ class MainHook : IXposedHookLoadPackage {
         hook(cl, clockHelper, "powerModeChanged", after = {
             animator?.cancel()
             progress = 0f
+            scrollY = 0f
             bouncerHook = false
             lastGearWritten = null
             applyState()
@@ -210,12 +233,36 @@ class MainHook : IXposedHookLoadPackage {
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
 
+        // Buka batas jumlah notifikasi yang ditampilkan sistem di lockscreen
+        // (kalau tidak, kartu di luar batas disembunyikan sistem dan tidak ikut ditata)
+        val limitSetters = listOf(
+            "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayout",
+            "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayout",
+            "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayoutController",
+            stack,
+            "com.android.systemui.statusbar.notification.stack.AmbientState"
+        )
+        for (c in limitSetters) {
+            hook(cl, c, "setMaxDisplayedNotifications", before = { p ->
+                if (shouldUnlimit() && p.args.isNotEmpty() && p.args[0] is Int) {
+                    p.args[0] = 99
+                }
+            })
+        }
+        hook(cl, "com.android.systemui.statusbar.notification.stack.NotificationStackSizeCalculator",
+            "computeMaxKeyguardNotifications", after = { p ->
+                if (shouldUnlimit() && p.result is Int) {
+                    p.result = 99
+                }
+            })
+
         // State status bar: hanya ambil alih saat KEYGUARD (bukan shade / QS di lockscreen)
         hook(cl, stateCtl, "setState", after = { p ->
             val s = p.args.getOrNull(0) as? Int ?: return@hook
             if (s == 1 && barState != 1) {
                 animator?.cancel()
                 progress = 0f
+                scrollY = 0f
                 bouncerHook = false
                 lastGearWritten = null
             }
@@ -253,6 +300,7 @@ class MainHook : IXposedHookLoadPackage {
                                 screenOff = true
                                 animator?.cancel()
                                 progress = 0f
+                                scrollY = 0f
                                 bouncerHook = false
                                 lastGearWritten = null
                                 hideLabels()
@@ -303,6 +351,8 @@ class MainHook : IXposedHookLoadPackage {
     // ---- setting gear ----
 
     private fun shouldForceGear(): Boolean = Config.gesture && Config.gearForce && barState == 1
+
+    private fun shouldUnlimit(): Boolean = Config.gesture && Config.unlimit && onKeyguardState()
 
     // "1" = jam biasa (kecil), "0" = jam tinggi
     private fun desiredGear(): String = if (qOf(progress) >= Config.gearAt) "1" else "0"
@@ -440,9 +490,29 @@ class MainHook : IXposedHookLoadPackage {
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
         val ev = p.args[0] as? MotionEvent ?: return
         val root = p.thisObject as? View ?: return
-        if (!Config.gesture) { if (applied) { progress = 0f; applyState() }; return }
+        if (!Config.gesture) { if (applied) { progress = 0f; scrollY = 0f; applyState() }; return }
         val dm = root.resources.displayMetrics
         val a = ev.actionMasked
+
+        // slider di tepi kanan (keadaan 3): seret untuk menggulir daftar
+        if (a == MotionEvent.ACTION_DOWN) {
+            val dd = dm.density
+            sliderDrag = sliderShown && ev.rawX >= dm.widthPixels - 40f * dd &&
+                ev.rawY >= sliderTrackTop - 16f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * dd
+            if (sliderDrag) {
+                animator?.cancel()
+                tracking = false
+                taken = false
+            }
+        }
+        if (sliderDrag) {
+            when (a) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> dragSlider(ev.rawY)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> sliderDrag = false
+            }
+            p.result = true
+            return
+        }
 
         if (a == MotionEvent.ACTION_DOWN) {
             animator?.cancel()
@@ -454,6 +524,7 @@ class MainHook : IXposedHookLoadPackage {
                 findStack(root)
             } else if (applied) {
                 progress = 0f
+                scrollY = 0f
                 applyState()
             }
             logT("touchSeen", "locked=$locked state=$barState stack=${stackRef?.get() != null} cards=${hasCards()}", discrete = true)
@@ -480,6 +551,7 @@ class MainHook : IXposedHookLoadPackage {
                 taken = true
                 startY = ev.rawY
                 baseProgress = progress
+                baseScroll = scrollY
                 log("takeover swipe, base=$baseProgress")
             }
         }
@@ -487,9 +559,12 @@ class MainHook : IXposedHookLoadPackage {
         if (taken) {
             when (a) {
                 MotionEvent.ACTION_MOVE -> {
+                    // swipe naik melewati keadaan 3 = menggulir daftar (kalau kartu tidak muat)
+                    val l12 = Config.rangeDp + Config.stage2Dp
                     val moved = (startY - ev.rawY) / dm.density
-                    val d = progressToDist(baseProgress) + moved
-                    progress = distToProgress(d.coerceAtLeast(0f)).coerceIn(0f, 2f)
+                    val dist = progressToDist(baseProgress) + baseScroll / dm.density + moved
+                    progress = distToProgress(min(dist, l12).coerceAtLeast(0f)).coerceIn(0f, 2f)
+                    scrollY = ((dist - l12) * dm.density).coerceIn(0f, scrollMaxPx)
                     applyState()
                     logT("progress", "p=$progress")
                 }
@@ -525,7 +600,7 @@ class MainHook : IXposedHookLoadPackage {
             val onKeyguard = locked && onKeyguardState()
             if (!Config.gesture || !onKeyguard) {
                 if (applied) { reset(sv, ctx); applied = false }
-                if (!locked) progress = 0f
+                if (!locked) { progress = 0f; scrollY = 0f }
                 return
             }
             applied = true
@@ -644,14 +719,27 @@ class MainHook : IXposedHookLoadPackage {
         return out
     }
 
-    // Tata letak keadaan 3: tumpukan bertingkat tanpa celah dengan jarak SERAGAM.
+    // Tata letak tanpa tumpukan: semua kartu tampil penuh, berurutan dengan jarak kecil (gap).
+    private fun layoutList(hs: FloatArray, top: Float, gap: Float): StateLayout {
+        val n = hs.size
+        val out = StateLayout(n)
+        var y = top
+        for (i in 0 until n) {
+            y += hs[i]
+            out.bottom[i] = y
+            out.scale[i] = 1f
+            out.kind[i] = 0
+            y += gap
+        }
+        return out
+    }
+
+    // Tata letak keadaan 3 (kartu banyak): tumpukan bertingkat tanpa celah dengan jarak SERAGAM.
     // Kartu 0 tampil penuh. Tiap kartu di bawahnya berada di belakang kartu di atasnya, dan jarak tepi bawah
     // antar kartu sama dengan jarak kartu A -> kartu B (step = tinggi kartu ke-2 * capBase, dengan tumpang
-    // tindih minimal overlapMin). Jadi semua kartu tersusun rapi dengan jarak yang sama, skalanya mengecil
-    // sedikit tiap tingkat. Kalau tumpukan tidak muat sampai limit, semua jarak dikecilkan sama rata
-    // (lam < 1); kalau masih tidak muat, jumlah kartu yang terlihat dikurangi.
+    // tindih minimal overlapMin). Semua kartu ikut tampil; kalau tidak muat, daftar digulir (lihat applyStack).
     private fun layoutCascade(
-        hs: FloatArray, top: Float, limit: Float, minPeek: Float, overlapMin: Float,
+        hs: FloatArray, top: Float, minPeek: Float, overlapMin: Float,
         maxVisible: Int, capBase: Float, scaleStep: Float
     ): StateLayout {
         val n = hs.size
@@ -662,47 +750,15 @@ class MainHook : IXposedHookLoadPackage {
         out.kind[0] = 0
         if (n == 1) return out
 
-        // tebal terlihat paling tipis (pita)
         fun lo(i: Int): Float = min(minPeek, hs[i] * sc(i))
-
-        // jarak A -> B: dipakai untuk semua kartu
+        // jarak A -> B: dipakai untuk semua kartu (dibatasi tinggi kartu itu sendiri, supaya tidak ada celah)
         val step = max(min(hs[1] * sc(1) * capBase, hs[1] * sc(1) - overlapMin), lo(1))
-        // batas atas jarak kartu i (tidak boleh melebihi tinggi kartu itu sendiri, supaya tidak ada celah)
-        fun hi(i: Int): Float = max(min(step, hs[i] * sc(i) - overlapMin), lo(i))
+        fun t(i: Int): Float = max(min(step, hs[i] * sc(i) - overlapMin), lo(i))
 
-        val room = limit - out.bottom[0]
-
-        // jumlah kartu yang terlihat: dikurangi sampai semuanya muat dengan ketebalan minimum
-        var m = min(n, max(maxVisible, 1))
-        while (m > 1) {
-            var s = 0f
-            for (i in 1 until m) s += lo(i)
-            if (s <= room) break
-            m--
-        }
-
-        fun t(i: Int, lam: Float): Float = (lam * step).coerceIn(lo(i), hi(i))
-        fun total(lam: Float): Float {
-            var s = 0f
-            for (i in 1 until m) s += t(i, lam)
-            return s
-        }
-
-        // lam = 1: jarak penuh seperti A -> B. Kalau tidak muat, kecilkan semua jarak sama rata (bisection)
-        var lam = 1f
-        if (total(1f) > room) {
-            var l = 0f
-            var h = 1f
-            for (iter in 0 until 28) {
-                val mid = (l + h) / 2f
-                if (total(mid) > room) h = mid else l = mid
-            }
-            lam = l
-        }
-
+        val m = min(n, max(maxVisible, 1))
         for (i in 1 until n) {
             if (i < m) {
-                out.bottom[i] = out.bottom[i - 1] + t(i, lam)
+                out.bottom[i] = out.bottom[i - 1] + t(i)
                 out.scale[i] = sc(i)
                 out.kind[i] = 1
             } else {
@@ -763,7 +819,7 @@ class MainHook : IXposedHookLoadPackage {
         }
         if (a < 1f) {
             // di titik asal semua kartu sekecil pita terakhir; makin keluar makin besar
-            val sO = la.scale[n - 1]
+            val sO = min(la.scale[n - 1], 0.9f)
             for (i in 0 until n) {
                 val ea = openProgress(i, n, a, openStagger)
                 outBottom[i] = origin + (outBottom[i] - origin) * ea
@@ -789,13 +845,12 @@ class MainHook : IXposedHookLoadPackage {
 
     // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari dasar tumpukan (kartu depan dulu)
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): hanya kartu depan penuh, sisanya menumpuk di belakangnya; dasar pita terakhir
-    // tepat di bottom2Frac (garis merah).
-    // Keadaan 3 (q=1): semua kartu tersusun dengan jarak seragam seperti kartu A ke B; kartu atas penuh,
-    // tiap kartu di bawahnya mengecil sedikit, berakhir paling jauh di batas bawah (listBottomFrac).
-    // Kartu yang menumpuk adalah kartu asli (tanpa clip, tanpa disembunyikan): digeser ke belakang
-    // kartu di atasnya dan diperkecil, sehingga hanya bagian bawahnya yang menyembul.
-    // Tata letak dua keadaan dihitung terpisah, lalu composeStack menggabungkannya dengan a dan q.
+    // Keadaan 2 (q=0): kartu <= noStack2 = semua kartu penuh (tanpa tumpukan); selain itu kartu depan penuh dan
+    // sampai 4 pita di belakangnya (maks 5 kartu), dasar pita terakhir tepat di bottom2Frac (garis merah).
+    // Keadaan 3 (q=1): kartu <= noStack3 = semua kartu penuh dengan jarak kecil; selain itu tumpukan bertingkat
+    // dengan jarak seragam seperti kartu A ke B. Kalau tidak muat sampai listBottomFrac, daftar digulir
+    // (swipe naik atau seret slider di kanan) dan kartu dipotong di batas atas dan bawah daftar.
+    // Kartu yang menumpuk adalah kartu asli: digeser ke belakang kartu di atasnya dan diperkecil.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -824,7 +879,12 @@ class MainHook : IXposedHookLoadPackage {
         val targetTop = restTop + (smallTop - restTop) * q
 
         updateLabels(sv, a, targetTop, notifCount(g))
-        if (n == 0) return
+        if (n == 0) {
+            scrollMaxPx = 0f
+            scrollY = 0f
+            hideSlider()
+            return
+        }
 
         val limit = dm.heightPixels * Config.listBottomFrac
         val bottom2 = dm.heightPixels * Config.bottom2Frac
@@ -835,13 +895,31 @@ class MainHook : IXposedHookLoadPackage {
         val hs = FloatArray(n) { visH(cards[it].first) }
         val decay = Config.bandDecay.coerceIn(0.3f, 1f)
         val step = Config.scaleStep.coerceIn(0f, 0.12f)
-        val la = layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
-            minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
-        val lb = layoutCascade(hs, smallTop, limit, minPeek, Config.overlapDp * d, Config.cascadeMax,
-            Config.cascadeCap.coerceIn(0.2f, 1f), Config.scale3Step.coerceIn(0f, 0.08f))
 
-        // titik asal animasi buka: dasar tumpukan (tepi bawah kartu terakhir di keadaan 2),
-        // minimal originFrac supaya tetap di dekat teks "N Notifications" walau kartunya sedikit
+        // keadaan 2: tanpa tumpukan kalau kartunya sedikit (dan muat sampai garis), selain itu bertumpuk
+        val list2 = if (n <= Config.noStack2) {
+            layoutList(hs, restTop, Config.gap2Dp * d).takeIf { it.bottom[n - 1] <= bottom2 }
+        } else null
+        val la = list2 ?: layoutState(baseYs, hs, restTop, 0f, Config.full2, Config.bands2, bottom2,
+            minPeek, Config.peekMaxFrac.coerceIn(0.3f, 1f), decay, step)
+
+        // keadaan 3: tanpa tumpukan kalau kartunya sedikit, selain itu bertingkat dengan jarak seragam
+        val lb = if (n <= Config.noStack3) {
+            layoutList(hs, smallTop, Config.gap3Dp * d)
+        } else {
+            layoutCascade(hs, smallTop, minPeek, Config.overlapDp * d, Config.cascadeMax,
+                Config.cascadeCap.coerceIn(0.2f, 1f), Config.scale3Step.coerceIn(0f, 0.08f))
+        }
+
+        // jarak gulir maksimum keadaan 3: isi daftar yang melewati batas bawah
+        var contentBottom = 0f
+        for (i in 0 until n) contentBottom = max(contentBottom, lb.bottom[i])
+        scrollMaxPx = max(0f, contentBottom - limit)
+        if (q < 0.999f) scrollY = 0f
+        scrollY = scrollY.coerceIn(0f, scrollMaxPx)
+        val scroll = scrollY
+
+        // titik asal animasi buka: dasar tumpukan keadaan 2, minimal originFrac (garis merah)
         var origin = dm.heightPixels * Config.originFrac
         for (i in 0 until n) origin = max(origin, la.bottom[i])
 
@@ -850,7 +928,7 @@ class MainHook : IXposedHookLoadPackage {
         composeStack(la, lb, a, q, Config.stagger, Config.openStagger, origin, bottoms, scales)
 
         // info untuk debug: logcat | grep IOSLock
-        val sb = StringBuilder("n=$n q=${"%.2f".format(q)}")
+        val sb = StringBuilder("n=$n q=${"%.2f".format(q)} scroll=${scroll.toInt()}/${scrollMaxPx.toInt()}")
 
         for (i in 0 until n) {
             val card = cards[i].first
@@ -861,7 +939,7 @@ class MainHook : IXposedHookLoadPackage {
 
             val kind = if (q < 0.5f) la.kind[i] else lb.kind[i]
             val s = scales[i]
-            val center = bottoms[i] - h * s / 2f
+            val center = bottoms[i] - scroll - h * s / 2f
             sb.append(" [").append(card.javaClass.simpleName.take(14)).append(" k=").append(kind)
                 .append(" h=").append(card.height).append("/").append(h.toInt()).append("]")
 
@@ -875,9 +953,25 @@ class MainHook : IXposedHookLoadPackage {
             card.translationZ = wz
             card.scaleX = s
             card.scaleY = s
-            card.clipBounds = null
+
+            // potong kartu di luar area daftar (atas = awal daftar, bawah = batas bawah) saat menuju/di keadaan 3
+            if (q > 0f) {
+                val cs = center + slide
+                val y0 = h / 2f + (targetTop - cs) / s
+                val y1 = h / 2f + (limit - cs) / s
+                val iy0 = max(0f, y0).toInt()
+                val iy1 = min(card.height.toFloat(), y1).toInt()
+                card.clipBounds = when {
+                    iy0 <= 0 && iy1 >= card.height -> null
+                    iy1 > iy0 -> Rect(0, iy0, card.width, iy1)
+                    else -> Rect(0, 0, 0, 0)
+                }
+            } else {
+                card.clipBounds = null
+            }
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz)
         }
+        updateSlider(sv, q, smallTop, limit)
         logT("cards", sb.toString())
     }
 
@@ -955,10 +1049,101 @@ class MainHook : IXposedHookLoadPackage {
     private fun hideLabels() {
         labelCenter?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
         labelCount?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
+        hideSlider()
+    }
+
+    // ---- slider scroll (tepi kanan, keadaan 3) ----
+
+    private class SliderView(ctx: Context) : View(ctx) {
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(70, 255, 255, 255) }
+        private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(210, 255, 255, 255) }
+        private var thumbTop = 0f
+        private var thumbH = 0f
+
+        fun setThumb(top: Float, h: Float) {
+            if (top != thumbTop || h != thumbH) {
+                thumbTop = top
+                thumbH = h
+                invalidate()
+            }
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat()
+            val r = w / 2f
+            canvas.drawRoundRect(0f, 0f, w, height.toFloat(), r, r, trackPaint)
+            canvas.drawRoundRect(0f, thumbTop, w, thumbTop + thumbH, r, r, thumbPaint)
+        }
+    }
+
+    private fun ensureSlider(root: ViewGroup) {
+        if (slider?.parent === root) return
+        (slider?.parent as? ViewGroup)?.removeView(slider)
+        val sv = SliderView(root.context)
+        sv.alpha = 0f
+        sv.visibility = View.INVISIBLE
+        sv.isClickable = false
+        sv.isFocusable = false
+        val d = root.resources.displayMetrics.density
+        root.addView(sv, ViewGroup.LayoutParams(max(2, (Config.sliderDp * d).toInt()), (200f * d).toInt()))
+        slider = sv
+    }
+
+    private fun hideSlider() {
+        slider?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
+        sliderShown = false
+    }
+
+    private fun updateSlider(sv: View, q: Float, top: Float, bottom: Float) {
+        val root = sv.rootView as? ViewGroup ?: return
+        ensureSlider(root)
+        val s = slider ?: return
+        if (q < 0.999f || scrollMaxPx < 2f || labelsBlocked(root)) {
+            hideSlider()
+            return
+        }
+        val dm = root.resources.displayMetrics
+        val d = dm.density
+        val rl = IntArray(2)
+        root.getLocationOnScreen(rl)
+
+        val trackTop = top + 8f * d
+        val trackH = (bottom - trackTop).coerceAtLeast(40f * d)
+        val viewport = bottom - top
+        val thumbH = max(36f * d, trackH * viewport / (viewport + scrollMaxPx)).coerceAtMost(trackH)
+        val thumbTop = (trackH - thumbH) * (scrollY / scrollMaxPx).coerceIn(0f, 1f)
+
+        val w = max(2, (Config.sliderDp * d).toInt())
+        val h = trackH.toInt()
+        val lp = s.layoutParams
+        if (lp != null && (lp.width != w || lp.height != h)) {
+            lp.width = w
+            lp.height = h
+            s.requestLayout()
+        }
+        s.translationX = dm.widthPixels - rl[0] - Config.sliderRightDp * d - w
+        s.translationY = trackTop - rl[1]
+        s.setThumb(thumbTop, thumbH)
+        s.visibility = View.VISIBLE
+        s.alpha = 1f
+
+        sliderTrackTop = trackTop
+        sliderTrackH = trackH
+        sliderThumbH = thumbH
+        sliderShown = true
+    }
+
+    // seret slider: posisi jari menentukan posisi gulir daftar
+    private fun dragSlider(y: Float) {
+        val range = (sliderTrackH - sliderThumbH).coerceAtLeast(1f)
+        val frac = ((y - sliderTrackTop - sliderThumbH / 2f) / range).coerceIn(0f, 1f)
+        scrollY = frac * scrollMaxPx
+        applyState()
     }
 
     private fun reset(sv: View?, ctx: Context?) {
         restoreGear(ctx)
+        scrollY = 0f
         hideLabels()
         restoreClip()
         if (sv == null) return
