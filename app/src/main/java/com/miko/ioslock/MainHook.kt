@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
+import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
@@ -31,6 +32,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
@@ -227,6 +229,10 @@ class MainHook : IXposedHookLoadPackage {
     private var pillLastBlur = -1
     private var pillLastTint = -1
     private var pillLastRad = -1f
+    // blur notifikasi XOS (render effect cross-window yang sama dengan latar kartu notifikasi)
+    private var tranView: Any? = null
+    private var pillXosBlur: WeakReference<View>? = null
+    private var pillXosTries = 0
     // geometri pil terakhir dalam piksel layar: [left, top, lebar, tinggi]
     private var pillGeo = FloatArray(4)
 
@@ -1346,6 +1352,8 @@ class MainHook : IXposedHookLoadPackage {
         pillLastBlur = -1
         pillLastTint = -1
         pillLastRad = -1f
+        pillXosBlur = null
+        pillXosTries = 0
 
         val lc = makeLabel(ctx, Config.labelSp, true, Gravity.START)
         lc.text = "Notification Center"
@@ -1425,10 +1433,34 @@ class MainHook : IXposedHookLoadPackage {
         return floatArrayOf(cx - w / 2f, cy - h / 2f, w, h)
     }
 
-    // Buat drawable blur belakang-window milik platform (ViewRootImpl.createBackgroundBlurDrawable). View harus
-    // sudah menempel di window. Kalau gagal (ROM beda), dicoba lagi beberapa kali, lalu pakai kaca transparan biasa.
+    // Blur pil memakai blur notifikasi XOS yang sudah ada: DepthUtil.enableEffectRowBlur memasang render effect
+    // cross-window blur pada view, mekanisme yang sama dengan latar kartu notifikasi (TrNotificationBackgroundView).
+    // View harus sudah menempel di window. Kalau tidak tersedia, pakai drawable blur platform, lalu tint biasa.
     private fun ensurePillBlur(pv: PillView) {
-        if (pillBlur != null || pillBlurTries >= 6 || !pv.isAttachedToWindow) return
+        if (!pv.isAttachedToWindow || pillXosBlur?.get() === pv) return
+
+        // 1) blur notifikasi XOS (DepthUtil + TranView)
+        if (pillXosTries < 6) {
+            pillXosTries++
+            try {
+                val cl = pv.context.classLoader
+                val depth = XposedHelpers.findClass("com.transsion.systemui.blur.DepthUtil", cl)
+                val tranCls = XposedHelpers.findClass("com.transsion.hubsdk.api.view.TranView", cl)
+                val tv = tranView ?: XposedHelpers.newInstance(tranCls).also { tranView = it }
+                XposedHelpers.callStaticMethod(depth, "enableEffectRowBlur", pv, tv)
+                pillXosBlur = WeakReference(pv)
+                pillBlur = null
+                pv.background = null
+                pv.useFallback = true   // tint pil tetap digambar di atas blur
+                log("pil: blur notifikasi XOS aktif (DepthUtil.enableEffectRowBlur)")
+            } catch (t: Throwable) {
+                once("pillXosFail") { log("pil: blur notifikasi XOS gagal: $t") }
+            }
+            if (pillXosBlur?.get() === pv) return
+        }
+
+        // 2) cadangan: drawable blur belakang-window platform
+        if (pillBlur != null || pillBlurTries >= 6) return
         pillBlurTries++
         val bd = try {
             val vri = XposedHelpers.callMethod(pv, "getViewRootImpl")
@@ -1507,7 +1539,8 @@ class MainHook : IXposedHookLoadPackage {
                 pv.invalidate()
             }
         }
-        if (pv.useFallback) pv.setFallback(radius, tintA)
+        // bentuk (outline) pil selalu diperbarui; tint hanya digambar kalau bukan blur drawable platform
+        pv.setFallback(radius, if (pv.useFallback) tintA else 0)
     }
 
     private fun hidePill() {
@@ -1524,9 +1557,28 @@ class MainHook : IXposedHookLoadPackage {
         private var radius = 0f
         private var fillA = 0
 
+        init {
+            // blur notifikasi XOS digambar di belakang view, jadi potong mengikuti bentuk pil
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    val r = radius.coerceIn(0f, min(view.width, view.height) / 2f)
+                    outline.setRoundRect(0, 0, view.width, view.height, r)
+                }
+            }
+            clipToOutline = true
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            invalidateOutline()
+        }
+
         fun setFallback(r: Float, a: Int) {
             if (r != radius || a != fillA) {
-                radius = r
+                if (r != radius) {
+                    radius = r
+                    invalidateOutline()
+                }
                 fillA = a
                 invalidate()
             }
