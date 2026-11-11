@@ -9,10 +9,14 @@ import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Rect
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.PowerManager
 import android.os.SystemClock
@@ -25,7 +29,6 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
-import android.view.animation.OvershootInterpolator
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -91,7 +94,7 @@ object Config {
     // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan (semua kartu tampil penuh, jarak gap2Dp)
     val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 3
     val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
-    // keadaan 3: semua kartu tampil penuh (tidak dipotong) dengan jarak kecil gap3Dp.
+    // keadaan 3: semua kartu tampil penuh dengan jarak kecil gap3Dp; bagian atas dipotong dengan fade.
     // Kartu yang tidak muat di bawah (batas listBottomFrac) tetap kecil dan menumpuk setebal dockDp,
     // lalu membesar saat daftar di-swipe naik. dockScale = pengecilan skala maksimum kartu di tumpukan bawah,
     // dockRefDp = seberapa jauh kartu di bawah batas sampai skalanya mencapai pengecilan maksimum.
@@ -106,12 +109,10 @@ object Config {
     val sliderHideMs: Long get() = prop("debug.ioslock.sliderhidems").toLongOrNull() ?: 900L
     val sliderFadeInMs: Long get() = prop("debug.ioslock.sliderfadein").toLongOrNull() ?: 150L
     val sliderFadeOutMs: Long get() = prop("debug.ioslock.sliderfadeout").toLongOrNull() ?: 350L
-    // jam saat daftar keadaan 3 di-swipe naik: mengecil sedikit dan naik dengan efek bounce.
-    // clockId = nama id view jam kalau pencarian otomatis salah (lihat logcat "clockScan")
-    val clockBounce: Boolean get() = prop("debug.ioslock.clockbounce") != "0"
-    val clockShrink: Float get() = prop("debug.ioslock.clockshrink").toFloatOrNull() ?: 0.12f
-    val clockUpDp: Float get() = prop("debug.ioslock.clockupdp").toFloatOrNull() ?: 36f
-    val clockId: String get() = prop("debug.ioslock.clockid")
+    // keadaan 3: kartu yang ter-scroll melewati garis atas (smallFrac) dipotong dengan fade setebal topFadeDp
+    // (0 = potong datar). Wallpaper digelapkan sebesar dimAlpha (0..1) saat masuk keadaan 3 (0 = mati).
+    val topFadeDp: Float get() = prop("debug.ioslock.topfade").toFloatOrNull() ?: 44f
+    val dimAlpha: Float get() = prop("debug.ioslock.dim").toFloatOrNull() ?: 0.28f
     // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
     // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
     val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
@@ -198,18 +199,26 @@ class MainHook : IXposedHookLoadPackage {
     private var lastScrollSeen = 0f
     private val sliderHideRunnable = Runnable { fadeSlider(false) }
 
-    // jam (view jam di lockscreen): mengecil dan naik dengan bounce saat daftar di-scroll
-    private var clockRef: WeakReference<View>? = null
-    private var clockApplied = false
-    private val clockOrig = FloatArray(5)
-    private var clockAnim: ValueAnimator? = null
-    private var clockWant = false
-    @Volatile private var clockProg = 0f
+    // fade atas daftar (mask lewat hook dispatchDraw milik view stack)
+    @Volatile private var maskOn = false
+    @Volatile private var maskLine = 0f
+    @Volatile private var maskFade = 0f
+    @Volatile private var maskStrength = 0f
+    private var maskHooked = false
+    @Volatile private var maskReady = false
+    private val maskSolid = Paint().apply {
+        color = Color.BLACK
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+    }
+    private val maskGrad = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) }
+
+    // dim wallpaper di keadaan 3
+    private var dimView: View? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.23 loaded into SystemUI")
+        log("v0.24 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -322,7 +331,7 @@ class MainHook : IXposedHookLoadPackage {
                                 scrollY = 0f
                                 bouncerHook = false
                                 lastGearWritten = null
-                                restoreClock()
+                                hideDim()
                                 hideLabels()
                             }
                             Intent.ACTION_SCREEN_ON -> {
@@ -832,9 +841,9 @@ class MainHook : IXposedHookLoadPackage {
     // q: 0..1 jam mengecil dan daftar naik
     // Keadaan 2 (q=0): kartu depan penuh dan maks 2 pita di belakangnya (total 3 kartu), dasar pita terakhir
     // tepat di bottom2Frac (garis merah). Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
-    // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil, tidak dipotong. Kartu yang melewati batas bawah
+    // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil; atas dipotong di garis dengan fade. Kartu yang melewati batas bawah
     // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
-    // Saat di-scroll, label "Notification Center" ikut bergeser bersama kartu teratas, jam mengecil dan naik (bounce).
+    // Wallpaper digelapkan sedikit saat masuk keadaan 3.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
@@ -868,7 +877,8 @@ class MainHook : IXposedHookLoadPackage {
             scrollY = 0f
             updateLabels(sv, a, targetTop, count)
             hideSlider()
-            updateClock(sv, false)
+            updateMask(sv, false, 0f, smallTop, d)
+            updateDim(sv, 0f)
             return
         }
 
@@ -898,7 +908,7 @@ class MainHook : IXposedHookLoadPackage {
         scrollY = scrollY.coerceIn(0f, scrollMaxPx)
         val scroll = scrollY
 
-        updateLabels(sv, a, targetTop - scroll, count)
+        updateLabels(sv, a, targetTop, count)
 
         // titik asal animasi buka: dasar tumpukan keadaan 2, minimal originFrac (garis merah)
         var origin = dm.heightPixels * Config.originFrac
@@ -958,7 +968,12 @@ class MainHook : IXposedHookLoadPackage {
             card.translationZ = wz
             card.scaleX = s
             card.scaleY = s
-            card.clipBounds = null
+            // potong bagian atas kartu yang ter-scroll melewati garis atas daftar; fade-nya digambar oleh mask
+            val csy = center + slide
+            val iy0 = (h / 2f + (smallTop - csy) / s).toInt()
+            card.clipBounds = if (q > 0f && iy0 > 0) {
+                Rect(0, min(iy0, card.height), card.width, card.height)
+            } else null
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz)
         }
 
@@ -967,9 +982,9 @@ class MainHook : IXposedHookLoadPackage {
             (rightEdge + dm.widthPixels) / 2f
         } else dm.widthPixels - 6f * d
 
-        // jam: mengecil dan naik (bounce) begitu daftar mulai di-scroll, kembali saat scroll 0
-        val clockOn = q >= 0.999f && scroll > (if (clockWant) 3f else 10f) * d
-        updateClock(sv, clockOn)
+        // fade atas, dim wallpaper, slider
+        updateMask(sv, q >= 0.999f && scroll > 0.5f, scroll, smallTop, d)
+        updateDim(sv, q)
         updateSlider(sv, q, smallTop, limit, gapCenter)
         logT("cards", sb.toString())
     }
@@ -1175,100 +1190,127 @@ class MainHook : IXposedHookLoadPackage {
         applyState()
     }
 
-    // ---- jam: mengecil dan naik dengan bounce saat daftar di-scroll ----
+    // ---- fade atas daftar (mask) ----
 
-    private fun collectClock(v: View, depth: Int, out: MutableList<View>, want: String) {
-        if (depth > 16 || out.size > 40) return
-        val dm = v.resources.displayMetrics
-        val id = idName(v)
-        val hit = if (want.isNotEmpty()) id == want
-        else v.javaClass.name.contains("Clock") || id.contains("clock", true)
-        if (hit && v.isShown && v.width > 0 && v.height > 100f * dm.density &&
-            v.height < dm.heightPixels * 0.6f) out.add(v)
-        if (v is ViewGroup) {
-            for (i in 0 until v.childCount) collectClock(v.getChildAt(i), depth + 1, out, want)
-        }
-    }
-
-    // cari view jam. Kalau salah pilih: lihat logcat "clockScan", lalu setprop debug.ioslock.clockid <nama id>
-    private fun findClock(root: View) {
-        val cur = clockRef?.get()
-        if (cur != null && cur.isAttachedToWindow) return
-        val want = Config.clockId
-        val found = ArrayList<View>()
-        collectClock(root.rootView, 0, found, want)
-        val pick = if (want.isNotEmpty()) found.firstOrNull()
-        else found.maxByOrNull { it.width.toLong() * it.height }
-        if (pick != null) clockRef = WeakReference(pick)
-        logT("clockScan", "pick=" + (pick?.let { it.javaClass.name + "#" + idName(it) + " " + it.width + "x" + it.height } ?: "none") +
-            " candidates=" + found.take(8).joinToString { it.javaClass.simpleName + "#" + idName(it) + " " + it.width + "x" + it.height },
-            discrete = true)
-    }
-
-    private fun applyClock() {
-        val v = clockRef?.get() ?: return
-        if (!clockApplied) {
-            clockOrig[0] = v.scaleX
-            clockOrig[1] = v.scaleY
-            clockOrig[2] = v.translationY
-            clockOrig[3] = v.pivotX
-            clockOrig[4] = v.pivotY
-            clockApplied = true
-        }
-        val d = v.resources.displayMetrics.density
-        val p = clockProg
-        v.pivotX = v.width / 2f
-        v.pivotY = 0f
-        val sc = 1f - Config.clockShrink * p
-        v.scaleX = clockOrig[0] * sc
-        v.scaleY = clockOrig[1] * sc
-        v.translationY = clockOrig[2] - Config.clockUpDp * d * p
-    }
-
-    private fun restoreClock() {
-        clockAnim?.let { it.removeAllListeners(); it.cancel() }
-        clockAnim = null
-        clockWant = false
-        clockProg = 0f
-        if (clockApplied) {
-            val v = clockRef?.get()
-            if (v != null) {
-                v.scaleX = clockOrig[0]
-                v.scaleY = clockOrig[1]
-                v.translationY = clockOrig[2]
-                v.pivotX = clockOrig[3]
-                v.pivotY = clockOrig[4]
+    // Hook dispatchDraw milik view stack: kartu digambar di layer terpisah, lalu bagian di atas garis dihapus
+    // (DST_OUT) dan bagian tepat di bawah garis dibuat memudar setebal topFadeDp, jadi potongan atas tidak datar.
+    // Kalau class stack tidak punya dispatchDraw sendiri, potongan atas tetap datar (clipBounds saja).
+    private fun ensureMaskHook(v: View) {
+        if (maskHooked) return
+        maskHooked = true
+        try {
+            var c: Class<*>? = v.javaClass
+            var target: Class<*>? = null
+            while (c != null && c != ViewGroup::class.java && c != View::class.java) {
+                if (c.declaredMethods.any { it.name == "dispatchDraw" }) { target = c; break }
+                c = c.superclass
             }
-            clockApplied = false
-        }
-    }
+            if (target == null) {
+                log("mask: dispatchDraw tidak ada di ${v.javaClass.name}, potongan atas tetap datar")
+                return
+            }
+            XposedBridge.hookAllMethods(target, "dispatchDraw", object : XC_MethodHook() {
+                override fun beforeHookedMethod(p: MethodHookParam) {
+                    try {
+                        val view = p.thisObject as? View ?: return
+                        if (!maskOn || view !== stackRef?.get()) return
+                        val canvas = p.args[0] as? Canvas ?: return
+                        val loc = IntArray(2)
+                        view.getLocationOnScreen(loc)
+                        val dm = view.resources.displayMetrics
+                        val l = -loc[0].toFloat()
+                        val t = -loc[1].toFloat()
+                        val r = l + dm.widthPixels
+                        val b = t + dm.heightPixels
+                        val save = canvas.saveLayer(l, t, r, b, null)
+                        p.setObjectExtra("ioslSave", save)
+                        p.setObjectExtra("ioslRect", floatArrayOf(l, t, r, maskLine - loc[1], maskFade, maskStrength))
+                    } catch (t: Throwable) { }
+                }
 
-    private fun updateClock(sv: View, want: Boolean) {
-        val root = sv.rootView as? ViewGroup ?: return
-        val w = want && Config.clockBounce && !labelsBlocked(root)
-        if (w != clockWant) {
-            clockWant = w
-            if (w) findClock(root)
-            clockAnim?.let { it.removeAllListeners(); it.cancel() }
-            val an = ValueAnimator.ofFloat(clockProg, if (w) 1f else 0f)
-            an.duration = if (w) 420L else 340L
-            an.interpolator = OvershootInterpolator(if (w) 2.6f else 2.0f)
-            an.addUpdateListener { clockProg = it.animatedValue as Float; applyClock() }
-            an.addListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    if (!clockWant) restoreClock()
+                override fun afterHookedMethod(p: MethodHookParam) {
+                    try {
+                        val save = p.getObjectExtra("ioslSave") as? Int ?: return
+                        val rc = p.getObjectExtra("ioslRect") as? FloatArray ?: return
+                        val canvas = p.args[0] as? Canvas ?: return
+                        val l = rc[0]; val t = rc[1]; val r = rc[2]; val line = rc[3]
+                        val fade = rc[4]; val st = rc[5]
+                        // di atas garis: dihapus penuh
+                        canvas.drawRect(l, t, r, line, maskSolid)
+                        // di bawah garis: memudar dari transparan ke utuh
+                        if (fade > 1f && st > 0.01f) {
+                            val a = (255f * st).toInt().coerceIn(0, 255)
+                            maskGrad.shader = LinearGradient(
+                                0f, line, 0f, line + fade,
+                                Color.argb(a, 0, 0, 0), Color.argb(0, 0, 0, 0), Shader.TileMode.CLAMP
+                            )
+                            canvas.drawRect(l, line, r, line + fade, maskGrad)
+                        }
+                        canvas.restoreToCount(save)
+                    } catch (t: Throwable) { }
                 }
             })
-            clockAnim = an
-            an.start()
+            maskReady = true
+            log("mask hook on ${target.name}.dispatchDraw")
+        } catch (t: Throwable) {
+            log("mask hook gagal: $t")
         }
-        if (clockApplied || clockProg != 0f) applyClock()
+    }
+
+    // on = ada kartu yang ter-scroll melewati garis atas. Kekuatan fade naik bertahap seiring jarak gulir.
+    private fun updateMask(sv: View, on: Boolean, scroll: Float, line: Float, d: Float) {
+        ensureMaskHook(sv)
+        val fade = Config.topFadeDp * d
+        val st = if (on && fade > 1f) (scroll / (fade * 0.8f)).coerceIn(0f, 1f) else 0f
+        val active = on && maskReady
+        val changed = active != maskOn || abs(st - maskStrength) > 0.01f
+        maskOn = active
+        maskLine = line
+        maskFade = fade
+        maskStrength = st
+        if (changed) sv.invalidate()
+    }
+
+    // ---- dim wallpaper (keadaan 3) ----
+
+    // View hitam transparan di posisi paling bawah window shade: hanya menggelapkan yang ada di belakang
+    // (wallpaper), kartu dan teks tetap di atasnya.
+    private fun ensureDim(root: ViewGroup): View {
+        val cur = dimView
+        if (cur != null && cur.parent === root) return cur
+        (cur?.parent as? ViewGroup)?.removeView(cur)
+        val v = View(root.context)
+        v.setBackgroundColor(Color.BLACK)
+        v.alpha = 0f
+        v.visibility = View.INVISIBLE
+        v.isClickable = false
+        v.isFocusable = false
+        root.addView(v, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        dimView = v
+        return v
+    }
+
+    private fun updateDim(sv: View, q: Float) {
+        val root = sv.rootView as? ViewGroup ?: return
+        val v = ensureDim(root)
+        val amt = if (labelsBlocked(root)) 0f else (q * Config.dimAlpha).coerceIn(0f, 0.85f)
+        if (amt < 0.005f) {
+            if (v.visibility != View.INVISIBLE) v.visibility = View.INVISIBLE
+            v.alpha = 0f
+        } else {
+            if (v.visibility != View.VISIBLE) v.visibility = View.VISIBLE
+            v.alpha = amt
+        }
+    }
+
+    private fun hideDim() {
+        dimView?.let { it.alpha = 0f; it.visibility = View.INVISIBLE }
     }
 
     private fun reset(sv: View?, ctx: Context?) {
         restoreGear(ctx)
         scrollY = 0f
-        restoreClock()
+        hideDim()
         hideLabels()
         restoreClip()
         if (sv == null) return
