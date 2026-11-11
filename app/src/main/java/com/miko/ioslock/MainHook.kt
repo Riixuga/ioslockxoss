@@ -94,19 +94,20 @@ object Config {
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // skala awal kartu saat tumpukan dibuka (kecil, di garis asal), lalu membesar ke ukuran keadaan 2
     val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.55f
-    // keadaan 2: jumlah kartu yang tampil penuh (sisanya menumpuk di belakang kartu penuh terakhir). BARU: default 3
-    val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 3
-    // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir
+    // keadaan 2: jumlah kartu penuh (kartu depan). Sisanya tampil sebagai pita di belakang kartu depan.
+    // Default 1: satu kartu penuh, lalu bands2 pita di belakangnya, sisanya menumpuk tepat di belakang pita terakhir.
+    val full2: Int get() = prop("debug.ioslock.full2").toIntOrNull() ?: 1
+    // keadaan 2: jumlah pita tumpukan yang terlihat di bawah kartu penuh terakhir (2 = 3 kartu terlihat)
     val bands2: Int get() = prop("debug.ioslock.bands2").toIntOrNull() ?: 2
     // keadaan 2: kalau jumlah kartu <= noStack2, tumpukan dihilangkan. 0 = selalu menumpuk
     val noStack2: Int get() = prop("debug.ioslock.nostack2").toIntOrNull() ?: 0
     val gap2Dp: Float get() = prop("debug.ioslock.gap2dp").toFloatOrNull() ?: 10f
-    // keadaan 2: kartu penuh terakhir (di depan tumpukan) diperbesar sedikit supaya tumpukan di belakangnya terlihat rapi (1 = normal)
-    val front2Scale: Float get() = prop("debug.ioslock.front2scale").toFloatOrNull() ?: 1.04f
-    // keadaan 2: semua kartu setelah kartu depan menumpuk di belakangnya PERSIS seperti tumpukan bawah ("dock") keadaan 3
-    // (pakai dockScale / dockRefDp yang sama). 0 = kembali ke pita lama (maks bands2 pita, sisanya tersembunyi).
-    val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") != "0"
-    // tebal tumpukan keadaan 2 (dp); 0 = sama dengan dockDp. Dibatasi supaya dasar tumpukan tidak melewati bottom2Frac.
+    // keadaan 2: skala kartu depan pada mode dock (1 = normal). Hanya berlaku kalau ada kartu di belakangnya.
+    val front2Scale: Float get() = prop("debug.ioslock.front2scale").toFloatOrNull() ?: 1f
+    // keadaan 2: mode dock (semua kartu di belakang kartu depan menumpuk seperti stage 3).
+    // Default mati; nyalakan dengan: setprop debug.ioslock.dockstack2 1
+    val dockStack2: Boolean get() = prop("debug.ioslock.dockstack2") == "1"
+    // tebal tumpukan keadaan 2 pada mode dock (dp); 0 = sama dengan dockDp. Dibatasi supaya dasar tumpukan tidak melewati bottom2Frac.
     val dock2Dp: Float get() = prop("debug.ioslock.dock2dp").toFloatOrNull() ?: 0f
     // keadaan 3: semua kartu tampil penuh dengan jarak kecil gap3Dp; bagian atas dipotong dengan fade.
     // Kartu yang tidak muat di bawah (batas listBottomFrac) tetap kecil dan menumpuk setebal dockDp,
@@ -251,7 +252,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.28 loaded into SystemUI")
+        log("v0.29 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -890,7 +891,7 @@ class MainHook : IXposedHookLoadPackage {
     // tepi bawah = dasar kartu depan + dock * (1 - exp(-o / (1.3 * dock))), skala = 1 - dScale * min(1, o / ref),
     // o = jarak kartu itu dari dasar kartu depan kalau daftar dibentangkan. Makin dalam makin tipis dan makin kecil,
     // jadi berapa pun jumlah kartunya semuanya ikut menumpuk. dock dibatasi supaya dasar tumpukan <= limit.
-    // frontScale: skala kartu penuh terakhir (di depan tumpukan); tepi bawahnya tetap di tempat.
+    // frontScale: skala kartu penuh terakhir (di depan tumpukan), hanya kalau memang ada kartu di belakangnya.
     private fun layoutDockStack(
         hs: FloatArray, top: Float, gap: Float, full: Int,
         dock0: Float, limit: Float, ref: Float, dScale: Float, frontScale: Float
@@ -910,8 +911,8 @@ class MainHook : IXposedHookLoadPackage {
         for (i in 0 until n) {
             if (i < k) {
                 out.bottom[i] = spread[i]
-                // kartu penuh terakhir (di depan tumpukan) sedikit diperbesar; tepi bawahnya tetap
-                out.scale[i] = if (i == k - 1) frontScale else 1f
+                // kartu penuh terakhir hanya membesar kalau memang ada kartu di belakangnya
+                out.scale[i] = if (i == k - 1 && n > k) frontScale else 1f
                 out.kind[i] = 0
             } else {
                 val o = spread[i] - fullBottom
@@ -998,15 +999,16 @@ class MainHook : IXposedHookLoadPackage {
     // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari titik asal (garis bawah) sambil
     //    membesar dari kecil (openScale) ke ukuran keadaan 2
     // q: 0..1 jam mengecil dan daftar naik
-    // Keadaan 2 (q=0): kartu depan penuh, semua kartu lain menumpuk di belakangnya seperti dock keadaan 3
-    // (dasar tumpukan tidak melewati bottom2Frac). Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
+    // Keadaan 2 (q=0): kartu depan penuh, kartu lain menumpuk di belakangnya sebagai pita (layoutState),
+    // atau seperti dock keadaan 3 kalau dockStack2 aktif. Dasar tumpukan tidak melewati bottom2Frac.
+    // Kalau kartu <= noStack2 dan muat, semua kartu penuh tanpa tumpukan.
     // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil; atas dipotong di garis dengan fade. Kartu yang melewati batas bawah
     // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
     // Wallpaper digelapkan sedikit saat masuk keadaan 3.
     private fun applyStack(sv: View, a: Float, q: Float) {
         val dm = sv.resources.displayMetrics
         val d = dm.density
-        // BARU: stack tetap opaque selama mengecil, baru memudar di ujung animasi
+        // stack tetap opaque selama mengecil, baru memudar di ujung animasi
         sv.alpha = (a * 8f).coerceAtMost(1f)
         // saat tersembunyi, stack tidak boleh menerima sentuhan
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
