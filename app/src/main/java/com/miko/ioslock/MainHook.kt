@@ -176,25 +176,22 @@ object Config {
     val pillPadVDp: Float get() = prop("debug.ioslock.pillpadv").toFloatOrNull() ?: 7f
     // radius sudut pil (dp). Negatif = bulat penuh (setengah tinggi pil)
     val pillRadiusDp: Float get() = prop("debug.ioslock.pillradius").toFloatOrNull() ?: -1f
-    // cara blur pil: 0 = otomatis (urutan: blur XOS -> blur wallpaper -> blur platform -> kaca biasa),
+    // cara blur pil: 0 = otomatis (blur XOS lewat DepthUtil; kalau tidak ada: blur wallpaper, blur platform, kaca biasa),
     // 1 = blur platform saja (blur belakang-window lewat SurfaceFlinger, tidak ada hasilnya kalau ROM mematikannya),
-    // 2 = blur wallpaper saja, 3 = kaca putih transparan tanpa blur,
-    // 4 = blur XOS (DepthUtil) saja
+    // 2 = blur wallpaper saja, 3 = kaca putih transparan tanpa blur, 4 = blur XOS saja
     val pillMode: Int get() = prop("debug.ioslock.pillmode").toIntOrNull() ?: 0
     // kalibrasi blur wallpaper kalau isi pil tidak pas dengan wallpaper asli: zoom (1 = pas center-crop)
     // dan geser horizontal / vertikal (px)
     val pillWpZoom: Float get() = prop("debug.ioslock.pillwpzoom").toFloatOrNull() ?: 1f
     val pillWpDx: Float get() = prop("debug.ioslock.pillwpdx").toFloatOrNull() ?: 0f
     val pillWpDy: Float get() = prop("debug.ioslock.pillwpdy").toFloatOrNull() ?: 0f
-    // lama animasi pil muncul (ms): tumbuh dari kecil, melewati ukuran penuh sedikit, lalu menetap. 0 = tanpa animasi
-    val pillBounceMs: Long get() = prop("debug.ioslock.pillbounce").toLongOrNull() ?: 650L
-    // blur XOS: nama class (bisa diganti lewat setprop tanpa build ulang) dan argumen angka/boolean untuk
-    // DepthUtil.enableEffectRowBlur. Nilai default argumen belum tentu cocok, lihat log "xos:" untuk signature aslinya.
-    val xosDepthClass: String get() = prop("debug.ioslock.xosdepth").ifEmpty { "GANTI.DENGAN.PACKAGE.DepthUtil" }
-    val xosTranClass: String get() = prop("debug.ioslock.xostran").ifEmpty { "GANTI.DENGAN.PACKAGE.TranView" }
+    // animasi pil muncul (grow in + bounce), lama dalam ms; 0 = tanpa animasi
+    val pillBounceMs: Long get() = prop("debug.ioslock.pillbounce").toLongOrNull() ?: 700L
+    // argumen untuk DepthUtil.enableEffectRowBlur(pil, ...): signature aslinya dicatat di log (grep xos), angka dan
+    // boolean yang diminta method itu diisi dari sini sampai nilainya pas
+    val pillXosInt: Int get() = prop("debug.ioslock.xosint").toIntOrNull() ?: pillBlurPx.toInt()
+    val pillXosFloat: Float get() = prop("debug.ioslock.xosfloat").toFloatOrNull() ?: 1f
     val pillXosBool: Boolean get() = prop("debug.ioslock.xosbool") != "0"
-    val pillXosInt: Int get() = prop("debug.ioslock.xosint").toIntOrNull() ?: 0
-    val pillXosFloat: Float get() = prop("debug.ioslock.xosfloat").toFloatOrNull() ?: 0f
     // 1 = catat background tiap bagian kartu notifikasi (untuk mencari tahu blur apa yang dipakai kartu)
     val cardBgDump: Boolean get() = prop("debug.ioslock.cardbgdump") != "0"
 
@@ -267,18 +264,16 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var wpBitmap: Bitmap? = null
     @Volatile private var wpLoading = false
     private var wpTries = 0
-
-    // ClassLoader System UI (untuk mencari class XOS lewat refleksi)
+    // classloader System UI (untuk mencari class XOS lewat refleksi)
     private var sysCl: ClassLoader? = null
-    private val xosDepthName: String get() = Config.xosDepthClass
-    private val xosTranName: String get() = Config.xosTranClass
-
-    // animasi muncul pil
+    private val xosDepthName = "com.transsion.systemui.blur.DepthUtil"
+    private val xosTranName = "com.transsion.hubsdk.api.view.TranView"
+    // animasi muncul pil: skala dan alpha (1 = tidak beranimasi)
+    private var pillBounceS = 1f
+    private var pillBounceA = 1f
+    private var pillBounceAnim: ValueAnimator? = null
     private var pillWasRest = false
     private var pillLastBounce = 0L
-    private var pillBounceAnim: ValueAnimator? = null
-    @Volatile private var pillBounceS = 1f
-    @Volatile private var pillBounceA = 1f
 
     // state gestur. progress: 0..1 = kartu muncul (keadaan 1 -> 2), 1..2 = naik (keadaan 2 -> 3)
     @Volatile private var progress = 0f
@@ -334,8 +329,8 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        sysCl = cl
         log("v0.39 loaded into SystemUI")
+        sysCl = cl
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -752,8 +747,8 @@ class MainHook : IXposedHookLoadPackage {
         // slider di tepi kanan (keadaan 3): seret untuk menggulir daftar
         if (a == MotionEvent.ACTION_DOWN) {
             val dd = dm.density
-            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 56f * dd &&
-                ev.rawY >= sliderTrackTop - 24f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 24f * dd
+            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 40f * dd &&
+                ev.rawY >= sliderTrackTop - 16f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * dd
             if (sliderDrag) {
                 animator?.cancel()
                 tracking = false
@@ -1392,7 +1387,6 @@ class MainHook : IXposedHookLoadPackage {
         (labelCount?.parent as? ViewGroup)?.removeView(labelCount)
         val ctx = root.context
 
-        // pil tidak dibuat di sini: dipasang oleh ensurePillHost tepat di belakang stack kartu
         val lc = makeLabel(ctx, Config.labelSp, true, Gravity.START)
         lc.text = "Notification Center"
         val ln = makeLabel(ctx, 14f, false, Gravity.CENTER_HORIZONTAL)
@@ -1410,12 +1404,17 @@ class MainHook : IXposedHookLoadPackage {
 
         // geometri pil dihitung selalu (juga saat label disembunyikan): animasi kartu memakainya sebagai titik asal
         pillGeo = pillRect(root, count)
+        // pil dipasang di induk stack, tepat di belakang stack (lihat ensurePillHost)
+        ensurePillHost(sv, root)
 
         // layar mati atau layar PIN: kedua teks dan pil disembunyikan
         if (labelsBlocked(root)) {
             hideLabels()
             return
         }
+
+        // pil baru terlihat diam (a ~ 0): mulai animasi muncul sebelum teks diberi alpha
+        tickPillBounce(a, pillAlpha(a, count))
 
         val dm = root.resources.displayMetrics
         val d = dm.density
@@ -1435,17 +1434,10 @@ class MainHook : IXposedHookLoadPackage {
         val a2 = if (count > 0) {
             if (Config.countAlways) 1f else (1f - a * 3f).coerceIn(0f, 1f)
         } else 0f
-
-        // animasi muncul pil: harus dipanggil SEBELUM teks diberi alpha, supaya teks tidak sempat
-        // terlihat satu frame penuh sebelum animasi mulai
-        tickPillBounce(a, pillAlpha(a, count))
-
-        ln.visibility = if (a2 * pillBounceA > 0.01f) View.VISIBLE else View.INVISIBLE
+        ln.visibility = if (a2 > 0.01f) View.VISIBLE else View.INVISIBLE
         ln.alpha = a2 * pillBounceA
-        if (abs(ln.scaleX - pillBounceS) > 0.0005f) {
-            ln.scaleX = pillBounceS
-            ln.scaleY = pillBounceS
-        }
+        ln.scaleX = pillBounceS
+        ln.scaleY = pillBounceS
         if (count > 0) {
             val t = countText(count)
             if (ln.text.toString() != t) ln.text = t
@@ -1453,7 +1445,6 @@ class MainHook : IXposedHookLoadPackage {
         val hn = if (ln.height > 0) ln.height.toFloat() else 24f * d
         ln.translationY = dm.heightPixels * Config.countFrac - rl[1] - hn / 2f
 
-        ensurePillHost(sv, root)
         updatePill(root, a, count)
     }
 
@@ -1804,7 +1795,7 @@ class MainHook : IXposedHookLoadPackage {
             2 -> intArrayOf(2, 1, 0)
             3 -> intArrayOf(0)
             4 -> intArrayOf(3, 0)
-            else -> intArrayOf(2, 3, 1, 0)
+            else -> intArrayOf(3, 2, 1, 0)
         }
         for (m in order) {
             when (m) {
