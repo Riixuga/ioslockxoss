@@ -190,8 +190,8 @@ object Config {
     val pillBounceMs: Long get() = prop("debug.ioslock.pillbounce").toLongOrNull() ?: 650L
     // blur XOS: nama class (bisa diganti lewat setprop tanpa build ulang) dan argumen angka/boolean untuk
     // DepthUtil.enableEffectRowBlur. Nilai default argumen belum tentu cocok, lihat log "xos:" untuk signature aslinya.
-    val xosDepthClass: String get() = prop("debug.ioslock.xosdepth").ifEmpty { "GANTI.DENGAN.PACKAGE.DepthUtil" }
-    val xosTranClass: String get() = prop("debug.ioslock.xostran").ifEmpty { "GANTI.DENGAN.PACKAGE.TranView" }
+    val xosDepthClass: String get() = prop("debug.ioslock.xosdepth").ifEmpty { "com.transsion.systemui.blur.DepthUtil" }
+    val xosTranClass: String get() = prop("debug.ioslock.xostran").ifEmpty { "com.transsion.hubsdk.api.view.TranView" }
     val pillXosBool: Boolean get() = prop("debug.ioslock.xosbool") != "0"
     val pillXosInt: Int get() = prop("debug.ioslock.xosint").toIntOrNull() ?: 0
     val pillXosFloat: Float get() = prop("debug.ioslock.xosfloat").toFloatOrNull() ?: 0f
@@ -1708,6 +1708,7 @@ class MainHook : IXposedHookLoadPackage {
     private fun buildXosArgs(types: Array<Class<*>>, pv: PillView): Array<Any?>? {
         var gotView = false
         val parent = pv.parent
+        val tranCls: Class<*>? = sysCl?.let { XposedHelpers.findClassIfExists(xosTranName, it) }
         val out = arrayOfNulls<Any?>(types.size)
         for (i in types.indices) {
             val p = types[i]
@@ -1719,6 +1720,7 @@ class MainHook : IXposedHookLoadPackage {
                 p == Double::class.javaPrimitiveType || p == Double::class.javaObjectType -> 0.0
                 p == String::class.java -> ""
                 p == Context::class.java -> pv.context
+                p == Class::class.java -> tranCls
                 p != Any::class.java && p.isAssignableFrom(pv.javaClass) -> {
                     if (gotView && parent != null && p.isAssignableFrom(parent.javaClass)) parent
                     else { gotView = true; pv }
