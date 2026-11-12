@@ -83,6 +83,11 @@ object Config {
     val gearForce: Boolean get() = prop("debug.ioslock.gearforce") != "0"
     val gearAt: Float get() = prop("debug.ioslock.gearat").toFloatOrNull() ?: 0.3f
 
+    // mode stabil kartu (anti flick): cache tinggi kartu, kartu yang sedang di-swipe tidak ikut berubah tinggi
+    // mendadak, dan kartu yang sempat hilang sebentar dari daftar tetap dipertahankan selama beberapa frame.
+    // Matikan untuk membandingkan perilaku lama: setprop debug.ioslock.stable 0
+    val stable: Boolean get() = prop("debug.ioslock.stable") != "0"
+
     // posisi bagian atas kartu teratas (0..1 tinggi layar): keadaan 2 (bawah jam tinggi) dan keadaan 3 (bawah jam biasa)
     val restFrac: Float get() = prop("debug.ioslock.restfrac").toFloatOrNull() ?: 0.575f
     val smallFrac: Float get() = prop("debug.ioslock.smallfrac").toFloatOrNull() ?: 0.345f
@@ -235,6 +240,11 @@ class MainHook : IXposedHookLoadPackage {
     // posisi asli tiap kartu: [dasarY, tulisY, dasarZ, tulisZ, tulisX]
     private val rowState = WeakHashMap<View, FloatArray>()
 
+    // mode stabil: tinggi terakhir yang valid per kartu, dan waktu terakhir kartu itu terlihat di daftar
+    private val hCache = WeakHashMap<View, Float>()
+    private val seenAt = WeakHashMap<View, Long>()
+    private var lastCardN = -1
+
     // pengaturan clip asli view induk stack: [clipChildren, clipToPadding]
     private val clipOrig = WeakHashMap<ViewGroup, BooleanArray>()
 
@@ -359,7 +369,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.42 loaded into SystemUI")
+        log("v0.43 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -658,10 +668,13 @@ class MainHook : IXposedHookLoadPackage {
             n.contains("Spacer"))
     }
 
-    // tinggi kartu yang benar-benar terlihat. Baris notifikasi punya tinggi view (getHeight) yang bisa
-    // jauh lebih besar dari tinggi yang digambar (getActualHeight), terutama notifikasi pesan/GIF.
+    // view yang masih hidup di layout (tidak GONE, punya ukuran). Dipakai juga untuk pencarian media.
+    private fun alive(c: View): Boolean = c.visibility != View.GONE && c.width > 0 && c.height > 0
+
+    // tinggi kartu mentah. Baris notifikasi punya tinggi view (getHeight) yang bisa jauh lebih besar dari
+    // tinggi yang digambar (getActualHeight), terutama notifikasi pesan/GIF.
     private val noActualH = ConcurrentHashMap.newKeySet<Class<*>>()
-    private fun visH(c: View): Float {
+    private fun rawH(c: View): Float {
         val cls = c.javaClass
         if (!noActualH.contains(cls)) {
             try {
@@ -672,19 +685,43 @@ class MainHook : IXposedHookLoadPackage {
         return c.height.toFloat()
     }
 
-    // kartu nyata: bukan view hantu (tidak terlihat atau terlalu pendek)
+    // tinggi kartu yang dipakai untuk tata letak. Mode stabil: kalau tinggi mendadak berubah jauh saat kartu
+    // sedang di-swipe atau sedang disembunyikan/ditampilkan sistem, pakai tinggi terakhir yang valid.
+    // Ini mencegah kartu "memanjang" satu frame.
+    private fun visH(c: View): Float {
+        val raw = rawH(c)
+        if (!Config.stable) return raw
+        val prev = hCache[c]
+        if (raw <= 0f) return prev ?: 0f
+        if (prev == null) { hCache[c] = raw; return raw }
+        val unstable = abs(c.translationX) > 0.5f || c.visibility != View.VISIBLE
+        if (unstable && abs(raw - prev) > 0.35f * prev) return prev
+        hCache[c] = raw
+        return raw
+    }
+
+    // kartu baru saja terlihat di daftar (dalam 250 ms terakhir): tetap dihitung walau sempat hilang sebentar
+    private fun recentlySeen(c: View): Boolean {
+        if (!Config.stable) return false
+        val t = seenAt[c] ?: return false
+        return SystemClock.uptimeMillis() - t < 250L
+    }
+
+    // kartu nyata: bukan view hantu (tidak terlihat atau terlalu pendek).
+    // Kartu yang sedang di-swipe atau baru saja terlihat tidak dibuang walau alpha-nya sedang berubah.
     private fun isReal(c: View): Boolean {
         if (!isCard(c)) return false
         val dp = c.resources.displayMetrics.density
-        if (visH(c) < 56f * dp) return false
-        return c.alpha > 0.05f
+        val grace = recentlySeen(c)
+        val swiped = abs(c.translationX) > 0.5f
+        if (visH(c) < 56f * dp && !grace) return false
+        return c.alpha > 0.05f || swiped || grace
     }
 
     // kartu yang ikut dihitung dan ikut ditata. INVISIBLE sengaja ikut: kartu di luar batas jumlah
     // notifikasi lockscreen disembunyikan sistem dengan INVISIBLE (bukan GONE), dan harus dimunculkan lagi
     // di applyStack. Hanya GONE yang berarti kartu itu benar-benar dibuang sistem.
-    private fun isLaidOut(c: View): Boolean =
-        c.visibility != View.GONE && c.width > 0 && c.height > 0 && isReal(c)
+    private fun isLaidOut(c: View): Boolean = alive(c) && isReal(c)
 
     // jumlah notifikasi: semua kartu (termasuk kartu senter); grup dihitung per anak.
     // skip = kartu media player yang dipisah dari notification center (tidak ikut dihitung)
@@ -706,18 +743,26 @@ class MainHook : IXposedHookLoadPackage {
         return n
     }
 
-    // Kumpulkan kartu yang ikut ditata, urut dari atas. Kartu yang disembunyikan sistem (INVISIBLE) ikut
-    // diambil dan dimunculkan lagi. Posisi aslinya tidak bisa dipercaya, jadi dipasang di bawah kartu
-    // terakhir yang terlihat, sesuai urutan anak di stack.
+    // Kumpulkan kartu yang ikut ditata, urut dari atas.
+    // Kartu INVISIBLE (disembunyikan sistem karena batas jumlah) hanya dimunculkan lagi kalau fitur unlimit
+    // aktif, dan hanya kalau kartu itu sedang tidak di-swipe. Sekali dimunculkan, kartu tidak dibolak-balik
+    // lagi tiap frame (penyebab flick berulang).
     // skip = kartu media player yang dipisah dari notification center (tidak diambil, tidak dimunculkan)
     private fun collectCards(g: ViewGroup, skip: View? = null): ArrayList<Pair<View, Float>> {
         val shown = ArrayList<Pair<View, Float>>()
         val hidden = ArrayList<View>()
+        val now = SystemClock.uptimeMillis()
+        val unlimit = shouldUnlimit()
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
             if (c === skip) continue
             if (!isLaidOut(c)) continue
-            if (c.visibility == View.VISIBLE) shown.add(Pair(c, baseOfY(c))) else hidden.add(c)
+            if (c.visibility == View.VISIBLE) {
+                shown.add(Pair(c, baseOfY(c)))
+                if (Config.stable) seenAt[c] = now
+            } else if (unlimit && abs(c.translationX) < 0.5f) {
+                hidden.add(c)
+            }
         }
         shown.sortBy { it.second }
         if (hidden.isNotEmpty()) {
@@ -777,6 +822,7 @@ class MainHook : IXposedHookLoadPackage {
             sb.append(" #").append(i).append(' ').append(c.javaClass.simpleName.take(18))
                 .append(when (c.visibility) { View.VISIBLE -> " V "; View.INVISIBLE -> " I "; else -> " G " })
                 .append(c.width).append('x').append(c.height).append('/').append(visH(c).toInt())
+                .append(" tx=").append(c.translationX.toInt())
                 .append(if (isLaidOut(c)) " ok" else " skip")
         }
         return sb.toString()
@@ -895,7 +941,6 @@ class MainHook : IXposedHookLoadPackage {
         if (a == MotionEvent.ACTION_MOVE) velocityTracker?.addMovement(ev)
 
         // slide horizontal di pil / di atas pil: halaman jumlah <-> mini media player.
-        // Kalau hanya ada media player (tanpa notifikasi lain), tidak ada halaman jumlah untuk dituju.
         // Kalau tidak ada media player, tidak ada halaman media untuk dituju.
         if (pillTouch && !pillTaken && a == MotionEvent.ACTION_MOVE) {
             val dx = ev.rawX - downX
@@ -1457,7 +1502,7 @@ class MainHook : IXposedHookLoadPackage {
             if (mediaRow != null) {
                 for (i in 0 until g.childCount) {
                     val c = g.getChildAt(i)
-                    if (c !== mediaRow && isLaidOut(c)) c.visibility = View.INVISIBLE
+                    if (c !== mediaRow && alive(c)) c.visibility = View.INVISIBLE
                 }
                 mediaRow.visibility = View.VISIBLE
                 cards = ArrayList(cards.filter { it.first === mediaRow })
@@ -1467,11 +1512,17 @@ class MainHook : IXposedHookLoadPackage {
                 soloCardRef = null
             }
         } else if (split && mediaRow != null) {
-            // media player dipisah dari notification center: kartunya disembunyikan (dipulihkan di reset)
+            // media player dipisah dari notification center: kartunya disembunyikan SETIAP frame (termasuk saat
+            // notifikasi baru datang dan sistem menampilkan ulang baris), dipulihkan di reset
             if (mediaRow.visibility != View.INVISIBLE) mediaRow.visibility = View.INVISIBLE
             hiddenMediaRef = WeakReference(mediaRow)
         }
         val n = cards.size
+
+        if (Config.stable && n != lastCardN) {
+            logT("member", "n=$n was=$lastCardN", discrete = true)
+            lastCardN = n
+        }
 
         val restTop = dm.heightPixels * Config.restFrac
         // garis bawah keadaan 2 (sama dengan batas bawah keadaan 3 secara default)
@@ -1910,11 +1961,13 @@ class MainHook : IXposedHookLoadPackage {
         return null
     }
 
+    // Cari kartu media. Pencarian memakai alive() (bukan isLaidOut) supaya kartu media tetap ketemu walaupun
+    // sedang disembunyikan sistem atau sedang dianimasikan, sehingga tidak muncul lagi di daftar.
     private fun refreshMedia(g: ViewGroup): View? {
         // cegah pindai yang memunculkan lagi kartu lain selama mode media saja
         if (soloMedia) {
             val s = soloCardRef?.get() as? View
-            if (s != null && isLaidOut(s) && isMediaCard(s)) {
+            if (s != null && alive(s) && isMediaCard(s)) {
                 mediaRowRef = WeakReference(s)
                 mediaAvailable = true
                 return s
@@ -1922,7 +1975,7 @@ class MainHook : IXposedHookLoadPackage {
         }
         val now = SystemClock.uptimeMillis()
         val cached = mediaRowRef?.get() as? View
-        if (cached != null && isLaidOut(cached) && isMediaCard(cached) && now - mediaScanAt < 300L) {
+        if (cached != null && alive(cached) && isMediaCard(cached) && now - mediaScanAt < 300L) {
             mediaAvailable = true
             return cached
         }
@@ -1932,9 +1985,9 @@ class MainHook : IXposedHookLoadPackage {
         // pindai anak stack langsung (tanpa collectCards, supaya kartu yang disembunyikan tidak dimunculkan lagi)
         for (i in 0 until g.childCount) {
             val c = g.getChildAt(i)
-            if (isLaidOut(c) && isMediaCard(c)) { row = c; break }
+            if (alive(c) && isMediaCard(c)) { row = c; break }
         }
-        if (row == null && old != null && isLaidOut(old) && isMediaCard(old)) row = old
+        if (row == null && old != null && alive(old) && isMediaCard(old)) row = old
         if (row == null) {
             if (mediaAvailable) log("pil: media player hilang")
             mediaAvailable = false
@@ -1962,7 +2015,7 @@ class MainHook : IXposedHookLoadPackage {
     // byTap = false: dibuka lewat swipe naik, kemajuannya mengikuti jari (soloOpenT langsung 1).
     private fun beginSoloMedia(byTap: Boolean): Boolean {
         val row = mediaRowRef?.get() as? View
-        if (row == null || !isMediaCard(row) || !isLaidOut(row)) {
+        if (row == null || !isMediaCard(row) || !alive(row)) {
             log("pil: kartu media belum siap")
             return false
         }
