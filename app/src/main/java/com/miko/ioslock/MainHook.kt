@@ -97,7 +97,7 @@ object Config {
     val openStagger: Float get() = prop("debug.ioslock.openstagger").toFloatOrNull() ?: 0.35f
     // skala kartu di titik asal (makin kecil = makin mengecil menjadi satu titik), lalu membesar ke ukuran keadaan 2
     val openScale: Float get() = prop("debug.ioslock.openscale").toFloatOrNull() ?: 0.08f
-    // kurva animasi buka/tutup dan pindah keadaan 2 <-> 3 (setelah jari dilepas): cubic-bezier(x1, y1, x2, y2).
+    // kurva animasi pindah keadaan 2 <-> 3 (setelah jari dilepas): cubic-bezier(x1, y1, x2, y2).
     // Default (0, 0.81, 0.55, 1): cepat di awal lalu melambat halus. Lama animasi = snapBaseMs + snapPerMs * jarak (0..1).
     val easeX1: Float get() = prop("debug.ioslock.easex1").toFloatOrNull() ?: 0f
     val easeY1: Float get() = prop("debug.ioslock.easey1").toFloatOrNull() ?: 0.81f
@@ -105,6 +105,32 @@ object Config {
     val easeY2: Float get() = prop("debug.ioslock.easey2").toFloatOrNull() ?: 1f
     val snapBaseMs: Float get() = prop("debug.ioslock.snapbase").toFloatOrNull() ?: 260f
     val snapPerMs: Float get() = prop("debug.ioslock.snapper").toFloatOrNull() ?: 280f
+    // animasi buka/tutup tumpukan setelah jari dilepas (semua animasi yang melibatkan keadaan 1, termasuk langsung ke
+    // keadaan 3): lebih pelan dan lembut dari pindah 2 <-> 3. Lama = openBaseMs + openPerMs * jarak (0..2).
+    // Kurva default (0.22, 0.62, 0.28, 1): awal tidak sekencang kurva lama, akhirnya melambat halus.
+    // Mau lebih pelan lagi: naikkan openbase / openper.
+    val openBaseMs: Float get() = prop("debug.ioslock.openbase").toFloatOrNull() ?: 400f
+    val openPerMs: Float get() = prop("debug.ioslock.openper").toFloatOrNull() ?: 260f
+    val openEaseX1: Float get() = prop("debug.ioslock.openeasex1").toFloatOrNull() ?: 0.22f
+    val openEaseY1: Float get() = prop("debug.ioslock.openeasey1").toFloatOrNull() ?: 0.62f
+    val openEaseX2: Float get() = prop("debug.ioslock.openeasex2").toFloatOrNull() ?: 0.28f
+    val openEaseY2: Float get() = prop("debug.ioslock.openeasey2").toFloatOrNull() ?: 1f
+    // ambang saat jari dilepas (dibaca dari progres 0..2, ditambah proyeksi kecepatan jari sejauh lookMs):
+    // openAt   = geser naik sekecil ini (0..1 dari jarak rangeDp) sudah cukup untuk membuka keadaan 2
+    // closeAt  = turun di bawah ini menutup tumpukan lagi (keadaan 1)
+    // directAt = kalau gesekan DIMULAI dari keadaan 1 dan sudah sejauh ini (1 = jarak yang dulu membuka keadaan 2),
+    //            langsung ke keadaan 3 tanpa berhenti di keadaan 2
+    // state3At = batas keadaan 2 -> 3 untuk gesekan yang dimulai dari keadaan 2 (naik sedikit lebih mudah, turun sedikit lebih sulit)
+    val openAt: Float get() = prop("debug.ioslock.openat").toFloatOrNull() ?: 0.12f
+    val closeAt: Float get() = prop("debug.ioslock.closeat").toFloatOrNull() ?: 0.35f
+    val directAt: Float get() = prop("debug.ioslock.directat").toFloatOrNull() ?: 0.95f
+    val state3At: Float get() = prop("debug.ioslock.state3at").toFloatOrNull() ?: 1.5f
+    val lookMs: Float get() = prop("debug.ioslock.lookms").toFloatOrNull() ?: 80f
+    // gesekan naik yang kuat (dp/detik) dan sisa lajunya melewati keadaan 3 sejauh carryMinDp: kartu langsung
+    // bergulir (momentum menyambung dari keadaan 1/2 ke gulir daftar). Turun kuat di daftar yang ter-scroll
+    // juga menyambung balik: gulir ke atas lalu terus menutup keadaan 3 kembali ke keadaan 2.
+    val carryVelDp: Float get() = prop("debug.ioslock.carryveldp").toFloatOrNull() ?: 1200f
+    val carryMinDp: Float get() = prop("debug.ioslock.carrymindp").toFloatOrNull() ?: 80f
     // bentuk gerak tiap kartu terhadap progres: 0 = linear (jadi mengikuti kurva di atas), 1 = smoothstep penuh
     val cardSmooth: Float get() = prop("debug.ioslock.cardsmooth").toFloatOrNull() ?: 0f
     // momentum gulir keadaan 3 (seperti bearing): setelah jari dilepas daftar terus bergulir dan melambat halus.
@@ -146,6 +172,9 @@ object Config {
     val sliderHideMs: Long get() = prop("debug.ioslock.sliderhidems").toLongOrNull() ?: 900L
     val sliderFadeInMs: Long get() = prop("debug.ioslock.sliderfadein").toLongOrNull() ?: 150L
     val sliderFadeOutMs: Long get() = prop("debug.ioslock.sliderfadeout").toLongOrNull() ?: 350L
+    // slider: daftar mengikuti jari dengan sedikit "ekor" supaya gerakannya mulus, bukan loncat per sentuhan.
+    // Konstanta waktu (ms): makin besar = makin licin tapi makin tertinggal dari jari. 0 = menempel langsung ke jari.
+    val sliderFollowMs: Float get() = prop("debug.ioslock.sliderfollow").toFloatOrNull() ?: 45f
     // keadaan 3: kartu yang ter-scroll melewati garis atas (smallFrac) dipotong dengan fade setebal topFadeDp
     // (0 = potong datar). Wallpaper digelapkan sebesar dimAlpha (0..1) saat masuk keadaan 3 (0 = mati).
     val topFadeDp: Float get() = prop("debug.ioslock.topfade").toFloatOrNull() ?: 44f
@@ -243,10 +272,19 @@ class MainHook : IXposedHookLoadPackage {
     private var sliderTrackTop = 0f
     private var sliderTrackH = 0f
     private var sliderThumbH = 0f
+    private var sliderThumbTopAbs = 0f   // tepi atas thumb di layar (px), dipakai untuk "pegangan" saat disentuh
     private var sliderOn = false
     @Volatile private var sliderPoke = false
     private var lastScrollSeen = 0f
     private val sliderHideRunnable = Runnable { fadeSlider(false) }
+
+    // seret slider: jari menentukan sliderTarget, daftar (scrollY) mengejarnya dengan halus tiap frame.
+    // sliderVel = kecepatan gulir daftar yang sebenarnya (px/s), dipakai sebagai kecepatan awal momentum saat dilepas.
+    private var sliderGrab = 0f
+    private var sliderTarget = 0f
+    private var sliderVel = 0f
+    private var sliderLastT = 0L
+    private var sliderFollow: ValueAnimator? = null
 
     // fade atas daftar (mask lewat hook dispatchDraw milik view stack)
     @Volatile private var maskOn = false
@@ -276,7 +314,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.37 loaded into SystemUI")
+        log("v0.38 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -659,6 +697,16 @@ class MainHook : IXposedHookLoadPackage {
         return if (d <= l1) d / l1 else 1f + (d - l1) / l2
     }
 
+    // Sumbu gesek gabungan (px): 0..(rangeDp + stage2Dp) = kartu muncul lalu naik ke keadaan 3, sesudahnya = gulir daftar.
+    // Gesekan jari, momentum, dan animasi semuanya bergerak di sumbu yang sama, jadi sambungan keadaan 2 <-> 3 <-> gulir mulus.
+    private fun distPx(d: Float): Float = progressToDist(progress) * d + scrollY
+
+    private fun setDist(distPx: Float, d: Float) {
+        val l12 = (Config.rangeDp + Config.stage2Dp) * d
+        progress = distToProgress(min(distPx, l12).coerceAtLeast(0f) / d).coerceIn(0f, 2f)
+        scrollY = (distPx - l12).coerceIn(0f, scrollMaxPx)
+    }
+
     // ---- sentuhan ----
 
     private fun handleTouch(p: XC_MethodHook.MethodHookParam) {
@@ -668,7 +716,7 @@ class MainHook : IXposedHookLoadPackage {
         val dm = root.resources.displayMetrics
         val a = ev.actionMasked
 
-        // kecepatan jari, untuk momentum gulir di keadaan 3
+        // kecepatan jari, untuk momentum setelah dilepas
         if (a == MotionEvent.ACTION_DOWN) {
             velocity?.recycle()
             velocity = VelocityTracker.obtain()
@@ -678,12 +726,20 @@ class MainHook : IXposedHookLoadPackage {
         // slider di tepi kanan (keadaan 3): seret untuk menggulir daftar
         if (a == MotionEvent.ACTION_DOWN) {
             val dd = dm.density
-            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 40f * dd &&
+            val sl = slider
+            // boleh dipegang selama masih terlihat (termasuk saat sedang memudar)
+            val visible = sl != null && sl.visibility == View.VISIBLE && sl.alpha > 0.05f
+            sliderDrag = visible && ev.rawX >= dm.widthPixels - 40f * dd &&
                 ev.rawY >= sliderTrackTop - 16f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * dd
             if (sliderDrag) {
                 stopMotion()
                 tracking = false
                 taken = false
+                sliderVel = 0f
+                // kalau yang disentuh adalah thumb, jari memegang titik itu (thumb tidak melompat ke tengah jari);
+                // kalau yang disentuh trek di luar thumb, daftar meluncur halus ke titik itu
+                val mid = sliderThumbTopAbs + sliderThumbH / 2f
+                sliderGrab = if (abs(ev.rawY - mid) <= sliderThumbH / 2f + 14f * dd) ev.rawY - mid else 0f
             }
         }
         if (sliderDrag) {
@@ -691,10 +747,16 @@ class MainHook : IXposedHookLoadPackage {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> dragSlider(ev.rawY)
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     sliderDrag = false
+                    sliderFollow?.cancel()
+                    recycleVelocity()
                     if (a == MotionEvent.ACTION_UP) {
-                        // thumb bergerak turun = daftar bergulir bertambah; lanjut bergulir setelah dilepas
-                        val range = (sliderTrackH - sliderThumbH).coerceAtLeast(1f)
-                        flingFromTracker(root.context, scrollMaxPx / range)
+                        // daftar terus berjalan dengan kecepatan yang tadi dipakai (sliderVel), lalu melambat halus
+                        val minV = ViewConfiguration.get(root.context).scaledMinimumFlingVelocity.toFloat()
+                        val v = sliderVel * Config.flingGain
+                        if (abs(v) >= minV && scrollMaxPx > 2f) {
+                            val l12 = (Config.rangeDp + Config.stage2Dp) * dm.density
+                            startMomentum(dm.density, v, l12, l12 + scrollMaxPx)
+                        }
                     }
                 }
             }
@@ -759,69 +821,137 @@ class MainHook : IXposedHookLoadPackage {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     taken = false
-                    // menempel ke keadaan terdekat: 1 (teks), 2 (kartu muncul), 3 (jam kecil)
-                    val target = if (progress < 0.35f) 0f else round(progress).coerceIn(1f, 2f)
-                    val diff = abs(target - progress)
-                    if (diff > 0.005f) {
-                        snap(target)
-                    } else {
-                        if (diff > 0f) { progress = target; applyState() }
-                        // di keadaan 3: daftar terus bergulir (momentum) setelah jari dilepas
-                        if (a == MotionEvent.ACTION_UP && target >= 1.99f && scrollMaxPx > 2f) {
-                            flingFromTracker(root.context, -1f)
-                        }
-                    }
+                    // kecepatan jari (px/s, positif = ke atas); dibatalkan = tanpa kecepatan
+                    val vUp = if (a == MotionEvent.ACTION_UP) -takeVelocityY(root.context) else { recycleVelocity(); 0f }
+                    onRelease(root.context, vUp, dm.density)
                 }
             }
             p.result = true
         }
     }
 
-    private fun snap(target: Float) {
-        stopMotion()
-        val an = ValueAnimator.ofFloat(progress, target)
-        val dist = abs(target - progress)
-        // lama = dasar + sebanding jarak; kurva = cubic-bezier dari Config (default: cepat di awal, melambat halus)
-        an.duration = (Config.snapBaseMs + Config.snapPerMs * dist).toLong().coerceAtLeast(120L)
-        an.interpolator = PathInterpolator(
-            Config.easeX1.coerceIn(0f, 1f), Config.easeY1,
-            Config.easeX2.coerceIn(0f, 1f), Config.easeY2
-        )
-        an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
-        animator = an
-        an.start()
-    }
+    // ---- jari dilepas ----
 
-    // hentikan semua gerak otomatis (snap dan momentum gulir)
-    private fun stopMotion() {
-        animator?.cancel()
-        flingAnim?.cancel()
-    }
-
-    // Ambil kecepatan jari dari tracker lalu mulai momentum. factor mengubah kecepatan jari (px/s, positif = ke bawah)
-    // menjadi kecepatan gulir daftar: -1 untuk swipe di daftar (jari naik = daftar bergulir turun),
-    // scrollMaxPx / panjang_trek untuk menyeret slider.
-    private fun flingFromTracker(ctx: Context, factor: Float) {
-        val vt = velocity ?: return
+    private fun takeVelocityY(ctx: Context): Float {
+        val vt = velocity ?: return 0f
         velocity = null
-        try {
+        return try {
             val vc = ViewConfiguration.get(ctx)
             vt.computeCurrentVelocity(1000, vc.scaledMaximumFlingVelocity.toFloat())
-            val v = vt.yVelocity * factor * Config.flingGain
-            startFling(v, vc.scaledMinimumFlingVelocity.toFloat())
+            vt.yVelocity
+        } catch (t: Throwable) {
+            0f
         } finally {
             vt.recycle()
         }
     }
 
-    // Momentum gulir keadaan 3 (seperti bearing): kecepatan meluruh eksponensial v(t) = v0 * e^(-t/tau),
-    // jadi daftar terus bergulir lalu melambat halus, tidak berhenti mendadak saat jari dilepas.
-    // v0 dalam px/s (positif = gulir ke bawah daftar). Berhenti di ujung daftar atau saat disentuh lagi.
-    private fun startFling(v0: Float, minVel: Float) {
+    private fun recycleVelocity() {
+        velocity?.recycle()
+        velocity = null
+    }
+
+    // Pilih keadaan tujuan (0 = teks, 1 = keadaan 2, 2 = keadaan 3) dari progres yang sudah diproyeksikan (pp).
+    // up = jari bergerak naik. fromBelow = gesekan dimulai dari keadaan 1.
+    // - naik dari keadaan 1: progres >= openAt sudah cukup membuka keadaan 2; kalau sudah >= directAt (jarak yang dulu
+    //   dipakai untuk membuka keadaan 2) langsung ke keadaan 3
+    // - turun: di bawah closeAt tumpukan menutup
+    // - di antara keadaan 2 dan 3: batas state3At, bergeser sedikit mengikuti arah supaya terasa searah dengan jari
+    private fun pickTarget(pp: Float, up: Boolean, fromBelow: Boolean): Float {
+        val p = pp.coerceIn(0f, 2f)
+        if (fromBelow && up && p >= Config.directAt) return 2f
+        if (p < 1f) {
+            return if (up) {
+                if (p >= Config.openAt) 1f else 0f
+            } else {
+                if (p >= Config.closeAt) 1f else 0f
+            }
+        }
+        val thr = Config.state3At + (if (up) -0.15f else 0.15f)
+        return if (p >= thr) 2f else 1f
+    }
+
+    // Jari dilepas di swipe keadaan 1/2/3. vUp = kecepatan jari (px/s, positif = naik).
+    // 1) di keadaan 3 dan daftar bisa bergulir: momentum daftar; swipe turun yang kuat terus menyambung balik ke keadaan 2
+    // 2) swipe naik yang kuat dari keadaan 1/2 dan sisa lajunya melewati keadaan 3: langsung bergulir
+    // 3) selain itu: pilih keadaan dari posisi + proyeksi kecepatan, lalu animasi (snap)
+    private fun onRelease(ctx: Context, vUp: Float, d: Float) {
+        val minV = ViewConfiguration.get(ctx).scaledMinimumFlingVelocity.toFloat()
+        val fling = abs(vUp) >= minV
+        val l1 = Config.rangeDp * d
+        val l12 = l1 + Config.stage2Dp * d
+        val dmax = l12 + scrollMaxPx
+        val dist0 = distPx(d)
+        val tauS = Config.flingTauMs.coerceIn(80f, 4000f) / 1000f
+
+        if (progress >= 1.99f && fling && (scrollY > 0.5f || (vUp > 0f && scrollMaxPx > 2f))) {
+            startMomentum(d, vUp * Config.flingGain, l1, dmax)
+            return
+        }
+
+        if (progress < 1.99f && vUp >= Config.carryVelDp * d && scrollMaxPx > 2f) {
+            val leftover = dist0 + vUp * tauS - l12
+            if (leftover >= Config.carryMinDp * d) {
+                startMomentum(d, vUp * Config.flingGain, if (progress >= 1f) l1 else 0f, dmax)
+                return
+            }
+        }
+
+        val look = if (fling) vUp * Config.lookMs / 1000f else 0f
+        val pp = distToProgress(max(0f, dist0 + look) / d)
+        val up = if (fling) vUp > 0f else progress >= baseProgress
+        val target = pickTarget(pp, up, baseProgress < 1f)
+        if (abs(target - progress) > 0.005f) {
+            snap(target)
+        } else if (target != progress) {
+            progress = target
+            applyState()
+        }
+    }
+
+    private fun snap(target: Float) {
+        stopMotion()
+        val from = progress
+        val an = ValueAnimator.ofFloat(from, target)
+        val dist = abs(target - from)
+        if (from < 1f || target < 1f) {
+            // buka/tutup tumpukan (keadaan 1 <-> 2, atau langsung ke 3): lebih pelan, kurva lembut, akhirnya melambat halus
+            an.duration = (Config.openBaseMs + Config.openPerMs * dist).toLong().coerceAtLeast(200L)
+            an.interpolator = PathInterpolator(
+                Config.openEaseX1.coerceIn(0f, 1f), Config.openEaseY1,
+                Config.openEaseX2.coerceIn(0f, 1f), Config.openEaseY2
+            )
+        } else {
+            // pindah keadaan 2 <-> 3: lama = dasar + sebanding jarak; kurva = cubic-bezier dari Config
+            an.duration = (Config.snapBaseMs + Config.snapPerMs * dist).toLong().coerceAtLeast(120L)
+            an.interpolator = PathInterpolator(
+                Config.easeX1.coerceIn(0f, 1f), Config.easeY1,
+                Config.easeX2.coerceIn(0f, 1f), Config.easeY2
+            )
+        }
+        an.addUpdateListener { progress = it.animatedValue as Float; applyState() }
+        animator = an
+        an.start()
+    }
+
+    // hentikan semua gerak otomatis (snap, momentum, dan pengejar slider)
+    private fun stopMotion() {
+        animator?.cancel()
         flingAnim?.cancel()
-        if (abs(v0) < minVel || scrollMaxPx < 2f) return
+        sliderFollow?.cancel()
+    }
+
+    // Momentum di sumbu gesek gabungan (seperti bearing): kecepatan meluruh eksponensial v(t) = v0 * e^(-t/tau),
+    // jadi terus berjalan lalu melambat halus, tidak berhenti mendadak saat jari dilepas.
+    // v0 dalam px/s (positif = naik / gulir ke bawah daftar). Posisi dijepit di [lo, hi] (px di sumbu gabungan):
+    // lo = keadaan 2 untuk gesekan yang boleh menyambung balik ke keadaan 3 -> 2, atau awal keadaan 3 untuk slider (murni gulir);
+    // hi = ujung daftar. Kalau berhenti di antara dua keadaan, otomatis menempel ke keadaan terdekat (settleAfterMomentum).
+    private fun startMomentum(d: Float, v0: Float, lo: Float, hi: Float) {
+        flingAnim?.cancel()
+        if (abs(v0) < 12f || hi <= lo) return
         val tau = Config.flingTauMs.coerceIn(80f, 4000f)
-        val s0 = scrollY
+        val tauS = tau / 1000f
+        val d0 = distPx(d)
         // berhenti kalau kecepatan sudah di bawah 12 px/s
         val dur = (tau * ln(abs(v0) / 12f)).coerceIn(60f, 6000f)
         val an = ValueAnimator.ofFloat(0f, dur)
@@ -829,15 +959,25 @@ class MainHook : IXposedHookLoadPackage {
         an.interpolator = LinearInterpolator()
         an.addUpdateListener { u ->
             val t = u.animatedValue as Float
-            val ns = s0 + v0 * (tau / 1000f) * (1f - exp(-t / tau))
-            val hit = ns <= 0f || ns >= scrollMaxPx
-            scrollY = ns.coerceIn(0f, scrollMaxPx)
+            val raw = d0 + v0 * tauS * (1f - exp(-t / tau))
+            val hit = raw <= lo || raw >= hi
+            setDist(raw.coerceIn(lo, hi), d)
             sliderPoke = true
             applyState()
-            if (hit) u.cancel()
+            if (hit || u.animatedFraction >= 1f) {
+                u.cancel()
+                settleAfterMomentum(v0)
+            }
         }
         flingAnim = an
         an.start()
+    }
+
+    // momentum selesai di tengah perpindahan keadaan: tempel ke keadaan terdekat searah gerak terakhir
+    private fun settleAfterMomentum(v0: Float) {
+        val p = progress
+        val near = p < 0.005f || abs(p - 1f) < 0.005f || p > 1.995f
+        if (!near) snap(pickTarget(p, v0 > 0f, false))
     }
 
     // ---- penerapan efek ----
@@ -1506,6 +1646,7 @@ class MainHook : IXposedHookLoadPackage {
         sliderTrackTop = trackTop
         sliderTrackH = trackH
         sliderThumbH = thumbH
+        sliderThumbTopAbs = trackTop + thumbTop
 
         if (sliderPoke || abs(scrollY - lastScrollSeen) > 0.5f) {
             sliderPoke = false
@@ -1514,13 +1655,46 @@ class MainHook : IXposedHookLoadPackage {
         lastScrollSeen = scrollY
     }
 
-    // seret slider: posisi jari menentukan posisi gulir daftar
+    // seret slider: posisi jari (dikurangi "pegangan") menentukan TARGET gulir; daftar sendiri mengejar target itu
+    // dengan halus di startSliderFollow, jadi tidak loncat mengikuti tiap sampel sentuhan.
     private fun dragSlider(y: Float) {
         val range = (sliderTrackH - sliderThumbH).coerceAtLeast(1f)
-        val frac = ((y - sliderTrackTop - sliderThumbH / 2f) / range).coerceIn(0f, 1f)
-        scrollY = frac * scrollMaxPx
+        val frac = ((y - sliderGrab - sliderTrackTop - sliderThumbH / 2f) / range).coerceIn(0f, 1f)
+        sliderTarget = frac * scrollMaxPx
         sliderPoke = true
-        applyState()
+        if (sliderFollow?.isRunning != true) startSliderFollow()
+    }
+
+    // Pengejar target slider: tiap frame scrollY mendekati sliderTarget secara eksponensial (konstanta waktu
+    // sliderFollowMs). Sekaligus mengukur kecepatan gulir yang sebenarnya (sliderVel, dirata-rata) untuk momentum
+    // saat jari dilepas, jadi daftar melanjutkan kecepatan yang sama dan tidak berhenti mendadak.
+    private fun startSliderFollow() {
+        sliderLastT = SystemClock.uptimeMillis()
+        val an = ValueAnimator.ofFloat(0f, 1f)
+        an.duration = 1000L
+        an.repeatCount = ValueAnimator.INFINITE
+        an.interpolator = LinearInterpolator()
+        an.addUpdateListener { u ->
+            if (!sliderDrag) {
+                u.cancel()
+                return@addUpdateListener
+            }
+            val now = SystemClock.uptimeMillis()
+            val dt = (now - sliderLastT).coerceIn(1L, 50L).toFloat()
+            sliderLastT = now
+            val tau = Config.sliderFollowMs
+            val k = if (tau <= 1f) 1f else 1f - exp(-dt / tau)
+            val old = scrollY
+            val tgt = sliderTarget.coerceIn(0f, scrollMaxPx)
+            val ns = (old + (tgt - old) * k).coerceIn(0f, scrollMaxPx)
+            scrollY = ns
+            val inst = (ns - old) / dt * 1000f
+            sliderVel = sliderVel * 0.55f + inst * 0.45f
+            sliderPoke = true
+            applyState()
+        }
+        sliderFollow = an
+        an.start()
     }
 
     // ---- fade atas daftar (mask) ----
