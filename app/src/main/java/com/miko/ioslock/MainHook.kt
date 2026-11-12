@@ -752,8 +752,8 @@ class MainHook : IXposedHookLoadPackage {
         // slider di tepi kanan (keadaan 3): seret untuk menggulir daftar
         if (a == MotionEvent.ACTION_DOWN) {
             val dd = dm.density
-            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 40f * dd &&
-                ev.rawY >= sliderTrackTop - 16f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 16f * dd
+            sliderDrag = sliderOn && ev.rawX >= dm.widthPixels - 56f * dd &&
+                ev.rawY >= sliderTrackTop - 24f * dd && ev.rawY <= sliderTrackTop + sliderTrackH + 24f * dd
             if (sliderDrag) {
                 animator?.cancel()
                 tracking = false
@@ -1804,7 +1804,7 @@ class MainHook : IXposedHookLoadPackage {
             2 -> intArrayOf(2, 1, 0)
             3 -> intArrayOf(0)
             4 -> intArrayOf(3, 0)
-            else -> intArrayOf(3, 2, 1, 0)
+            else -> intArrayOf(2, 3, 1, 0)
         }
         for (m in order) {
             when (m) {
