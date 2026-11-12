@@ -1030,28 +1030,22 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     // Tempatkan kartu S (semua kartu di belakang kartu penuh / pita terakhir) sebagai tumpukan tipis di bawah baseBottom.
-    // Tepi bawah kartu TERAKHIR dipaskan persis di limit, yaitu garis bawah yang sama dengan keadaan 3,
-    // berapa pun tinggi kartu depannya. Kartu S di antaranya menumpuk dengan kurva yang sama seperti dock keadaan 3.
-    // Kalau ruangnya kurang dari minDock, tumpukan tetap setebal minDock supaya masih terlihat.
+    // Ruang dock dibagi rata: tiap kartu hanya terlihat sebagai pita tipis yang sama tebal di belakang kartu penuh,
+    // seperti di foto 3. Kartu paling bawah berakhir tepat di limit (garis merah), berapa pun jumlah kartunya,
+    // sehingga tidak ada celah wallpaper di antara kartu penuh dan tumpukan.
     private fun placeDock(
         out: StateLayout, from: Int, baseBottom: Float, baseScale: Float, hs: FloatArray, gap: Float,
         limit: Float, minDock: Float, ref: Float, dScale: Float
     ) {
         val n = hs.size
         if (from >= n) return
-        val off = FloatArray(n)
-        var o = 0f
-        for (i in from until n) {
-            o += hs[i] + gap
-            off[i] = o
-        }
+        val cnt = n - from
         val dock = max(limit - baseBottom, minDock)
-        val c = dock * 1.3f
-        val lastRaw = 1f - exp(-off[n - 1] / c)
+        val peek = dock / cnt
         for (i in from until n) {
-            val raw = 1f - exp(-off[i] / c)
-            out.bottom[i] = baseBottom + dock * (if (lastRaw > 0.001f) raw / lastRaw else raw)
-            out.scale[i] = baseScale * (1f - dScale * min(1f, off[i] / ref))
+            val j = i - from + 1
+            out.bottom[i] = baseBottom + peek * j
+            out.scale[i] = baseScale * (1f - dScale * (j.toFloat() / cnt))
             out.kind[i] = 1
         }
     }
