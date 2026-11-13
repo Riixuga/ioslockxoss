@@ -255,6 +255,9 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var stackLocked = false
     // urutan kartu yang dipakai selama dock terlihat (posisi baris dari SystemUI sering bergeser)
     private val slotOf = WeakHashMap<View, Int>()
+    // tinggi terbesar yang pernah terlihat selama dock terbuka. Artefak ukur SystemUI selalu MENEKAN tinggi
+    // (mis. 627/119), jadi nilai terbesar = tinggi yang benar. Nilai ini dipakai saat dock terkunci.
+    private val hMax = WeakHashMap<View, Float>()
     // jumlah kartu yang menunggu konfirmasi (perubahan 1-2 frame diabaikan)
     private var pendCardN = -1
     private var pendCardNAt = 0L
@@ -721,11 +724,14 @@ class MainHook : IXposedHookLoadPackage {
         // kalau diikuti, tata letak kartu ikut bergeser/memanjang lalu normal lagi (flick).
         // Tinggi baru hanya diambil saat dock tidak terlihat, jadi tidak ada yang berubah di layar.
         if (stackLocked) {
+            val best = hMax[c]
+            if (best != null && best > 0f) { hCache[c] = best; return best }
             if (prev != null && prev > 0f) return prev
-            if (raw > 0f) hCache[c] = raw
-            return if (raw > 0f) raw else 0f
+            return raw
         }
         if (raw > 0f) {
+            // dock terlihat tapi belum terkunci (animasi buka): catat tinggi terbesar, pakai nilai saat ini
+            if (stackOpen) hMax[c] = max(hMax[c] ?: 0f, raw)
             hCache[c] = raw
             return raw
         }
@@ -1559,8 +1565,11 @@ class MainHook : IXposedHookLoadPackage {
         // saat tersembunyi, stack tidak boleh menerima sentuhan
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
         // tinggi kartu hanya boleh berubah saat dock tidak terlihat (lihat visH)
+        val wasOpen = stackOpen
         stackOpen = a > 0.02f
         stackLocked = a >= 0.98f
+        // sesi baru: mulai kumpulkan tinggi terbesar dari awal
+        if (!stackOpen && wasOpen) hMax.clear()
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
