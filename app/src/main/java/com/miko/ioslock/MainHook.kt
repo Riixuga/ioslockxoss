@@ -247,17 +247,44 @@ class MainHook : IXposedHookLoadPackage {
     private val hCache = WeakHashMap<View, Float>()
     private val seenAt = WeakHashMap<View, Long>()
     private var lastCardN = -1
+
+    // daftar kartu terakhir yang sudah dikonfirmasi (urut dari atas). Dipakai selama jumlah kartu berubah sesaat,
+    // supaya frame itu tetap ditata (tidak return) dan tidak jatuh ke tata letak bawaan sistem.
+    private val heldRefs = ArrayList<WeakReference<View>>()
+
+    private fun keepCards(cards: List<Pair<View, Float>>) {
+        var same = heldRefs.size == cards.size
+        if (same) {
+            for (i in cards.indices) if (heldRefs[i].get() !== cards[i].first) { same = false; break }
+        }
+        if (same) return
+        heldRefs.clear()
+        for (p in cards) heldRefs.add(WeakReference(p.first))
+    }
+
+    private fun heldCards(g: ViewGroup): ArrayList<Pair<View, Float>> {
+        val out = ArrayList<Pair<View, Float>>()
+        for (r in heldRefs) {
+            val c = r.get() ?: continue
+            if (c.parent !== g || c.visibility == View.GONE) continue
+            if (c.visibility != View.VISIBLE) c.visibility = View.VISIBLE
+            out.add(Pair(c, baseOfY(c)))
+        }
+        return out
+    }
+
+    // tinggi kandidat baru per kartu: [tinggi, waktu pertama kali terlihat]. Dipakai visH supaya lonjakan
+    // tinggi 1-beberapa frame tidak dipakai (nilai baru hanya dipakai kalau bertahan)
+    private class HCand(var v: Float, var t: Long)
+    private val hCand = WeakHashMap<View, HCand>()
+
     // dock sedang terlihat (a > 0.02). Selama terlihat, tinggi kartu dikunci: SystemUI kadang mengukur ulang
     // baris dengan tinggi ~setengah / ~ganda, dan itu tidak boleh menggeser tata letak yang sudah tampil.
     @Volatile private var stackOpen = false
-    // dock benar-benar terbuka (a >= 0.98): baru di sini tinggi kartu dikunci. Saat animasi buka, tinggi masih
-    // berubah dari nilai terkompres (saat tersembunyi) ke nilai penuh, jadi belum boleh dikunci.
+    // dock benar-benar terbuka (a >= 0.98).
     @Volatile private var stackLocked = false
     // urutan kartu yang dipakai selama dock terlihat (posisi baris dari SystemUI sering bergeser)
     private val slotOf = WeakHashMap<View, Int>()
-    // tinggi terbesar yang pernah terlihat selama dock terbuka. Artefak ukur SystemUI selalu MENEKAN tinggi
-    // (mis. 627/119), jadi nilai terbesar = tinggi yang benar. Nilai ini dipakai saat dock terkunci.
-    private val hMax = WeakHashMap<View, Float>()
     // jumlah kartu yang menunggu konfirmasi (perubahan 1-2 frame diabaikan)
     private var pendCardN = -1
     private var pendCardNAt = 0L
@@ -397,7 +424,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.45 loaded into SystemUI")
+        log("v0.46 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -456,6 +483,26 @@ class MainHook : IXposedHookLoadPackage {
         hook(cl, bouncer, "onFullyHidden", after = { bouncerHook = false; applyState() })
 
         hook(cl, panel, "positionClockAndNotifications", after = { applyState() })
+
+        // Listener pre-draw kita harus jalan PALING AKHIR. Tiap ada listener baru di ViewTreeObserver stack
+        // (mis. mChildrenUpdater milik sistem saat count notifikasi berubah), daftarkan ulang listener kita
+        // supaya urutannya di belakang. Kalau tidak, sistem mereset tata letak kita setelah kita selesai = kedip 1 frame.
+        hook(cl, "android.view.ViewTreeObserver", "addOnPreDrawListener", after = { p ->
+            val l = p.args.getOrNull(0) ?: return@hook
+            if (l === drawListener) return@hook
+            val vto = p.thisObject as? ViewTreeObserver ?: return@hook
+            if (drawVto?.get() !== vto || !vto.isAlive) return@hook
+            vto.removeOnPreDrawListener(drawListener)
+            vto.addOnPreDrawListener(drawListener)
+            once("lastOrder") { log("listener pre-draw dipindah ke urutan terakhir") }
+        })
+        // cadangan kalau urutan di atas tidak cukup: tata ulang tepat setelah sistem selesai menerapkan state baris
+        for (c in listOf(
+            "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayout",
+            "com.android.systemui.statusbar.notification.stack.TrNotificationStackScrollLayout"
+        )) {
+            hook(cl, c, "updateChildren", after = { if (applied && !screenOff) applyState() })
+        }
 
         // Buka batas jumlah notifikasi yang ditampilkan sistem di lockscreen
         // (kalau tidak, kartu di luar batas disembunyikan sistem dan tidak ikut ditata)
@@ -713,29 +760,33 @@ class MainHook : IXposedHookLoadPackage {
         return c.height.toFloat()
     }
 
-    // tinggi kartu yang dipakai untuk tata letak. Mode stabil: tinggi dikunci selama dock terlihat, dan baru
-    // diambil ulang saat dock tersembunyi (lihat isi fungsinya). Ini mencegah kartu "memanjang"/bergeser.
+    // Tinggi kartu yang dipakai untuk tata letak. Nilai baru dari SystemUI hanya dipakai kalau BERTAHAN >= 250 ms.
+    // Lonjakan 1-beberapa frame (mis. 132 -> 237 saat baris dibind ulang, atau tinggi terkompres ~setengah) diabaikan,
+    // jadi dock tidak memanjang / bergeser lalu normal lagi (flick).
     private fun visH(c: View): Float {
         val raw = rawH(c)
         if (!Config.stable) return raw
         val prev = hCache[c]
-        // Selama dock terlihat, tinggi yang sudah dipakai DIKUNCI. SystemUI mengukur ulang baris terus-menerus
-        // (tiap notifikasi count diperbarui, tiap measure pass) dan nilainya bisa berubah-ubah tiap detik;
-        // kalau diikuti, tata letak kartu ikut bergeser/memanjang lalu normal lagi (flick).
-        // Tinggi baru hanya diambil saat dock tidak terlihat, jadi tidak ada yang berubah di layar.
-        if (stackLocked) {
-            val best = hMax[c]
-            if (best != null && best > 0f) { hCache[c] = best; return best }
-            if (prev != null && prev > 0f) return prev
+        if (prev == null || prev <= 0f) {
+            if (raw > 0f) hCache[c] = raw
             return raw
         }
-        if (raw > 0f) {
-            // dock terlihat tapi belum terkunci (animasi buka): catat tinggi terbesar, pakai nilai saat ini
-            if (stackOpen) hMax[c] = max(hMax[c] ?: 0f, raw)
+        if (raw <= 0f || abs(raw - prev) < 1.5f) {
+            hCand.remove(c)
+            return prev
+        }
+        val now = SystemClock.uptimeMillis()
+        val cand = hCand[c]
+        if (cand == null || abs(cand.v - raw) > 1.5f) {
+            hCand[c] = HCand(raw, now)
+            return prev
+        }
+        if (now - cand.t >= 250L) {
+            hCand.remove(c)
             hCache[c] = raw
             return raw
         }
-        return prev ?: 0f
+        return prev
     }
 
     // kartu baru saja terlihat di daftar (dalam 250 ms terakhir): tetap dihitung walau sempat hilang sebentar
@@ -1564,12 +1615,9 @@ class MainHook : IXposedHookLoadPackage {
         sv.alpha = (a * 8f).coerceAtMost(1f)
         // saat tersembunyi, stack tidak boleh menerima sentuhan
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
-        // tinggi kartu hanya boleh berubah saat dock tidak terlihat (lihat visH)
-        val wasOpen = stackOpen
+        // status dock terlihat / terbuka penuh (dipakai untuk mengunci urutan dan menjaga kartu yang sedang dikelola)
         stackOpen = a > 0.02f
         stackLocked = a >= 0.98f
-        // sesi baru: mulai kumpulkan tinggi terbesar dari awal
-        if (!stackOpen && wasOpen) hMax.clear()
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
@@ -1611,32 +1659,37 @@ class MainHook : IXposedHookLoadPackage {
             if (mediaRow.visibility != View.INVISIBLE) mediaRow.visibility = View.INVISIBLE
             hiddenMediaRef = WeakReference(mediaRow)
         }
-        val n = cards.size
 
-        // jumlah kartu yang berubah lalu balik lagi dalam 1-2 frame (sistem sedang measure ulang atau
-        // menyembunyikan baris sebentar) tidak boleh memicu tata ulang: dulu ini membuat dock sempat kosong
-        // lalu terisi lagi (flick). Perubahan baru dipakai setelah bertahan ~2 frame.
+        // Perubahan jumlah kartu yang cuma 1-2 frame (SystemUI bind ulang baris, mis. count notifikasi naik/turun)
+        // tidak dipakai dulu. JANGAN return di sini: return = frame tanpa tata letak, sedangkan sistem baru saja
+        // mereset translation/scale/visibility baris = kartu tampil dengan tata letak bawaan 1 frame (kedip).
+        // Selama menunggu, pakai daftar kartu terakhir yang sudah dikonfirmasi.
         val nowN = SystemClock.uptimeMillis()
-        if (Config.stable && a > 0.02f && lastCardN >= 0 && n != lastCardN) {
-            if (n != pendCardN) {
-                pendCardN = n
+        if (Config.stable && !soloMedia && a > 0.02f && lastCardN >= 0 && cards.size != lastCardN) {
+            if (cards.size != pendCardN) {
+                pendCardN = cards.size
                 pendCardNAt = nowN
-                logT("memberHold", "n=$n was=$lastCardN", discrete = true)
-                return
+                logT("memberHold", "n=${cards.size} was=$lastCardN", discrete = true)
             }
-            if (nowN - pendCardNAt < 34L) return
-            pendCardN = -1
-            logT("member", "n=$n was=$lastCardN solo=$soloMedia open=$stackOpen a=${"%.2f".format(a)} kids=${g.childCount}", discrete = true)
-            logT("memberWhy", dumpChildren(g), discrete = true)
-            lastCardN = n
-        } else if (Config.stable) {
-            if (n != lastCardN) {
-                logT("member", "n=$n was=$lastCardN solo=$soloMedia open=$stackOpen a=${"%.2f".format(a)} kids=${g.childCount}", discrete = true)
+            if (nowN - pendCardNAt < 34L) {
+                val held = heldCards(g)
+                if (held.isNotEmpty()) cards = held
+            } else {
+                pendCardN = -1
+                lastCardN = cards.size
+                logT("member", "n=${cards.size} solo=$soloMedia open=$stackOpen a=${"%.2f".format(a)} kids=${g.childCount}", discrete = true)
                 logT("memberWhy", dumpChildren(g), discrete = true)
-                lastCardN = n
+                keepCards(cards)
+            }
+        } else if (Config.stable) {
+            if (cards.size != lastCardN) {
+                lastCardN = cards.size
+                logT("member", "n=${cards.size} solo=$soloMedia open=$stackOpen a=${"%.2f".format(a)} kids=${g.childCount}", discrete = true)
             }
             pendCardN = -1
+            if (!soloMedia) keepCards(cards)
         }
+        val n = cards.size
 
         val restTop = dm.heightPixels * Config.restFrac
         // garis bawah keadaan 2 (sama dengan batas bawah keadaan 3 secara default)
