@@ -249,6 +249,9 @@ class MainHook : IXposedHookLoadPackage {
     // perubahan tinggi yang menunggu konfirmasi: (tinggi baru, waktu pertama terlihat)
     private val hPend = WeakHashMap<View, Pair<Float, Long>>()
     private var lastCardN = -1
+    // dock sedang terlihat (a > 0.02). Selama terlihat, tinggi kartu dikunci: SystemUI kadang mengukur ulang
+    // baris dengan tinggi ~setengah / ~ganda, dan itu tidak boleh menggeser tata letak yang sudah tampil.
+    @Volatile private var stackOpen = false
     // jumlah kartu yang menunggu konfirmasi (perubahan 1-2 frame diabaikan)
     private var pendCardN = -1
     private var pendCardNAt = 0L
@@ -722,11 +725,19 @@ class MainHook : IXposedHookLoadPackage {
         val now = SystemClock.uptimeMillis()
         val ratio = if (prev > 0f) raw / prev else 1f
         val halfDouble = ratio in 0.44f..0.56f || ratio in 1.8f..2.25f
-        val holdMs = when {
-            halfDouble -> 1800L
-            abs(raw - prev) <= 0.25f * prev -> 200L
-            else -> 500L
+        // artefak ukur SystemUI (~setengah / ~ganda dari tinggi yang sedang dipakai). Nilainya bisa bertahan
+        // belasan detik lalu balik lagi, jadi hold berapa pun tetap akan berganti-ganti. Selama dock terlihat
+        // tinggi yang sudah dipakai DIKUNCI; saat dock tertutup (tidak terlihat) nilainya bebas diperbarui.
+        if (halfDouble) {
+            hPend.remove(c)
+            if (stackOpen) {
+                logT("hlock", "${c.javaClass.simpleName.take(14)} keep=${prev.toInt()} raw=${raw.toInt()}", discrete = true)
+                return prev
+            }
+            hCache[c] = raw
+            return raw
         }
+        val holdMs = if (abs(raw - prev) <= 0.25f * prev) 200L else 500L
         val pend = hPend[c]
         if (pend == null || abs(pend.first - raw) > 0.04f * raw) {
             hPend[c] = Pair(raw, now)
@@ -1545,6 +1556,8 @@ class MainHook : IXposedHookLoadPackage {
         sv.alpha = (a * 8f).coerceAtMost(1f)
         // saat tersembunyi, stack tidak boleh menerima sentuhan
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
+        // tinggi kartu hanya boleh berubah saat dock tidak terlihat (lihat visH)
+        stackOpen = a > 0.02f
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
@@ -2852,6 +2865,7 @@ class MainHook : IXposedHookLoadPackage {
         soloMedia = false
         soloCardRef = null
         soloOpenT = 0f
+        stackOpen = false
         hideDim()
         hideLabels()
         restoreClip()
