@@ -741,14 +741,23 @@ class MainHook : IXposedHookLoadPackage {
         val dp = c.resources.displayMetrics.density
         val grace = recentlySeen(c)
         val swiped = abs(c.translationX) > 0.5f
-        if (visH(c) < 56f * dp && !grace) return false
-        return c.alpha > 0.05f || swiped || grace
+        // kartu yang sudah pernah ditata selama dock terlihat tetap dihitung, walau SystemUI sempat membuatnya
+        // 0 piksel / alpha 0 saat mengukur ulang. Dulu ini yang membuat jumlah kartu jatuh 7 -> 1 lalu balik 7.
+        val managed = stackOpen && (hCache.containsKey(c) || rowState.containsKey(c))
+        if (visH(c) < 56f * dp && !grace && !managed) return false
+        return c.alpha > 0.05f || swiped || grace || managed
     }
 
     // kartu yang ikut dihitung dan ikut ditata. INVISIBLE sengaja ikut: kartu di luar batas jumlah
     // notifikasi lockscreen disembunyikan sistem dengan INVISIBLE (bukan GONE), dan harus dimunculkan lagi
     // di applyStack. Hanya GONE yang berarti kartu itu benar-benar dibuang sistem.
-    private fun isLaidOut(c: View): Boolean = alive(c) && isReal(c)
+    private fun isLaidOut(c: View): Boolean {
+        val managed = stackOpen && (hCache.containsKey(c) || rowState.containsKey(c))
+        // kartu yang dikelola tidak dibuang hanya karena ukurannya sempat 0 selama dock terlihat; hanya GONE
+        // (benar-benar dibuang sistem) yang mengeluarkannya
+        val ok = if (managed) c.visibility != View.GONE else alive(c)
+        return ok && isReal(c)
+    }
 
     // jumlah notifikasi: semua kartu (termasuk kartu senter); grup dihitung per anak.
     // skip = kartu media player yang dipisah dari notification center (tidak ikut dihitung)
@@ -1588,11 +1597,13 @@ class MainHook : IXposedHookLoadPackage {
             }
             if (nowN - pendCardNAt < 34L) return
             pendCardN = -1
-            logT("member", "n=$n was=$lastCardN", discrete = true)
+            logT("member", "n=$n was=$lastCardN solo=$soloMedia open=$stackOpen a=${"%.2f".format(a)} kids=${g.childCount}", discrete = true)
+            logT("memberWhy", dumpChildren(g), discrete = true)
             lastCardN = n
         } else if (Config.stable) {
             if (n != lastCardN) {
-                logT("member", "n=$n was=$lastCardN", discrete = true)
+                logT("member", "n=$n was=$lastCardN solo=$soloMedia open=$stackOpen a=${"%.2f".format(a)} kids=${g.childCount}", discrete = true)
+                logT("memberWhy", dumpChildren(g), discrete = true)
                 lastCardN = n
             }
             pendCardN = -1
@@ -2120,6 +2131,7 @@ class MainHook : IXposedHookLoadPackage {
         soloAnim?.cancel()
         pillMediaAnim?.cancel()
         soloMedia = true
+        log("solo media ON (tap=$byTap)")
         soloCardRef = WeakReference(row)
         pillMediaT = 1f
         soloOpenT = if (byTap) 0f else 1f
