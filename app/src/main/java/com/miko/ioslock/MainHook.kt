@@ -250,6 +250,11 @@ class MainHook : IXposedHookLoadPackage {
     // dock sedang terlihat (a > 0.02). Selama terlihat, tinggi kartu dikunci: SystemUI kadang mengukur ulang
     // baris dengan tinggi ~setengah / ~ganda, dan itu tidak boleh menggeser tata letak yang sudah tampil.
     @Volatile private var stackOpen = false
+    // dock benar-benar terbuka (a >= 0.98): baru di sini tinggi kartu dikunci. Saat animasi buka, tinggi masih
+    // berubah dari nilai terkompres (saat tersembunyi) ke nilai penuh, jadi belum boleh dikunci.
+    @Volatile private var stackLocked = false
+    // urutan kartu yang dipakai selama dock terlihat (posisi baris dari SystemUI sering bergeser)
+    private val slotOf = WeakHashMap<View, Int>()
     // jumlah kartu yang menunggu konfirmasi (perubahan 1-2 frame diabaikan)
     private var pendCardN = -1
     private var pendCardNAt = 0L
@@ -715,7 +720,7 @@ class MainHook : IXposedHookLoadPackage {
         // (tiap notifikasi count diperbarui, tiap measure pass) dan nilainya bisa berubah-ubah tiap detik;
         // kalau diikuti, tata letak kartu ikut bergeser/memanjang lalu normal lagi (flick).
         // Tinggi baru hanya diambil saat dock tidak terlihat, jadi tidak ada yang berubah di layar.
-        if (stackOpen) {
+        if (stackLocked) {
             if (prev != null && prev > 0f) return prev
             if (raw > 0f) hCache[c] = raw
             return if (raw > 0f) raw else 0f
@@ -744,7 +749,10 @@ class MainHook : IXposedHookLoadPackage {
         // kartu yang sudah pernah ditata selama dock terlihat tetap dihitung, walau SystemUI sempat membuatnya
         // 0 piksel / alpha 0 saat mengukur ulang. Dulu ini yang membuat jumlah kartu jatuh 7 -> 1 lalu balik 7.
         val managed = stackOpen && (hCache.containsKey(c) || rowState.containsKey(c))
-        if (visH(c) < 56f * dp && !grace && !managed) return false
+        // tinggi yang dipakai untuk ambang ini adalah tinggi layout (c.height), BUKAN getActualHeight:
+        // SystemUI menekan tinggi aktual baris sampai ~setengah (mis. 1078/127) saat mengukur ulang, dan
+        // ambang lama (56dp) membuat semua kartu gugur serentak (n=8 -> n=0 -> n=8 = flick).
+        if (c.height < 56f * dp && !grace && !managed) return false
         return c.alpha > 0.05f || swiped || grace || managed
     }
 
@@ -809,6 +817,17 @@ class MainHook : IXposedHookLoadPackage {
                 shown.add(Pair(c, y))
                 y += visH(c) + 8f * d
             }
+        }
+        // Urutan kartu dikunci selama dock terlihat. SystemUI terus menggeser/mengukur ulang baris, dan kalau
+        // urutan (baseOfY) ikut berubah, kartu bertukar slot dan terlihat melompat (flick).
+        if (stackOpen) {
+            var extra = 0
+            for (p in shown) {
+                if (slotOf[p.first] == null) { slotOf[p.first] = 1_000_000 + extra; extra++ }
+            }
+            shown.sortBy { slotOf[it.first] ?: Int.MAX_VALUE }
+        } else {
+            for (i in shown.indices) slotOf[shown[i].first] = i
         }
         return shown
     }
@@ -1541,6 +1560,7 @@ class MainHook : IXposedHookLoadPackage {
         sv.visibility = if (a < 0.02f) View.INVISIBLE else View.VISIBLE
         // tinggi kartu hanya boleh berubah saat dock tidak terlihat (lihat visH)
         stackOpen = a > 0.02f
+        stackLocked = a >= 0.98f
         sv.translationY = 0f
         val g = sv as? ViewGroup ?: return
         freeClip(sv)
@@ -2852,6 +2872,7 @@ class MainHook : IXposedHookLoadPackage {
         soloCardRef = null
         soloOpenT = 0f
         stackOpen = false
+        stackLocked = false
         hideDim()
         hideLabels()
         restoreClip()
