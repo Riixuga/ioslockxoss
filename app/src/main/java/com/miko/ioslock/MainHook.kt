@@ -232,6 +232,9 @@ class MainHook : IXposedHookLoadPackage {
     private val lastMsg = ConcurrentHashMap<String, String>()
     private val dumped = ConcurrentHashMap.newKeySet<String>()
 
+    // kata kunci notifikasi yang BUKAN media player (record layar, screenshot, dll.)
+    private val recordHints = listOf("record", "screenrec", "capture")
+
     @Volatile private var stackRef: WeakReference<View>? = null
 
     // 0 = SHADE, 1 = KEYGUARD, 2 = SHADE_LOCKED, -1 = belum diketahui
@@ -369,7 +372,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.43 loaded into SystemUI")
+        log("v0.44 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -1641,18 +1644,21 @@ class MainHook : IXposedHookLoadPackage {
             val card = cards[i].first
             val baseY = cards[i].second
             val baseZ = baseOfZ(card)
-            val h = hs[i]
-            val naturalCenter = loc[1] + baseY + h / 2f
+            val h = hs[i]                                       // jarak tumpukan (stabil, dari cache)
+            val real = card.height.toFloat().coerceAtLeast(1f)  // tinggi yang benar-benar digambar
             rightEdge = max(rightEdge, (loc[0] + card.right).toFloat())
 
             val kind = if (q < 0.5f) la.kind[i] else lb.kind[i]
             val s = scales[i]
 
+            // pusat alami memakai tinggi NYATA, pivot juga, supaya skala tidak meleset
+            val naturalCenter = loc[1] + baseY + real / 2f
+
             // ukuran kartu saat animasi buka: dari ukuran pil (lebar pil / lebar kartu, tinggi pil / tinggi kartu)
             // ke skala keadaan 2. ea = 1 di luar animasi buka, jadi sx = sy = s.
             val ea = opens[i]
             val sx0 = if (toPill) (pg[2] / card.width.toFloat()).coerceIn(0.05f, 1f) else openScale
-            val sy0 = if (toPill) (pg[3] / h).coerceIn(0.05f, 1f) else openScale
+            val sy0 = if (toPill) (pg[3] / real).coerceIn(0.05f, 1f) else openScale
             val sx = sx0 + (s - sx0) * ea
             val sy = sy0 + (s - sy0) * ea
 
@@ -1679,17 +1685,21 @@ class MainHook : IXposedHookLoadPackage {
             }
 
             card.pivotX = card.width / 2f
-            card.pivotY = h / 2f
+            card.pivotY = real / 2f                 // pivot = pusat tinggi nyata
             card.translationY = wy
             card.translationZ = wz
             card.scaleX = sx
             card.scaleY = sy
-            // potong bagian atas kartu yang ter-scroll melewati garis atas daftar; fade-nya digambar oleh mask
-            val csy = center + slide
-            val iy0 = (h / 2f + (smallTop - csy) / s).toInt()
-            card.clipBounds = if (q > 0f && iy0 > 0) {
-                Rect(0, min(iy0, card.height), card.width, card.height)
-            } else null
+
+            // potong bagian atas kartu yang ter-scroll melewati garis atas daftar; fade-nya digambar oleh mask.
+            // clip hanya diatur kalau kartu tidak sedang di-swipe sistem (translationX ~ 0)
+            if (abs(card.translationX) < 0.5f) {
+                val csy = center + slide
+                val iy0 = (real / 2f + (smallTop - csy) / s).toInt()
+                card.clipBounds = if (q > 0f && iy0 > 0) {
+                    Rect(0, min(iy0, card.height), card.width, card.height)
+                } else null
+            }
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz, appliedWx)
         }
 
@@ -1881,18 +1891,26 @@ class MainHook : IXposedHookLoadPackage {
         return null
     }
 
+    // Media player = notifikasi dengan sesi media (android.mediaSession) atau kategori transport.
+    // Record layar, notifikasi sistem, dan progres ditolak walau ROM menandainya sebagai media (isMediaRow).
     private fun isMediaCard(row: View): Boolean {
-        if (row.javaClass.name.contains("ExpandableNotificationRow")) {
-            try {
-                if (XposedHelpers.callMethod(row, "isMediaRow") == true) return true
-            } catch (_: Throwable) { }
+        val sbn = sbnOf(row)
+        if (sbn == null) {
+            // cadangan kalau data notifikasi tidak terbaca
+            return row.javaClass.name.contains("MediaContainer") ||
+                findChild(row, 6) {
+                    it.javaClass.name.contains("MediaContainer") ||
+                        it.javaClass.name.contains("MediaCarousel")
+                } != null
         }
-        if (row.javaClass.name.contains("MediaContainer")) return true
-        return findChild(row, 6) {
-            it.javaClass.name.contains("MediaContainer") ||
-                it.javaClass.name.contains("MediaCarousel") ||
-                it.javaClass.name == "com.android.systemui.statusbar.notification.row.MediaControlPanel"
-        } != null
+        val n = sbn.notification
+        val pkg = sbn.packageName.orEmpty()
+        // record layar, sistem, dan progres bukan media player
+        if (pkg == "com.android.systemui" || recordHints.any { pkg.contains(it, true) }) return false
+        if (n.category == Notification.CATEGORY_SYSTEM || n.category == Notification.CATEGORY_PROGRESS) return false
+        val hasSession = n.extras?.containsKey("android.mediaSession") == true
+        val transport = n.category == Notification.CATEGORY_TRANSPORT
+        return hasSession || transport
     }
 
     private fun sbnOf(row: View): StatusBarNotification? = try {
@@ -1982,12 +2000,16 @@ class MainHook : IXposedHookLoadPackage {
         mediaScanAt = now
         val old = cached
         var row: View? = null
-        // pindai anak stack langsung (tanpa collectCards, supaya kartu yang disembunyikan tidak dimunculkan lagi)
-        for (i in 0 until g.childCount) {
-            val c = g.getChildAt(i)
-            if (alive(c) && isMediaCard(c)) { row = c; break }
+        // pertahankan baris media yang sudah dipilih selama masih valid
+        if (old != null && alive(old) && isMediaCard(old)) {
+            row = old
+        } else {
+            // pindai anak stack langsung (tanpa collectCards, supaya kartu yang disembunyikan tidak dimunculkan lagi)
+            for (i in 0 until g.childCount) {
+                val c = g.getChildAt(i)
+                if (alive(c) && isMediaCard(c)) { row = c; break }
+            }
         }
-        if (row == null && old != null && alive(old) && isMediaCard(old)) row = old
         if (row == null) {
             if (mediaAvailable) log("pil: media player hilang")
             mediaAvailable = false
@@ -1998,6 +2020,7 @@ class MainHook : IXposedHookLoadPackage {
             return null
         }
         if (row !== old) {
+            log("pil: baris media -> ${sbnOf(row)?.packageName}")
             mediaTitle = ""
             mediaText = ""
             mediaArt = null
