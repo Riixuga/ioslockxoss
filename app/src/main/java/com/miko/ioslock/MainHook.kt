@@ -246,8 +246,6 @@ class MainHook : IXposedHookLoadPackage {
     // mode stabil: tinggi terakhir yang valid per kartu, dan waktu terakhir kartu itu terlihat di daftar
     private val hCache = WeakHashMap<View, Float>()
     private val seenAt = WeakHashMap<View, Long>()
-    // perubahan tinggi yang menunggu konfirmasi: (tinggi baru, waktu pertama terlihat)
-    private val hPend = WeakHashMap<View, Pair<Float, Long>>()
     private var lastCardN = -1
     // dock sedang terlihat (a > 0.02). Selama terlihat, tinggi kartu dikunci: SystemUI kadang mengukur ulang
     // baris dengan tinggi ~setengah / ~ganda, dan itu tidak boleh menggeser tata letak yang sudah tampil.
@@ -707,50 +705,26 @@ class MainHook : IXposedHookLoadPackage {
         return c.height.toFloat()
     }
 
-    // tinggi kartu yang dipakai untuk tata letak. Mode stabil: kalau tinggi mendadak berubah jauh saat kartu
-    // sedang di-swipe atau sedang disembunyikan/ditampilkan sistem, pakai tinggi terakhir yang valid.
-    // Ini mencegah kartu "memanjang" satu frame.
+    // tinggi kartu yang dipakai untuk tata letak. Mode stabil: tinggi dikunci selama dock terlihat, dan baru
+    // diambil ulang saat dock tersembunyi (lihat isi fungsinya). Ini mencegah kartu "memanjang"/bergeser.
     private fun visH(c: View): Float {
         val raw = rawH(c)
         if (!Config.stable) return raw
         val prev = hCache[c]
-        if (raw <= 0f) return prev ?: 0f
-        if (prev == null) { hCache[c] = raw; return raw }
-        // perubahan kecil langsung diterima
-        if (abs(raw - prev) <= 0.04f * prev) { hPend.remove(c); hCache[c] = raw; return raw }
-        // perubahan besar: tinggi lama dipakai dulu, baru diterima kalau nilai barunya bertahan cukup lama.
-        // Nilai yang berubah tepat ~setengah atau ~ganda adalah artefak pengukuran SystemUI (baris di-clip /
-        // di-measure ulang, mis. tiap notifikasi count diperbarui): nilainya bolak-balik tiap siklus refresh,
-        // jadi butuh waktu jauh lebih lama sebelum dipakai. Ini yang mencegah kartu "memanjang" bergantian.
-        val now = SystemClock.uptimeMillis()
-        val ratio = if (prev > 0f) raw / prev else 1f
-        val halfDouble = ratio in 0.44f..0.56f || ratio in 1.8f..2.25f
-        // artefak ukur SystemUI (~setengah / ~ganda dari tinggi yang sedang dipakai). Nilainya bisa bertahan
-        // belasan detik lalu balik lagi, jadi hold berapa pun tetap akan berganti-ganti. Selama dock terlihat
-        // tinggi yang sudah dipakai DIKUNCI; saat dock tertutup (tidak terlihat) nilainya bebas diperbarui.
-        if (halfDouble) {
-            hPend.remove(c)
-            if (stackOpen) {
-                logT("hlock", "${c.javaClass.simpleName.take(14)} keep=${prev.toInt()} raw=${raw.toInt()}", discrete = true)
-                return prev
-            }
+        // Selama dock terlihat, tinggi yang sudah dipakai DIKUNCI. SystemUI mengukur ulang baris terus-menerus
+        // (tiap notifikasi count diperbarui, tiap measure pass) dan nilainya bisa berubah-ubah tiap detik;
+        // kalau diikuti, tata letak kartu ikut bergeser/memanjang lalu normal lagi (flick).
+        // Tinggi baru hanya diambil saat dock tidak terlihat, jadi tidak ada yang berubah di layar.
+        if (stackOpen) {
+            if (prev != null && prev > 0f) return prev
+            if (raw > 0f) hCache[c] = raw
+            return if (raw > 0f) raw else 0f
+        }
+        if (raw > 0f) {
             hCache[c] = raw
             return raw
         }
-        val holdMs = if (abs(raw - prev) <= 0.25f * prev) 200L else 500L
-        val pend = hPend[c]
-        if (pend == null || abs(pend.first - raw) > 0.04f * raw) {
-            hPend[c] = Pair(raw, now)
-            logT("hjump", "${c.javaClass.simpleName.take(14)} stable=${prev.toInt()} raw=${raw.toInt()}" +
-                " h=${c.height} hold=${holdMs}", discrete = true)
-            return prev
-        }
-        if (now - pend.second >= holdMs) {
-            hPend.remove(c); hCache[c] = raw
-            logT("hset", "${c.javaClass.simpleName.take(14)} ${prev.toInt()} -> ${raw.toInt()}", discrete = true)
-            return raw
-        }
-        return prev
+        return prev ?: 0f
     }
 
     // kartu baru saja terlihat di daftar (dalam 250 ms terakhir): tetap dihitung walau sempat hilang sebentar
