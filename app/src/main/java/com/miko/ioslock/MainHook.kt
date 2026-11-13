@@ -246,12 +246,21 @@ class MainHook : IXposedHookLoadPackage {
     // mode stabil: tinggi terakhir yang valid per kartu, dan waktu terakhir kartu itu terlihat di daftar
     private val hCache = WeakHashMap<View, Float>()
     private val seenAt = WeakHashMap<View, Long>()
+    // perubahan tinggi yang menunggu konfirmasi: (tinggi baru, waktu pertama terlihat)
+    private val hPend = WeakHashMap<View, Pair<Float, Long>>()
     private var lastCardN = -1
 
     // pengaturan clip asli view induk stack: [clipChildren, clipToPadding]
     private val clipOrig = WeakHashMap<ViewGroup, BooleanArray>()
 
     private var drawHookView: WeakReference<View>? = null
+    private var drawVto: WeakReference<ViewTreeObserver>? = null
+    private val drawListener = ViewTreeObserver.OnPreDrawListener {
+        val sv0 = stackRef?.get()
+        logT("pre", "applied=$applied bar=$barState p=${"%.2f".format(progress)} solo=$soloMedia a=${sv0?.alpha} v=${sv0?.visibility}", discrete = true)
+        if (applied && !screenOff) applyState()
+        true
+    }
 
     // kontrol setting gear jam wallpaper
     @Volatile private var ownWrite = false
@@ -372,7 +381,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.44 loaded into SystemUI")
+        log("v0.45 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -697,10 +706,19 @@ class MainHook : IXposedHookLoadPackage {
         val prev = hCache[c]
         if (raw <= 0f) return prev ?: 0f
         if (prev == null) { hCache[c] = raw; return raw }
-        val unstable = abs(c.translationX) > 0.5f || c.visibility != View.VISIBLE
-        if (unstable && abs(raw - prev) > 0.35f * prev) return prev
-        hCache[c] = raw
-        return raw
+        // perubahan kecil langsung diterima
+        if (abs(raw - prev) <= 0.04f * prev) { hPend.remove(c); hCache[c] = raw; return raw }
+        // perubahan besar: tinggi lama dipakai dulu. Baru diterima kalau nilai barunya bertahan >= 160 ms.
+        // Lonjakan tinggi sesaat (1-2 frame, mis. saat konten kartu diperbarui atau mulai di-swipe) diabaikan.
+        val now = SystemClock.uptimeMillis()
+        val pend = hPend[c]
+        if (pend == null || abs(pend.first - raw) > 0.04f * raw) {
+            hPend[c] = Pair(raw, now)
+            logT("hjump", "${c.javaClass.simpleName.take(14)} stable=${prev.toInt()} raw=${raw.toInt()}", discrete = true)
+            return prev
+        }
+        if (now - pend.second >= 160L) { hPend.remove(c); hCache[c] = raw; return raw }
+        return prev
     }
 
     // kartu baru saja terlihat di daftar (dalam 250 ms terakhir): tetap dihitung walau sempat hilang sebentar
@@ -826,6 +844,8 @@ class MainHook : IXposedHookLoadPackage {
                 .append(when (c.visibility) { View.VISIBLE -> " V "; View.INVISIBLE -> " I "; else -> " G " })
                 .append(c.width).append('x').append(c.height).append('/').append(visH(c).toInt())
                 .append(" tx=").append(c.translationX.toInt())
+                .append(" a=").append("%.2f".format(c.alpha))
+                .append(" pkg=").append(sbnOf(c)?.packageName?.takeLast(16) ?: "-")
                 .append(if (isLaidOut(c)) " ok" else " skip")
         }
         return sb.toString()
@@ -1446,16 +1466,14 @@ class MainHook : IXposedHookLoadPackage {
     // Terapkan ulang efek tiap frame (sebelum digambar), supaya posisi
     // tidak ditimpa lagi oleh stack notifikasi bawaan.
     private fun ensureDrawHook(sv: View) {
-        if (drawHookView?.get() === sv) return
         val vto = sv.viewTreeObserver
         if (!vto.isAlive) return
+        // daftarkan ulang kalau stack pindah window / ViewTreeObserver berganti
+        if (drawHookView?.get() === sv && drawVto?.get() === vto) return
+        drawVto?.get()?.let { if (it.isAlive) it.removeOnPreDrawListener(drawListener) }
+        vto.addOnPreDrawListener(drawListener)
         drawHookView = WeakReference(sv)
-        vto.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
-            override fun onPreDraw(): Boolean {
-                if (applied && !screenOff) applyState()
-                return true
-            }
-        })
+        drawVto = WeakReference(vto)
     }
 
     // a: 0..1 animasi buka tumpukan: semua kartu keluar bergantian dari pil "N Notifications" sambil
@@ -1645,7 +1663,7 @@ class MainHook : IXposedHookLoadPackage {
             val baseY = cards[i].second
             val baseZ = baseOfZ(card)
             val h = hs[i]                                       // jarak tumpukan (stabil, dari cache)
-            val real = card.height.toFloat().coerceAtLeast(1f)  // tinggi yang benar-benar digambar
+            val real = h.coerceAtLeast(1f)                      // pivot dan pusat memakai tinggi yang sama dengan tata letak
             rightEdge = max(rightEdge, (loc[0] + card.right).toFloat())
 
             val kind = if (q < 0.5f) la.kind[i] else lb.kind[i]
@@ -1692,12 +1710,14 @@ class MainHook : IXposedHookLoadPackage {
             card.scaleY = sy
 
             // potong bagian atas kartu yang ter-scroll melewati garis atas daftar; fade-nya digambar oleh mask.
-            // clip hanya diatur kalau kartu tidak sedang di-swipe sistem (translationX ~ 0)
-            if (abs(card.translationX) < 0.5f) {
+            // bawah kartu dipotong di tinggi stabil kalau tinggi yang digambar sesaat melonjak (anti flick)
+            run {
                 val csy = center + slide
                 val iy0 = (real / 2f + (smallTop - csy) / s).toInt()
-                card.clipBounds = if (q > 0f && iy0 > 0) {
-                    Rect(0, min(iy0, card.height), card.width, card.height)
+                val bottomClip = if (Config.stable && rawH(card) > h + 2f) h.toInt().coerceIn(1, card.height) else card.height
+                val topClip = if (q > 0f && iy0 > 0) min(iy0, bottomClip - 1).coerceAtLeast(0) else 0
+                card.clipBounds = if (topClip > 0 || bottomClip < card.height) {
+                    Rect(0, topClip, card.width, bottomClip)
                 } else null
             }
             rowState[card] = floatArrayOf(baseY, wy, baseZ, wz, appliedWx)
