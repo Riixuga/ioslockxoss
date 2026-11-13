@@ -249,6 +249,9 @@ class MainHook : IXposedHookLoadPackage {
     // perubahan tinggi yang menunggu konfirmasi: (tinggi baru, waktu pertama terlihat)
     private val hPend = WeakHashMap<View, Pair<Float, Long>>()
     private var lastCardN = -1
+    // jumlah kartu yang menunggu konfirmasi (perubahan 1-2 frame diabaikan)
+    private var pendCardN = -1
+    private var pendCardNAt = 0L
 
     // pengaturan clip asli view induk stack: [clipChildren, clipToPadding]
     private val clipOrig = WeakHashMap<ViewGroup, BooleanArray>()
@@ -712,16 +715,30 @@ class MainHook : IXposedHookLoadPackage {
         if (prev == null) { hCache[c] = raw; return raw }
         // perubahan kecil langsung diterima
         if (abs(raw - prev) <= 0.04f * prev) { hPend.remove(c); hCache[c] = raw; return raw }
-        // perubahan besar: tinggi lama dipakai dulu. Baru diterima kalau nilai barunya bertahan >= 160 ms.
-        // Lonjakan tinggi sesaat (1-2 frame, mis. saat konten kartu diperbarui atau mulai di-swipe) diabaikan.
+        // perubahan besar: tinggi lama dipakai dulu, baru diterima kalau nilai barunya bertahan cukup lama.
+        // Nilai yang berubah tepat ~setengah atau ~ganda adalah artefak pengukuran SystemUI (baris di-clip /
+        // di-measure ulang, mis. tiap notifikasi count diperbarui): nilainya bolak-balik tiap siklus refresh,
+        // jadi butuh waktu jauh lebih lama sebelum dipakai. Ini yang mencegah kartu "memanjang" bergantian.
         val now = SystemClock.uptimeMillis()
+        val ratio = if (prev > 0f) raw / prev else 1f
+        val halfDouble = ratio in 0.44f..0.56f || ratio in 1.8f..2.25f
+        val holdMs = when {
+            halfDouble -> 1800L
+            abs(raw - prev) <= 0.25f * prev -> 200L
+            else -> 500L
+        }
         val pend = hPend[c]
         if (pend == null || abs(pend.first - raw) > 0.04f * raw) {
             hPend[c] = Pair(raw, now)
-            logT("hjump", "${c.javaClass.simpleName.take(14)} stable=${prev.toInt()} raw=${raw.toInt()}", discrete = true)
+            logT("hjump", "${c.javaClass.simpleName.take(14)} stable=${prev.toInt()} raw=${raw.toInt()}" +
+                " h=${c.height} hold=${holdMs}", discrete = true)
             return prev
         }
-        if (now - pend.second >= 160L) { hPend.remove(c); hCache[c] = raw; return raw }
+        if (now - pend.second >= holdMs) {
+            hPend.remove(c); hCache[c] = raw
+            logT("hset", "${c.javaClass.simpleName.take(14)} ${prev.toInt()} -> ${raw.toInt()}", discrete = true)
+            return raw
+        }
         return prev
     }
 
@@ -1571,9 +1588,27 @@ class MainHook : IXposedHookLoadPackage {
         }
         val n = cards.size
 
-        if (Config.stable && n != lastCardN) {
+        // jumlah kartu yang berubah lalu balik lagi dalam 1-2 frame (sistem sedang measure ulang atau
+        // menyembunyikan baris sebentar) tidak boleh memicu tata ulang: dulu ini membuat dock sempat kosong
+        // lalu terisi lagi (flick). Perubahan baru dipakai setelah bertahan ~2 frame.
+        val nowN = SystemClock.uptimeMillis()
+        if (Config.stable && a > 0.02f && lastCardN >= 0 && n != lastCardN) {
+            if (n != pendCardN) {
+                pendCardN = n
+                pendCardNAt = nowN
+                logT("memberHold", "n=$n was=$lastCardN", discrete = true)
+                return
+            }
+            if (nowN - pendCardNAt < 34L) return
+            pendCardN = -1
             logT("member", "n=$n was=$lastCardN", discrete = true)
             lastCardN = n
+        } else if (Config.stable) {
+            if (n != lastCardN) {
+                logT("member", "n=$n was=$lastCardN", discrete = true)
+                lastCardN = n
+            }
+            pendCardN = -1
         }
 
         val restTop = dm.heightPixels * Config.restFrac
