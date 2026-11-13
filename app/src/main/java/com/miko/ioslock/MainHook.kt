@@ -319,6 +319,10 @@ class MainHook : IXposedHookLoadPackage {
 
     // saat mini media ditekan / di-swipe naik: hanya kartu media yang dibuka
     private var soloMedia = false
+    // state B: geser horizontal di kartu media ditelan (media player tidak bisa dihapus)
+    private var soloBlock = false
+    private var soloDownX = 0f
+    private var soloDownY = 0f
     private var soloCardRef: WeakReference<View>? = null
     @Volatile private var soloOpenT = 0f
     private var soloAnim: ValueAnimator? = null
@@ -912,6 +916,30 @@ class MainHook : IXposedHookLoadPackage {
             }
             p.result = true
             return
+        }
+
+        // mode media (B): kartu media player tidak bisa dihapus. Geser horizontal ditelan (dan sistem dibatalkan),
+        // ketukan kontrol media tetap jalan; geser vertikal untuk menutup dock tetap jalan.
+        if (soloMedia) {
+            if (a == MotionEvent.ACTION_DOWN) {
+                soloBlock = false
+                soloDownX = ev.rawX
+                soloDownY = ev.rawY
+            } else if (a == MotionEvent.ACTION_MOVE && !soloBlock) {
+                val slop = ViewConfiguration.get(root.context).scaledTouchSlop
+                val dx = ev.rawX - soloDownX
+                val dy = ev.rawY - soloDownY
+                if (abs(dx) > slop && abs(dx) > abs(dy) * 1.2f) {
+                    soloBlock = true
+                    cancelNativeTouch(p)
+                    log("media: geser kartu diblokir (state B)")
+                }
+            }
+            if (soloBlock) {
+                if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) soloBlock = false
+                p.result = true
+                return
+            }
         }
 
         if (a == MotionEvent.ACTION_DOWN) {
@@ -1518,15 +1546,18 @@ class MainHook : IXposedHookLoadPackage {
         val mediaRow = refreshMedia(g)
         val split = Config.splitMedia
         // di luar mode media saja, kartu media dilewati: tidak ikut ditata, dihitung, atau dimunculkan lagi
-        var cards = collectCards(g, if (split && !soloMedia) mediaRow else null)
+        // mode media (B): HANYA kartu media. collectCards tidak dipakai karena ia memunculkan lagi kartu
+        // INVISIBLE (notifikasi state A ikut tampil sesaat = kedip).
+        var cards = if (soloMedia) {
+            if (mediaRow != null) arrayListOf(Pair(mediaRow, baseOfY(mediaRow))) else ArrayList()
+        } else collectCards(g, if (split) mediaRow else null)
         if (soloMedia) {
             if (mediaRow != null) {
                 for (i in 0 until g.childCount) {
                     val c = g.getChildAt(i)
                     if (c !== mediaRow && alive(c)) c.visibility = View.INVISIBLE
                 }
-                mediaRow.visibility = View.VISIBLE
-                cards = ArrayList(cards.filter { it.first === mediaRow })
+                if (mediaRow.visibility != View.VISIBLE) mediaRow.visibility = View.VISIBLE
             }
             if (mediaRow == null || cards.isEmpty()) {
                 soloMedia = false
