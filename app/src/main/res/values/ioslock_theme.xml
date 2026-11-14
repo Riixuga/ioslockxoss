@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Terang/gelap mengikuti pengaturan HP (DayNight). Seluruh UI digambar lewat kode, jadi tema ini hanya
+         menyiapkan jendela tanpa action bar dengan status bar dan navigation bar transparan. -->
+    <style name="Theme.IOSLock" parent="@android:style/Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>
