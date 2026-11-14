@@ -149,6 +149,36 @@ object Strings {
             "سيُفتح التقرير في تيليجرام. راجعه ثم اضغط إرسال هناك."
         ),
         "send" to arrayOf("Send", "Kirim", "إرسال"),
+        "log_attach" to arrayOf(
+            "Attach log file",
+            "Lampirkan file log",
+            "إرفاق ملف السجل"
+        ),
+        "log_attach_desc" to arrayOf(
+            "Module log from System UI. Contains app package names only, no message content.",
+            "Log modul dari System UI. Hanya berisi nama paket aplikasi, tanpa isi pesan.",
+            "سجل الوحدة من واجهة النظام. يحتوي على أسماء الحزم فقط دون محتوى الرسائل."
+        ),
+        "bug_note_log" to arrayOf(
+            "Telegram opens a share list. Choose @mkbtgr and press send; the log file is attached.",
+            "Telegram akan membuka daftar bagikan. Pilih @mkbtgr lalu tekan kirim; file log ikut terlampir.",
+            "سيفتح تيليجرام قائمة المشاركة. اختر @mkbtgr ثم اضغط إرسال؛ ملف السجل مرفق."
+        ),
+        "log_collecting" to arrayOf(
+            "Collecting log…",
+            "Mengumpulkan log…",
+            "جارٍ جمع السجل…"
+        ),
+        "log_no_root" to arrayOf(
+            "No root access, the report is sent without the module log",
+            "Tidak ada akses root, laporan dikirim tanpa log modul",
+            "لا توجد صلاحية روت، سيُرسل التقرير دون سجل الوحدة"
+        ),
+        "pick_chat" to arrayOf(
+            "Choose @mkbtgr in Telegram",
+            "Pilih @mkbtgr di Telegram",
+            "اختر @mkbtgr في تيليجرام"
+        ),
         "problem_required" to arrayOf(
             "Please describe the problem first",
             "Isi masalahnya dulu",
