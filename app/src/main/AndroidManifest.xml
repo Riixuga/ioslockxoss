@@ -45,5 +45,12 @@
             </intent-filter>
         </receiver>
 
+        <!-- menyajikan file log laporan bug ke Telegram (hanya-baca, hanya folder cache/logs) -->
+        <provider
+            android:name=".LogFileProvider"
+            android:authorities="com.miko.ioslock.logs"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
     </application>
 </manifest>
