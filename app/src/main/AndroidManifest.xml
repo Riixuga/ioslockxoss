@@ -1,35 +1,22 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-  Kalau manifest kamu sudah punya meta-data Xposed (xposedmodule, xposeddescription, xposedminversion, ...),
-  pertahankan punyamu. Yang wajib ada dari file ini: permission BOOT_COMPLETED, supportsRtl, theme,
-  dua activity, dan dua receiver di bawah.
--->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
-        android:allowBackup="true"
-        android:icon="@mipmap/ic_launcher"
         android:label="IOSLock"
+        android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.IOSLock">
 
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="iOS-style lock screen notification stack for TranOS" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="93" />
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="iOS-style lockscreen notification stack" />
+        <meta-data android:name="xposedminversion" android:value="93" />
+        <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
 
         <activity
             android:name=".MainActivity"
-            android:exported="true"
-            android:label="IOSLock">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -38,10 +25,9 @@
 
         <activity
             android:name=".AboutActivity"
-            android:exported="false"
-            android:label="IOSLock" />
+            android:exported="false" />
 
-        <!-- Dikirim dari proses System UI oleh tombol "Reset UI" di menu power -->
+        <!-- exported harus true karena pengirimnya adalah proses System UI (uid lain) -->
         <receiver
             android:name=".RestartUiReceiver"
             android:exported="true">
@@ -50,7 +36,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- Menerapkan lagi pengaturan (property debug.ioslock.*) setelah reboot -->
+        <!-- menerapkan lagi pengaturan aplikasi (property debug.ioslock.*) setelah reboot -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true">
@@ -58,5 +44,6 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
     </application>
 </manifest>
