@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ikon: tiga kartu notifikasi bertumpuk keluar dari pil kaca. Aman untuk adaptive icon (area tengah 66dp). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#59FFFFFF" android:pathData="M42.5,27 h23.0 a4.5,4.5 0 0 1 4.5,4.5 v0.0 a4.5,4.5 0 0 1 -4.5,4.5 h-23.0 a4.5,4.5 0 0 1 -4.5,-4.5 v-0.0 a4.5,4.5 0 0 1 4.5,-4.5 z" />
+    <path android:fillColor="#99FFFFFF" android:pathData="M38,39 h32 a5,5 0 0 1 5,5 v1 a5,5 0 0 1 -5,5 h-32 a5,5 0 0 1 -5,-5 v-1 a5,5 0 0 1 5,-5 z" />
+    <path android:fillColor="#F2FFFFFF" android:pathData="M34,53 h40 a6,6 0 0 1 6,6 v3 a6,6 0 0 1 -6,6 h-40 a6,6 0 0 1 -6,-6 v-3 a6,6 0 0 1 6,-6 z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M40,74 h28 a6,6 0 0 1 6,6 v0 a6,6 0 0 1 -6,6 h-28 a6,6 0 0 1 -6,-6 v-0 a6,6 0 0 1 6,-6 z" />
+    <path android:fillColor="#FF22D3EE" android:pathData="M44,80m-2.6,0a2.6,2.6 0 1,1 5.2,0a2.6,2.6 0 1,1 -5.2,0" />
+    <path android:fillColor="#FF4F5DF5" android:pathData="M51.4,78.6 h15.2 a1.4,1.4 0 0 1 1.4,1.4 v0.0 a1.4,1.4 0 0 1 -1.4,1.4 h-15.2 a1.4,1.4 0 0 1 -1.4,-1.4 v-0.0 a1.4,1.4 0 0 1 1.4,-1.4 z" />
+</vector>
