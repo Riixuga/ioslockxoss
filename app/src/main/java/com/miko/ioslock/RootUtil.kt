@@ -112,6 +112,31 @@ object RootUtil {
         }
     }
 
+    /**
+     * Kumpulkan log modul untuk laporan bug (butuh root; app biasa tidak boleh membaca log proses lain).
+     * cb(teks log, rootOk) dipanggil di main thread.
+     */
+    fun collectLog(cb: (String, Boolean) -> Unit) {
+        io.execute {
+            val script = """
+                echo "[props]"
+                getprop | grep -i ioslock
+                echo ""
+                echo "[systemui pid]"
+                pidof com.android.systemui
+                echo ""
+                echo "[module log, tag IOSLock]"
+                logcat -d -v threadtime -t 5000 IOSLock:V '*:S' | tail -n 1500
+                echo ""
+                echo "[crash buffer]"
+                logcat -d -b crash -v threadtime | tail -n 120
+            """.trimIndent()
+            val r = exec(script, 30_000L)
+            val ok = r.code != -1 && r.out.contains("[props]")
+            main.post { cb(r.out, ok) }
+        }
+    }
+
     /** Matikan System UI; sistem langsung membangkitkannya lagi. */
     fun restartSystemUi(cb: ((Boolean) -> Unit)? = null) {
         run("killall com.android.systemui || pkill -f com.android.systemui", cb)
