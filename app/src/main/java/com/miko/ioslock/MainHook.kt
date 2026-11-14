@@ -12,7 +12,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ComposeShader
 import android.graphics.LinearGradient
 import android.graphics.Outline
 import android.graphics.Paint
@@ -150,20 +149,7 @@ object Config {
     // keadaan 3: kartu yang ter-scroll melewati garis atas (smallFrac) dipotong dengan fade setebal topFadeDp
     // (0 = potong datar). Wallpaper digelapkan sebesar dimAlpha (0..1) saat masuk keadaan 3 (0 = mati).
     val topFadeDp: Float get() = prop("debug.ioslock.topfade").toFloatOrNull() ?: 44f
-    val dimAlpha: Float get() = prop("debug.ioslock.dim").toFloatOrNull() ?: 0.36f
-    // dim menutupi SELURUH layar (semua bagian wallpaper) kecuali jam. Dim dipasang paling bawah di window SystemUI,
-    // jadi kalau jam adalah view SystemUI (KeyguardClockView) jam otomatis tidak ikut gelap. Kalau jam digambar oleh
-    // wallpaper (depth clock) dan tidak ada view jam SystemUI yang tampil, dim dibolongi SATU kotak membulat tepat di
-    // sekitar jam (BUKAN pita selebar layar): kiri-kanan sejauh dimHoleSideFrac dari tepi layar (0..0.45 lebar layar),
-    // atas di dimHoleTopFrac (0..1 tinggi layar, harus di atas tanggal), bawah dimHoleBottomDp di atas tepi atas kartu.
-    // Tepi kotak memudar setebal dimHoleFeatherDp ke LUAR, jadi isi kotak (jam + tanggal) utuh tidak terpotong
-    // dan sisa layar tetap gelap penuh.
-    // setprop debug.ioslock.dimhole: kosong = otomatis, 0 = tanpa lubang (dim penuh), 1 = selalu pakai lubang
-    val dimHole: String get() = prop("debug.ioslock.dimhole")
-    val dimHoleTopFrac: Float get() = prop("debug.ioslock.dimholetop").toFloatOrNull() ?: 0.05f
-    val dimHoleBottomDp: Float get() = prop("debug.ioslock.dimholebottom").toFloatOrNull() ?: 28f
-    val dimHoleFeatherDp: Float get() = prop("debug.ioslock.dimholefeather").toFloatOrNull() ?: 24f
-    val dimHoleSideFrac: Float get() = prop("debug.ioslock.dimholeside").toFloatOrNull() ?: 0.05f
+    val dimAlpha: Float get() = prop("debug.ioslock.dim").toFloatOrNull() ?: 0.28f
     // swipe naik keadaan 2 -> 3: kartu keluar dari tumpukan satu per satu (kartu depan lebih dulu).
     // 0 = semua kartu renggang bersamaan, makin besar makin bergantian (maksimum 0.8)
     val stagger: Float get() = prop("debug.ioslock.stagger").toFloatOrNull() ?: 0.3f
@@ -224,8 +210,9 @@ object Config {
     val stage2Dp: Float get() = prop("debug.ioslock.stage2dp").toFloatOrNull() ?: 100f
     val bottomZoneDp: Float get() = prop("debug.ioslock.bottomdp").toFloatOrNull() ?: 120f
 
-    // tombol "Reset UI" di menu power (matikan: setprop debug.ioslock.powerbtn 0)
-    val powerBtn: Boolean get() = prop("debug.ioslock.powerbtn") != "0"
+    // tombol "Reset UI" di menu power. Default MATI; dinyalakan dari aplikasi IOSLock
+    // (atau manual: setprop debug.ioslock.powerbtn 1)
+    val powerBtn: Boolean get() = prop("debug.ioslock.powerbtn") == "1"
     // 1 = catat semua teks di tiap window baru (untuk mencari tahu menu power ada di mana)
     val pwrDump: Boolean get() = prop("debug.ioslock.pwrdump") == "1"
     // kalau jalur root tidak mematikan System UI dalam sekian ms, System UI mematikan dirinya sendiri (0 = tanpa cadangan)
@@ -424,13 +411,7 @@ class MainHook : IXposedHookLoadPackage {
     private val maskGrad = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) }
 
     // dim wallpaper di keadaan 3
-    private var dimView: DimView? = null
-
-    // jam sistem (KeyguardClockView): dipakai untuk menentukan apakah jam digambar SystemUI (di atas dim) atau wallpaper
-    private val clockCls = "com.transsion.keyguard.clock.ui.KeyguardClockView"
-    private var clockRefs: List<WeakReference<View>> = emptyList()
-    private var clockScanAt = 0L
-    private var dimDiagAt = 0L
+    private var dimView: View? = null
 
     // batas jumlah notifikasi: field int di stack yang ikut diangkat (jaring pengaman selain hook setter)
     private var limitFieldsCls: Class<*>? = null
@@ -444,7 +425,7 @@ class MainHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "com.android.systemui") return
         val cl = lpparam.classLoader
-        log("v0.49 loaded into SystemUI")
+        log("v0.47 loaded into SystemUI")
 
         val clockHelper = "com.transsion.keyguard.clock.KeyguardClockHelper"
         val clockInteractor = "com.transsion.keyguard.clock.domain.interactor.KeyguardClockInteractor"
@@ -1624,7 +1605,7 @@ class MainHook : IXposedHookLoadPackage {
     // bawah yang sama dengan keadaan 3.
     // Keadaan 3 (q=1): semua kartu penuh dengan jarak kecil; atas dipotong di garis dengan fade. Kartu yang melewati batas bawah
     // (listBottomFrac) tetap kecil dan menumpuk di bawah ("dock") sampai daftar di-swipe naik atau slider digeser.
-    // Wallpaper digelapkan sedikit saat masuk keadaan 3 (tidak menutupi jam, lihat updateDim).
+    // Wallpaper digelapkan sedikit saat masuk keadaan 3.
     // Media player (splitMedia): kartunya TIDAK ikut tumpukan notification center. Di mode media saja (soloMedia,
     // keadaan 2B) hanya kartu itu yang tampil, dengan tepi bawah tepat di garis bawah keadaan 2 (bottom2Frac)
     // seperti tumpukan notifikasi di A, tanpa teks "Notification Center".
@@ -1724,7 +1705,7 @@ class MainHook : IXposedHookLoadPackage {
             updateLabels(sv, a, targetTop, count)
             hideSlider()
             updateMask(sv, false, 0f, smallTop, d)
-            updateDim(sv, 0f, targetTop, d)
+            updateDim(sv, 0f)
             return
         }
 
@@ -1896,7 +1877,7 @@ class MainHook : IXposedHookLoadPackage {
 
         // fade atas, dim wallpaper, slider
         updateMask(sv, q >= 0.999f && scroll > 0.5f, scroll, smallTop, d)
-        updateDim(sv, q, targetTop, d)
+        updateDim(sv, q)
         updateSlider(sv, q, smallTop, limit, gapCenter)
         logT("cards", sb.toString())
     }
@@ -2881,124 +2862,49 @@ class MainHook : IXposedHookLoadPackage {
 
     // ---- dim wallpaper (keadaan 3) ----
 
-    // View gelap penuh layar. Opasitas total lewat View.alpha. Kalau hole aktif, SATU kotak (jam + tanggal) tidak
-    // ikut gelap; seluruh sisa layar tetap gelap penuh. Alpha lubang = hx(x) * hy(y): 1 di dalam kotak, memudar
-    // ke 0 sejauh feather ke luar. Digambar dengan layer: hitam penuh, lalu lubang dilubangi DST_OUT. Tepi atas,
-    // bawah, kiri, kanan semuanya lembut dan sudutnya membulat otomatis, tanpa pita selebar layar.
-    private class DimView(ctx: Context) : View(ctx) {
-        private val paint = Paint()
-        private val holePaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) }
-        private var holeOn = false
-        private var hl = 0f
-        private var ht = 0f
-        private var hr = 0f
-        private var hb = 0f
-        private var feather = 0f
-        private var holeShader: Shader? = null
-        private val shKey = floatArrayOf(Float.NaN, Float.NaN, Float.NaN, Float.NaN, Float.NaN)
-
-        fun setHole(on: Boolean, l: Float, t: Float, r: Float, b: Float, f: Float) {
-            if (on != holeOn || abs(l - hl) > 0.5f || abs(t - ht) > 0.5f || abs(r - hr) > 0.5f ||
-                abs(b - hb) > 0.5f || abs(f - feather) > 0.5f) {
-                holeOn = on
-                hl = l
-                ht = t
-                hr = r
-                hb = b
-                feather = f
-                invalidate()
-            }
+    // Jam yang ditemukan di root (dipakai untuk meletakkan overlay gelap tepat di bawahnya)
+    private fun findClockView(root: ViewGroup): View? {
+        val found = ArrayList<View>()
+        findViews(root, 0, found) { v ->
+            v.javaClass.name.contains("Clock") && v.isShown && v.height > 0
         }
-
-        override fun onDraw(canvas: Canvas) {
-            val w = width.toFloat()
-            val h = height.toFloat()
-            paint.shader = null
-            paint.color = Color.BLACK
-            if (!holeOn || w < 1f || h < 1f) {
-                canvas.drawRect(0f, 0f, w, h, paint)
-                return
-            }
-            val fe = feather.coerceAtLeast(1f)
-            val l = hl.coerceIn(0f, w)
-            val r = hr.coerceIn(l, w)
-            val t = ht.coerceIn(0f, h)
-            val b = hb.coerceIn(t, h)
-            if (shKey[0] != l || shKey[1] != t || shKey[2] != r || shKey[3] != b || shKey[4] != fe) {
-                val cols = intArrayOf(Color.TRANSPARENT, Color.BLACK, Color.BLACK, Color.TRANSPARENT)
-                val pX = (fe / ((r - l) + 2f * fe)).coerceIn(0.001f, 0.499f)
-                val pY = (fe / ((b - t) + 2f * fe)).coerceIn(0.001f, 0.499f)
-                val gx = LinearGradient(l - fe, 0f, r + fe, 0f, cols, floatArrayOf(0f, pX, 1f - pX, 1f), Shader.TileMode.CLAMP)
-                val gy = LinearGradient(0f, t - fe, 0f, b + fe, cols, floatArrayOf(0f, pY, 1f - pY, 1f), Shader.TileMode.CLAMP)
-                // alpha = alpha(gx) * alpha(gy)
-                holeShader = ComposeShader(gx, gy, PorterDuff.Mode.DST_IN)
-                shKey[0] = l
-                shKey[1] = t
-                shKey[2] = r
-                shKey[3] = b
-                shKey[4] = fe
-            }
-            val save = canvas.saveLayer(0f, 0f, w, h, null)
-            canvas.drawRect(0f, 0f, w, h, paint)
-            holePaint.shader = holeShader
-            canvas.drawRect(l - fe, t - fe, r + fe, b + fe, holePaint)
-            canvas.restoreToCount(save)
+        val c = found.firstOrNull()
+        if (c != null) once("clockFound") {
+            log("jam: ${c.javaClass.name} di ${(c.parent as? View)?.javaClass?.name}")
         }
+        return c
     }
 
-    // true kalau ada view jam SystemUI (KeyguardClockView) yang sedang tampil di window ini. View dicari lewat
-    // nama kelas persis, BUKAN "mengandung Clock": di SystemUI ada banyak view lain dengan "Clock" di namanya
-    // (jam status bar, TrClockView, dll). Kalau jam depth digambar wallpaper, view ini disembunyikan sistem.
-    private fun systemClockShown(root: ViewGroup): Boolean {
-        val now = SystemClock.uptimeMillis()
-        if (clockRefs.none { it.get()?.isAttachedToWindow == true } && now - clockScanAt > 500L) {
-            clockScanAt = now
-            val found = ArrayList<View>()
-            findViews(root, 0, found) { it.javaClass.name == clockCls }
-            clockRefs = found.map { WeakReference(it) }
-        }
-        val c = clockRefs.firstNotNullOfOrNull { r ->
-            r.get()?.takeIf { it.isShown && it.height > 0 && it.alpha > 0.3f }
-        } ?: return false
-        once("clockView") {
-            val l = IntArray(2)
-            c.getLocationOnScreen(l)
-            log("jam sistem: ${c.javaClass.name} top=${l[1]} bottom=${l[1] + c.height}")
-        }
-        return true
-    }
+    // Overlay gelap untuk wallpaper di keadaan 3. Diletakkan TEPAT DI BAWAH jam, supaya jam tidak ikut gelap.
+    // Kalau jam tidak ditemukan di root yang sama, overlay tetap di paling bawah (perilaku lama).
+    private fun ensureDim(root: ViewGroup): View {
+        val clock = findClockView(root)
+        val host = (clock?.parent as? ViewGroup) ?: root
+        val sameHost = clock != null && clock.parent === host
 
-    // debug: kondisi view jam SystemUI walau sedang disembunyikan (dipakai dimDiag untuk menyetel lubang dim)
-    private fun clockInfo(): String {
-        val c = clockRefs.firstNotNullOfOrNull { it.get() } ?: return "tidak-ada"
-        val l = IntArray(2)
-        return try {
-            c.getLocationOnScreen(l)
-            "vis=${c.visibility} shown=${c.isShown} a=${"%.2f".format(c.alpha)} " +
-                "x=${l[0]}..${l[0] + c.width} y=${l[1]}..${l[1] + c.height}"
-        } catch (t: Throwable) { "err" }
-    }
-
-    // Overlay gelap untuk wallpaper di keadaan 3, dipasang paling bawah di root (di bawah semua view SystemUI,
-    // jadi jam yang berupa view SystemUI tidak ikut gelap).
-    private fun ensureDim(root: ViewGroup): DimView {
-        val cur = dimView ?: DimView(root.context).also {
+        val cur = dimView ?: View(root.context).also {
+            it.setBackgroundColor(Color.BLACK)
             it.alpha = 0f
             it.visibility = View.INVISIBLE
             it.isClickable = false
             it.isFocusable = false
             dimView = it
         }
-        if (cur.parent !== root || root.indexOfChild(cur) != 0) {
+
+        val placed = cur.parent === host && (
+            if (sameHost) host.indexOfChild(cur) == host.indexOfChild(clock) - 1
+            else host.indexOfChild(cur) == 0
+        )
+        if (!placed) {
             (cur.parent as? ViewGroup)?.removeView(cur)
-            root.addView(cur, 0, ViewGroup.LayoutParams(
+            val idx = if (sameHost) host.indexOfChild(clock) else 0
+            host.addView(cur, idx, ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         return cur
     }
 
-    // line = tepi atas daftar kartu (px layar, ikut bergerak saat transisi keadaan 2 -> 3).
-    private fun updateDim(sv: View, q: Float, line: Float, d: Float) {
+    private fun updateDim(sv: View, q: Float) {
         val root = sv.rootView as? ViewGroup ?: return
         val v = ensureDim(root)
         val amt = if (labelsBlocked(root)) 0f else (q * Config.dimAlpha).coerceIn(0f, 0.85f)
@@ -3006,40 +2912,8 @@ class MainHook : IXposedHookLoadPackage {
             if (v.visibility != View.INVISIBLE) v.visibility = View.INVISIBLE
             v.alpha = 0f
         } else {
-            val sysClock = systemClockShown(root)
-            val hole = when (Config.dimHole) {
-                "0" -> false
-                "1" -> true
-                else -> !sysClock
-            }
-            val rl = IntArray(2)
-            root.getLocationOnScreen(rl)
-            val hm = root.resources.displayMetrics
-            // kotak jam: kiri-kanan sejauh sideFrac dari tepi layar, atas di dimHoleTopFrac, bawah sedikit di atas kartu
-            val side = hm.widthPixels * Config.dimHoleSideFrac.coerceIn(0f, 0.45f)
-            val hTop = hm.heightPixels * Config.dimHoleTopFrac - rl[1]
-            val hBottom = max(line - Config.dimHoleBottomDp * d - rl[1], hTop + 1f)
-            v.setHole(
-                hole,
-                side - rl[0],
-                hTop,
-                hm.widthPixels - side - rl[0],
-                hBottom,
-                Config.dimHoleFeatherDp * d
-            )
             if (v.visibility != View.VISIBLE) v.visibility = View.VISIBLE
             v.alpha = amt
-            // diagnosa (logcat | grep dimDiag): siapa yang menggambar jam saat dim tampil
-            val nowMs = SystemClock.uptimeMillis()
-            if (nowMs - dimDiagAt > 2000L) {
-                dimDiagAt = nowMs
-                val depthShow = try {
-                    Settings.Secure.getInt(root.context.contentResolver, "depth_clock_show", -1)
-                } catch (t: Throwable) { -2 }
-                log("dimDiag: sysClock=$sysClock depth_clock_show=$depthShow hole=$hole q=${"%.2f".format(q)} " +
-                    "rect=${(side).toInt()},${hTop.toInt()}..${(hm.widthPixels - side).toInt()},${hBottom.toInt()} " +
-                    "clockView[${clockInfo()}]")
-            }
         }
     }
 
