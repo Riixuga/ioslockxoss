@@ -3,6 +3,7 @@ package com.miko.ioslock
 import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.Dialog
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -43,6 +44,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
@@ -983,6 +988,66 @@ private fun inputField(act: Activity, pal: Pal, value: String, hint: String, lin
     return e
 }
 
+private fun cleanOldLogs(dir: File) {
+    val cutoff = System.currentTimeMillis() - 24L * 3600L * 1000L
+    dir.listFiles()?.forEach { if (it.lastModified() < cutoff) it.delete() }
+}
+
+/** Gabungkan info perangkat, isi laporan, dan log modul jadi satu file teks di cache/logs. */
+private fun writeLogFile(act: Activity, report: String, moduleLog: String, rootOk: Boolean): File? = try {
+    val dir = File(act.cacheDir, "logs")
+    dir.mkdirs()
+    cleanOldLogs(dir)
+    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    val f = File(dir, "ioslock_log_$stamp.txt")
+    val sb = StringBuilder()
+    sb.append("IOSLock bug report\n")
+    sb.append("Time: ").append(Date().toString()).append('\n')
+    sb.append("App: IOSLock ").append(AppInfo.VERSION).append('\n')
+    sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n")
+    sb.append("Build: ").append(Build.DISPLAY).append('\n')
+    sb.append("Fingerprint: ").append(Build.FINGERPRINT).append("\n\n")
+    sb.append("---- Report ----\n").append(report).append("\n\n")
+    sb.append("---- Module log ----\n")
+    if (rootOk) sb.append(moduleLog) else sb.append("(root access denied, module log not available)\n")
+    f.writeText(sb.toString())
+    f
+} catch (t: Throwable) {
+    null
+}
+
+/** Bagikan laporan + file log ke Telegram. Pengguna memilih chat @mkbtgr di daftar bagikan Telegram. */
+private fun shareReportWithLog(act: Activity, lang: String, report: String, file: File) {
+    val uri = Uri.parse("content://" + LogFileProvider.AUTHORITY + "/" + Uri.encode(file.name))
+    val i = Intent(Intent.ACTION_SEND)
+    i.type = "text/plain"
+    i.putExtra(Intent.EXTRA_STREAM, uri)
+    i.putExtra(Intent.EXTRA_TEXT, report)
+    i.putExtra(Intent.EXTRA_SUBJECT, "IOSLock bug report")
+    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    i.clipData = ClipData.newRawUri("IOSLock log", uri)
+    Toast.makeText(act, Strings.get(lang, "pick_chat"), Toast.LENGTH_LONG).show()
+    val telegrams = listOf(
+        "org.telegram.messenger", "org.telegram.messenger.web",
+        "org.thunderdog.challegram", "org.telegram.plus"
+    )
+    for (pkg in telegrams) {
+        try {
+            val t = Intent(i)
+            t.setPackage(pkg)
+            act.startActivity(t)
+            return
+        } catch (_: ActivityNotFoundException) {
+        } catch (_: Throwable) {
+        }
+    }
+    try {
+        act.startActivity(Intent.createChooser(i, "Telegram"))
+    } catch (t: Throwable) {
+        openUrl(act, lang, AppInfo.REPORT_URL + "?text=" + Uri.encode(report))
+    }
+}
+
 fun showBugReport(act: Activity, pal: Pal, lang: String) {
     val s = Sheet(act, pal, lang)
     val c = s.content
@@ -1008,9 +1073,28 @@ fun showBugReport(act: Activity, pal: Pal, lang: String) {
     c.addView(label("f_problem"))
     c.addView(problem, lpv(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-    c.addView(tv(act, Strings.get(lang, "bug_note"), 12.5f, pal.sub).apply {
-        layoutParams = lpv(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).m(act.dp(4), act.dp(14), 0, act.dp(14))
+    // lampirkan log (default nyala)
+    val attachRow = LinearLayout(act)
+    attachRow.orientation = LinearLayout.HORIZONTAL
+    attachRow.gravity = Gravity.CENTER_VERTICAL
+    val attachTexts = LinearLayout(act)
+    attachTexts.orientation = LinearLayout.VERTICAL
+    attachTexts.addView(tv(act, Strings.get(lang, "log_attach"), 14.5f, pal.text, true))
+    attachTexts.addView(tv(act, Strings.get(lang, "log_attach_desc"), 12f, pal.sub).apply {
+        layoutParams = lpv(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).m(0, act.dp(2), 0, 0)
     })
+    val attach = ToggleView(act, pal)
+    attach.contentDescription = Strings.get(lang, "log_attach")
+    attach.setChecked(true, user = false, animate = false)
+    attachRow.addView(attachTexts, lpv(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).m(act.dp(4), 0, act.dp(12), 0))
+    attachRow.addView(attach, lpv(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    attachRow.setOnClickListener { attach.toggle() }
+    c.addView(attachRow, lpv(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).m(0, act.dp(16), 0, 0))
+
+    val note = tv(act, Strings.get(lang, "bug_note_log"), 12.5f, pal.sub)
+    note.layoutParams = lpv(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).m(act.dp(4), act.dp(14), 0, act.dp(14))
+    c.addView(note)
+    attach.onChange = { on -> note.text = Strings.get(lang, if (on) "bug_note_log" else "bug_note") }
 
     val row = LinearLayout(act)
     row.orientation = LinearLayout.HORIZONTAL
@@ -1028,13 +1112,35 @@ fun showBugReport(act: Activity, pal: Pal, lang: String) {
             "TranOS version: ${tran.text.toString().trim()}\n" +
             "Problem: $problemText\n\n" +
             "IOSLock ${AppInfo.VERSION} | Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+        // laporan selalu disalin juga, sebagai cadangan kalau Telegram tidak mengisi pesannya
         try {
             val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("IOSLock report", report))
         } catch (t: Throwable) { }
-        s.dialog.dismiss()
-        Toast.makeText(act, Strings.get(lang, "copied"), Toast.LENGTH_LONG).show()
-        openUrl(act, lang, AppInfo.REPORT_URL + "?text=" + Uri.encode(report))
+
+        if (!attach.checked) {
+            s.dialog.dismiss()
+            Toast.makeText(act, Strings.get(lang, "copied"), Toast.LENGTH_LONG).show()
+            openUrl(act, lang, AppInfo.REPORT_URL + "?text=" + Uri.encode(report))
+            return@setOnClickListener
+        }
+
+        // dengan log: kumpulkan log modul lewat root, simpan sebagai file, lalu bagikan ke Telegram
+        send.isEnabled = false
+        send.alpha = 0.6f
+        Toast.makeText(act, Strings.get(lang, "log_collecting"), Toast.LENGTH_SHORT).show()
+        RootUtil.collectLog { text, rootOk ->
+            if (act.isFinishing || act.isDestroyed) return@collectLog
+            s.dialog.dismiss()
+            if (!rootOk) Toast.makeText(act, Strings.get(lang, "log_no_root"), Toast.LENGTH_LONG).show()
+            val file = writeLogFile(act, report, text, rootOk)
+            if (file != null) {
+                shareReportWithLog(act, lang, report, file)
+            } else {
+                Toast.makeText(act, Strings.get(lang, "copied"), Toast.LENGTH_LONG).show()
+                openUrl(act, lang, AppInfo.REPORT_URL + "?text=" + Uri.encode(report))
+            }
+        }
     }
     row.addView(cancel)
     row.addView(send, lpv(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).m(act.dp(8), 0, 0, 0))
